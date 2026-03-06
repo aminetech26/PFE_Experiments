@@ -1,0 +1,81 @@
+[project]
+name = "pfe-experiments"
+version = "0.1.0"
+description = "PV Fault Detection, Classification & Prediction — ESI × CDER 2025/2026"
+requires-python = ">=3.11"
+dependencies = [
+    # Core ML / DL
+    "torch>=2.3",
+    "pytorch-lightning>=2.3",
+    "torchmetrics>=1.4",
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+    "lightgbm>=4.3",
+    "catboost>=1.2",
+
+    # Data Engineering
+    "pandas>=2.2",
+    "polars>=0.20",
+    "numpy>=1.26",
+    "pyarrow>=16.0",
+    "openpyxl>=3.1",
+    "xlrd>=2.0",
+
+    # Feature Engineering & Signal Processing
+    "tsfresh>=0.20",
+    "scipy>=1.13",
+    "PyWavelets>=1.6",
+    "EMD-signal>=1.6",
+    "stumpy>=1.13",
+
+    # Experiment Tracking & Reproducibility
+    "mlflow>=2.13",
+    "dagshub>=0.3",
+    "dvc>=3.50",
+    "optuna>=3.6",
+    "pyyaml>=6.0",
+
+    # Statistical Testing
+    "statsmodels>=0.14",
+    "pingouin>=0.5",
+
+    # Online Learning / Drift Detection
+    "river>=0.21",
+
+    # Visualization
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+    "plotly>=5.22",
+
+    # Utilities
+    "tqdm>=4.66",
+    "loguru>=0.7",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4",
+    "ipykernel>=6.29",
+    "jupyterlab>=4.2",
+]
+edge = [
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+]
+gui = [
+    "PySide6>=6.7",
+    "pyqtgraph>=0.13",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src --cov-report=term-missing"

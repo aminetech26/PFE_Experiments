@@ -1,0 +1,43 @@
+# ── Secrets & credentials ─────────────────────────────────────────────────
+.env
+*.token
+
+# ── Python ────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Local MLflow runs (DagsHub is the source of truth) ───────────────────
+experiments/mlruns/
+mlruns/
+
+# ── DVC internal (keep .dvc files, ignore cache) ─────────────────────────
+.dvc/cache/
+.dvc/tmp/
+
+# ── Data files (tracked by DVC, not git) ─────────────────────────────────
+data/raw/
+data/interim/
+data/processed/
+
+# ── Model checkpoints (large, DVC-tracked) ───────────────────────────────
+experiments/checkpoints/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── IDEs ──────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+
+# ── OS ────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini

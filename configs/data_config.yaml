@@ -1,0 +1,35 @@
+# Data configuration — controls all dataset loading and feature engineering
+# Modify here, not in code, to keep experiments consistent.
+
+paths:
+  raw_dir: "data/raw"
+  reunion: "University of La Réunion Data"
+  interim_dir: "data/interim"
+  processed_dir: "data/processed"
+
+window:
+  size: 60          # timesteps per window (adjust per dataset's sampling rate)
+  step: 30          # stride (50% overlap)
+  forecast_horizon: # for Task C (forecasting)
+    - 5_min
+    - 10_min
+
+splits:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  gap_windows: 5    # drop N windows between train and val to prevent leakage
+
+features:
+  reunion:
+    electrical: [Ia, Ig, Eg, Fg, Pg, Va, Vg]
+    meteorological: [GTI, DTI, TA, TPV]
+    physics: [performance_ratio, delta_temp, dP_dt, dV_dt, dI_dt, Vg_normalized]
+    wavelet: true   # enable wavelet denoising
+
+label_columns:
+  reunion: Fault          # 0.0, 1.0, 2.0, 3.0, 4.0
+
+scaling:
+  method: robust          # RobustScaler (outlier-resistant)
+  fit_on: train           # CRITICAL: fit only on training split

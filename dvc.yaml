@@ -1,0 +1,57 @@
+stages:
+  # Stage 0: Data Ingestion → Parquet
+  ingest:
+    cmd: python src/data/ingestion.py
+    deps:
+      - src/data/ingestion.py
+      - data/raw/University of La Réunion Data/dt1_solar_and_meteorological_measurement.csv
+      - data/raw/University of La Réunion Data/dt2_electrical_production_inverter_1_with_faults.csv
+    outs:
+      - data/interim/reunion_dt2_merged.parquet
+
+  # Stage 1: Feature Engineering
+  featurize:
+    cmd: python src/data/featurize_pipeline.py
+    deps:
+      - src/data/features.py
+      - src/data/featurize_pipeline.py
+      - data/interim/reunion_dt2_merged.parquet
+      - configs/data_config.yaml
+    outs:
+      - data/processed/reunion_features.parquet
+      - data/processed/preprocessor.pkl
+
+  # Stage 2: Baseline ML Models
+  train_baselines:
+    cmd: python src/models/train_baselines.py
+    deps:
+      - src/models/train_baselines.py
+      - data/processed/reunion_features.parquet
+      - configs/model_config.yaml
+    metrics:
+      - experiments/metrics/baseline_results.json:
+          cache: false
+
+  # Stage 3: DL Models
+  train_dl:
+    cmd: python src/models/train_dl.py
+    deps:
+      - src/models/train_dl.py
+      - data/processed/reunion_features.parquet
+      - data/processed/mendeley_features.parquet
+      - configs/model_config.yaml
+    metrics:
+      - experiments/metrics/dl_results.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/best_model.pt
+
+  # Stage 4: ONNX Export
+  export_onnx:
+    cmd: python src/deployment/export_onnx.py
+    deps:
+      - src/deployment/export_onnx.py
+      - experiments/checkpoints/best_model.pt
+      - configs/deploy_config.yaml
+    outs:
+      - experiments/deployment/model.onnx
