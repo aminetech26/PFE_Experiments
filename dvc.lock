@@ -1,0 +1,24 @@
+schema: '2.0'
+stages:
+  ingest:
+    cmd: python src/data/ingestion.py
+    deps:
+    - path: data/raw/University of La Réunion 
+        Data/dt1_solar_and_meteorological_measurement.csv
+      hash: md5
+      md5: 471c7408a65fcb304a3dc037ba2a5a24
+      size: 2244383634
+    - path: data/raw/University of La Réunion 
+        Data/dt2_electrical_production_inverter_1_with_faults.csv
+      hash: md5
+      md5: 79f7ca4af39347cf890b47f2b541e5f5
+      size: 202733474
+    - path: src/data/ingestion.py
+      hash: md5
+      md5: 748e77d588fdd416811cc28020fd97d3
+      size: 2969
+    outs:
+    - path: data/interim/reunion_dt2_merged.parquet
+      hash: md5
+      md5: d529e1bbcef3949ede21635c03040701
+      size: 44545623
