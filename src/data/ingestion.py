@@ -60,6 +60,37 @@ def load_reunion(output_path: Path | None = None) -> pl.DataFrame:
     return merged
 
 
+def load_reunion_dt3(output_path: Path | None = None) -> pl.DataFrame:
+    """
+    Load La Réunion dt3 (healthy inverter 2 — no faults) + dt1 (meteorological).
+    Needed for the differential power signal: ΔP = P_inv1 - α·P_inv2.
+
+    Returns a Polars DataFrame.
+    """
+    dt1_path = REUNION_DIR / "dt1_solar_and_meteorological_measurement.csv"
+    dt3_path = REUNION_DIR / "dt3_electrical_production_inverter_2.csv"
+
+    logger.info("Loading La Réunion dt3 (healthy inverter)...")
+    dt3 = pl.read_csv(dt3_path, try_parse_dates=True)
+    logger.info(f"  dt3: {len(dt3):,} rows, columns: {dt3.columns}")
+
+    logger.info("Loading La Réunion dt1 (meteorological) for dt3 merge...")
+    dt1 = pl.read_csv(dt1_path, try_parse_dates=True)
+
+    dt1 = dt1.sort("time")
+    dt3 = dt3.sort("time")
+
+    merged = dt3.join_asof(dt1, on="time", strategy="nearest", tolerance="30s")
+    logger.info(f"dt3 after asof join: {len(merged):,} rows, {merged.width} columns")
+
+    if output_path is None:
+        output_path = OUTPUT_DIR / "reunion_dt3_merged.parquet"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.write_parquet(output_path)
+    logger.success(f"Saved → {output_path}")
+    return merged
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -72,4 +103,8 @@ if __name__ == "__main__":
     df = load_reunion()
     print(df.head(3))
     print(f"Schema: {df.schema}")
+
+    logger.info("=== Stage 0b: Ingesting dt3 (healthy reference) ===")
+    df3 = load_reunion_dt3()
+    print(df3.head(3))
     logger.success("=== Ingestion complete ===")

@@ -15,8 +15,8 @@ stages:
       size: 202733474
     - path: src/data/ingestion.py
       hash: md5
-      md5: 748e77d588fdd416811cc28020fd97d3
-      size: 2969
+      md5: 67fa74db8b461232afa24ff6d125d6c4
+      size: 4352
     outs:
     - path: data/interim/reunion_dt2_merged.parquet
       hash: md5
