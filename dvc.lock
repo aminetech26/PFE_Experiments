@@ -13,6 +13,11 @@ stages:
       hash: md5
       md5: 79f7ca4af39347cf890b47f2b541e5f5
       size: 202733474
+    - path: data/raw/University of La Réunion 
+        Data/dt3_electrical_production_inverter_2.csv
+      hash: md5
+      md5: 5c8f9325643556d1487db20dc6b77cfb
+      size: 189397065
     - path: src/data/ingestion.py
       hash: md5
       md5: 67fa74db8b461232afa24ff6d125d6c4
@@ -22,3 +27,7 @@ stages:
       hash: md5
       md5: d529e1bbcef3949ede21635c03040701
       size: 44545623
+    - path: data/interim/reunion_dt3_merged.parquet
+      hash: md5
+      md5: c66f6875287d3f354eec2a47f8e4b17a
+      size: 41752957

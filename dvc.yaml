@@ -6,8 +6,10 @@ stages:
       - src/data/ingestion.py
       - data/raw/University of La Réunion Data/dt1_solar_and_meteorological_measurement.csv
       - data/raw/University of La Réunion Data/dt2_electrical_production_inverter_1_with_faults.csv
+      - data/raw/University of La Réunion Data/dt3_electrical_production_inverter_2.csv
     outs:
       - data/interim/reunion_dt2_merged.parquet
+      - data/interim/reunion_dt3_merged.parquet
 
   # Stage 1: Feature Engineering
   featurize:
