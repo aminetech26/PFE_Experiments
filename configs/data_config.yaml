@@ -18,7 +18,12 @@ splits:
   train_ratio: 0.70
   val_ratio: 0.15
   test_ratio: 0.15
-  gap_windows: 5    # drop N windows between train and val to prevent leakage
+  segment_gap_count: 0          # optional full segments dropped at boundaries
+  embargo_seconds: 1260         # 21 min purge/embargo from EDA autocorrelation policy
+  segmentation_gap_seconds: 300 # contiguous-segment cut threshold (5 min)
+  daytime_gti_threshold: 10.0   # keep daytime rows only for primary modeling
+  min_train_count: 5            # minimum samples per class in train
+  min_val_count: 2              # minimum samples per class in validation
 
 features:
   reunion:

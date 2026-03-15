@@ -11,36 +11,66 @@ stages:
       - data/interim/reunion_dt2_merged.parquet
       - data/interim/reunion_dt3_merged.parquet
 
-  # Stage 1: Feature Engineering
+  # Stage 1: Temporal Split (segment-aware + embargo)
+  split:
+    cmd: python src/data/split_pipeline.py
+    deps:
+      - src/data/splitting.py
+      - src/data/split_pipeline.py
+      - data/interim/reunion_dt2_merged.parquet
+      - configs/data_config.yaml
+    outs:
+      - data/processed/splits/train_raw.parquet
+      - data/processed/splits/val_raw.parquet
+      - data/processed/splits/test_raw.parquet
+      - data/processed/splits/dropped_embargo_raw.parquet
+      - data/processed/splits/split_manifest.json
+
+  # Stage 2: Feature Engineering (post-split, deterministic)
   featurize:
     cmd: python src/data/featurize_pipeline.py
     deps:
       - src/data/features.py
       - src/data/featurize_pipeline.py
-      - data/interim/reunion_dt2_merged.parquet
+      - data/processed/splits/train_raw.parquet
+      - data/processed/splits/val_raw.parquet
+      - data/processed/splits/test_raw.parquet
+      - data/interim/reunion_dt3_merged.parquet
       - configs/data_config.yaml
     outs:
-      - data/processed/reunion_features.parquet
-      - data/processed/preprocessor.pkl
+      - data/processed/splits/train.parquet
+      - data/processed/splits/val.parquet
+      - data/processed/splits/test.parquet
+      - data/processed/splits/featurize_manifest.json
 
-  # Stage 2: Baseline ML Models
+  # Stage 3: Baseline ML Models
   train_baselines:
     cmd: python src/models/train_baselines.py
     deps:
+      - src/data/features.py
+      - src/evaluation/leakage_checks.py
       - src/models/train_baselines.py
-      - data/processed/reunion_features.parquet
+      - data/processed/splits/train.parquet
+      - data/processed/splits/val.parquet
+      - data/processed/splits/test.parquet
+      - data/processed/splits/split_manifest.json
+      - data/processed/splits/featurize_manifest.json
+      - configs/data_config.yaml
       - configs/model_config.yaml
     metrics:
       - experiments/metrics/baseline_results.json:
           cache: false
+    outs:
+      - data/processed/preprocessor.pkl
 
-  # Stage 3: DL Models
+  # Stage 4: DL Models
   train_dl:
     cmd: python src/models/train_dl.py
     deps:
       - src/models/train_dl.py
-      - data/processed/reunion_features.parquet
-      - data/processed/mendeley_features.parquet
+      - data/processed/splits/train.parquet
+      - data/processed/splits/val.parquet
+      - data/processed/splits/test.parquet
       - configs/model_config.yaml
     metrics:
       - experiments/metrics/dl_results.json:
@@ -48,7 +78,7 @@ stages:
     outs:
       - experiments/checkpoints/best_model.pt
 
-  # Stage 4: ONNX Export
+  # Stage 5: ONNX Export
   export_onnx:
     cmd: python src/deployment/export_onnx.py
     deps:
