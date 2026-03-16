@@ -24,8 +24,8 @@ splits:
   eda_embargo_key_path: acf.embargo_seconds
   segmentation_gap_seconds: 300 # contiguous-segment cut threshold (5 min)
   daytime_gti_threshold: 10.0   # keep daytime rows only for primary modeling
-  min_train_count: 5            # absolute floor per class in train
-  min_val_count: 2              # absolute floor per class in validation
+  min_train_count: 1000            # absolute floor per class in train
+  min_val_count: 2000              # absolute floor per class in validation
   train_min_frac: 0.01          # relative minimum per class in train
   val_min_frac: 0.005           # relative minimum per class in validation
   # Fault classes are burst events concentrated in a few segments — impossible to enforce
