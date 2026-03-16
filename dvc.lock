@@ -1,7 +1,7 @@
 schema: '2.0'
 stages:
   ingest:
-    cmd: python src/data/ingestion.py
+    cmd: python -m src.data.ingestion
     deps:
     - path: data/raw/University of La Réunion 
         Data/dt1_solar_and_meteorological_measurement.csv
@@ -31,3 +31,43 @@ stages:
       hash: md5
       md5: c66f6875287d3f354eec2a47f8e4b17a
       size: 41752957
+  split:
+    cmd: python -m src.data.split_pipeline
+    deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 69432d5201240980c314481bee16626c
+      size: 2146
+    - path: data/interim/reunion_dt2_merged.parquet
+      hash: md5
+      md5: d529e1bbcef3949ede21635c03040701
+      size: 44545623
+    - path: src/data/split_pipeline.py
+      hash: md5
+      md5: e99cd993dfbc8bfcb3b2a8a96090319b
+      size: 6104
+    - path: src/data/splitting.py
+      hash: md5
+      md5: dcd6d4c7e5e666ee57faaab2b077e44e
+      size: 13568
+    outs:
+    - path: data/processed/splits/dropped_embargo_raw.parquet
+      hash: md5
+      md5: 8b1a0df0e748f62ccbb7858e7aba9110
+      size: 21116
+    - path: data/processed/splits/split_manifest.json
+      hash: md5
+      md5: c225b7ddec41373da207b1ddc82ae052
+      size: 2655
+    - path: data/processed/splits/test_raw.parquet
+      hash: md5
+      md5: a29f08adc43550c68b059789d0a0829c
+      size: 6645230
+    - path: data/processed/splits/train_raw.parquet
+      hash: md5
+      md5: a0e89755bc1d89de1e4948b7633973b0
+      size: 30910491
+    - path: data/processed/splits/val_raw.parquet
+      hash: md5
+      md5: 3690b0cb02189486dbf986143e00ac02
+      size: 6515251

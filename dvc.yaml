@@ -1,7 +1,7 @@
 stages:
   # Stage 0: Data Ingestion → Parquet
   ingest:
-    cmd: python src/data/ingestion.py
+    cmd: python -m src.data.ingestion
     deps:
       - src/data/ingestion.py
       - data/raw/University of La Réunion Data/dt1_solar_and_meteorological_measurement.csv
@@ -13,7 +13,7 @@ stages:
 
   # Stage 1: Temporal Split (segment-aware + embargo)
   split:
-    cmd: python src/data/split_pipeline.py
+    cmd: python -m src.data.split_pipeline
     deps:
       - src/data/splitting.py
       - src/data/split_pipeline.py
@@ -28,7 +28,7 @@ stages:
 
   # Stage 2: Feature Engineering (post-split, deterministic)
   featurize:
-    cmd: python src/data/featurize_pipeline.py
+    cmd: python -m src.data.featurize_pipeline
     deps:
       - src/data/features.py
       - src/data/featurize_pipeline.py
@@ -45,7 +45,7 @@ stages:
 
   # Stage 3: Baseline ML Models
   train_baselines:
-    cmd: python src/models/train_baselines.py
+    cmd: python -m src.models.train_baselines
     deps:
       - src/data/features.py
       - src/evaluation/leakage_checks.py
@@ -65,7 +65,7 @@ stages:
 
   # Stage 4: DL Models
   train_dl:
-    cmd: python src/models/train_dl.py
+    cmd: python -m src.models.train_dl
     deps:
       - src/models/train_dl.py
       - data/processed/splits/train.parquet
@@ -80,7 +80,7 @@ stages:
 
   # Stage 5: ONNX Export
   export_onnx:
-    cmd: python src/deployment/export_onnx.py
+    cmd: python -m src.deployment.export_onnx
     deps:
       - src/deployment/export_onnx.py
       - experiments/checkpoints/best_model.pt

@@ -19,11 +19,20 @@ splits:
   val_ratio: 0.15
   test_ratio: 0.15
   segment_gap_count: 0          # optional full segments dropped at boundaries
-  embargo_seconds: 1260         # 21 min purge/embargo from EDA autocorrelation policy
+  embargo_fallback_seconds: 1260 # used if EDA recommendations JSON is missing/invalid
+  eda_recommendations_path: data/interim/eda_split_recommendations.json
+  eda_embargo_key_path: acf.embargo_seconds
   segmentation_gap_seconds: 300 # contiguous-segment cut threshold (5 min)
   daytime_gti_threshold: 10.0   # keep daytime rows only for primary modeling
-  min_train_count: 5            # minimum samples per class in train
-  min_val_count: 2              # minimum samples per class in validation
+  min_train_count: 5            # absolute floor per class in train
+  min_val_count: 2              # absolute floor per class in validation
+  train_min_frac: 0.01          # relative minimum per class in train
+  val_min_frac: 0.005           # relative minimum per class in validation
+  # Fault classes are burst events concentrated in a few segments — impossible to enforce
+  # temporal coverage in both train and val simultaneously. Classes below this total are
+  # not enforced in the split search. Set above the largest fault class (4.0 = ~61k) so
+  # all fault classes remain unenforced; only class 0.0 (normal, ~2.85M) drives the search.
+  rare_class_threshold: 70000
 
 features:
   reunion:

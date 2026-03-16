@@ -1,0 +1,4 @@
+deployment:
+  model_name: pfe_placeholder
+  opset_version: 17
+  dynamic_batch: true
