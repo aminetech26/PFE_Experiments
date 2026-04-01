@@ -18,6 +18,7 @@ splits:
   train_ratio: 0.70
   val_ratio: 0.15
   test_ratio: 0.15
+  seed: 42                    # For reproducible segment-stratified splits
   segment_gap_count: 0          # optional full segments dropped at boundaries
   embargo_fallback_seconds: 1260 # used if EDA recommendations JSON is missing/invalid
   eda_recommendations_path: data/interim/eda_split_recommendations.json
