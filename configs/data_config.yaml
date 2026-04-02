@@ -50,3 +50,44 @@ label_columns:
 scaling:
   method: robust    # RobustScaler (outlier-resistant)
   fit_on: train     
+
+# =============================================================================
+# PREPROCESSING CONFIGURATION
+# =============================================================================
+# Based on EDA findings documented in PREPROCESSING_DECISIONS.md
+
+preprocessing:
+  # --- Missing Value Handling ---
+  # Tiered strategy: ffill for short gaps, interpolate for medium, drop for long
+  # Rule: NEVER impute on fault data (would fabricate fault signatures)
+  missing_values:
+    ffill_max_gap_seconds: 60          # < 1 min → forward-fill (normal only)
+    interp_max_gap_seconds: 300        # 1-5 min → linear interpolation (normal only)
+    # > 5 min → DROP rows
+    # Any gap on fault data → DROP rows
+  
+  # --- Outlier Treatment ---
+  # IQR 3× is conservative — only catches far outliers (sensor errors)
+  # Fault data outliers are expected signatures, not errors
+  outliers:
+    method: iqr
+    iqr_multiplier: 3.0                # 3× IQR (far outliers only)
+    action: clip                        # winsorize to bounds
+    scope: normal_only                  # don't touch fault data
+  
+  # --- Stationarity Correction ---
+  # STL not applicable (segments < 2 seasonal cycles)
+  # Use physics-based normalization instead
+  stationarity:
+    # Irradiance normalization: removes diurnal dependency
+    # Power/GTI ≈ efficiency, which is ~constant throughout day
+    irradiance_normalize:
+      features: [Pg, Ig, Eg, Fg, Ia]   # power-related features
+      denominator: GTI
+      suffix: _norm
+    
+    # Linear detrending: removes slow thermal drift per segment
+    linear_detrend:
+      features: [TA, TPV]               # temperature features
+      scope: per_segment
+      suffix: _detrend
