@@ -1,4 +1,4 @@
-# Data configuration — controls all dataset loading and feature engineering
+# Data configuration — controls all dataset loading and splitting
 # Modify here, not in code, to keep experiments consistent.
 
 paths:
@@ -7,44 +7,46 @@ paths:
   interim_dir: "data/interim"
   processed_dir: "data/processed"
 
-window:
-  size: 60          # timesteps per window (adjust per dataset's sampling rate)
-  step: 30          # stride (50% overlap)
-  forecast_horizon: # for Task C (forecasting)
-    - 5_min
-    - 10_min
-
 splits:
+  seed: 42
   train_ratio: 0.70
   val_ratio: 0.15
   test_ratio: 0.15
-  seed: 42                    # For reproducible segment-stratified splits
-  segment_gap_count: 0          # optional full segments dropped at boundaries
-  embargo_fallback_seconds: 1260 # used if EDA recommendations JSON is missing/invalid
-  eda_recommendations_path: data/interim/eda_split_recommendations.json
-  eda_embargo_key_path: acf.embargo_seconds
-  segmentation_gap_seconds: 300 # contiguous-segment cut threshold (5 min)
-  daytime_gti_threshold: 10.0   # keep daytime rows only for primary modeling
-  min_train_count: 1000            # absolute floor per class in train
-  min_val_count: 2000              # absolute floor per class in validation
-  train_min_frac: 0.01          # relative minimum per class in train
-  val_min_frac: 0.005           # relative minimum per class in validation
-  # Fault classes are burst events concentrated in a few segments — impossible to enforce
-  # temporal coverage in both train and val simultaneously. Classes below this total are
-  # not enforced in the split search. Set above the largest fault class (4.0 = ~61k) so
-  # all fault classes remain unenforced; only class 0.0 (normal, ~2.85M) drives the search.
-  rare_class_threshold: 70000
+  segmentation_gap_seconds: 300      # 5 min gap defines segment boundary
+  daytime_gti_threshold: 10.0        # W/m², filter nighttime
+
+  # Evaluable fault classes (have ≥3 segments for train/val/test distribution)
+  evaluable_classes: [3.1, 3.2, 4.0]
+  
+  # Train-only fault classes (insufficient segments, contribute to Task A only)
+  train_only_classes: [1.0, 2.1, 2.2, 2.3]
+
+# =============================================================================
+# TASK C: PREDICTION CONFIGURATION
+# =============================================================================
+
+prediction:
+  forecast_horizon_seconds: 1800     # 30 min — how far ahead to predict
+  window_size_seconds: 3600          # 60 min — history used as features
+  min_episodes_for_eval: 3           # Minimum episodes to be evaluable
+
+# =============================================================================
+# FEATURE CONFIGURATION
+# =============================================================================
 
 features:
   reunion:
     electrical: [Ia, Ig, Eg, Fg, Pg, Va, Vg]
     meteorological: [GTI, DTI, TA, TPV]
     physics: [performance_ratio, delta_temp, dP_dt, dV_dt, dI_dt, Vg_normalized]
-    wavelet: true   # enable wavelet denoising
+
+window:
+  size: 60          # timesteps per window
+  step: 30          # stride (50% overlap)
 
 label_columns:
-  reunion: Fault          # 0.0, 1.0, 2.0, 3.0, 4.0
+  reunion: Fault    # 0.0=normal, 1.0-4.0=fault types
 
 scaling:
-  method: robust          # RobustScaler (outlier-resistant)
-  fit_on: train           # CRITICAL: fit only on training split
+  method: robust    # RobustScaler (outlier-resistant)
+  fit_on: train     
