@@ -36,8 +36,8 @@ stages:
     deps:
     - path: configs/data_config.yaml
       hash: md5
-      md5: 611b6857eb6380e45fd84fce95eeb407
-      size: 1832
+      md5: 42aa968ace2da7e065a02b8162d656f1
+      size: 3591
     - path: data/interim/reunion_dt2_merged.parquet
       hash: md5
       md5: d529e1bbcef3949ede21635c03040701
@@ -115,3 +115,119 @@ stages:
       hash: md5
       md5: 02a83e6fa0eab5ab8d8fdb1acee80529
       size: 10634532
+  preprocess:
+    cmd: uv run python -m src.data.preprocess_pipeline
+    deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 42aa968ace2da7e065a02b8162d656f1
+      size: 3591
+    - path: data/interim/splits/anomaly_semisup/test.parquet
+      hash: md5
+      md5: b47576d614fb7e34d834ba80e09c87a8
+      size: 12835071
+    - path: data/interim/splits/anomaly_semisup/train.parquet
+      hash: md5
+      md5: 2736c37d587f72012a83c1499aa37230
+      size: 45550325
+    - path: data/interim/splits/anomaly_semisup/val.parquet
+      hash: md5
+      md5: 4fcf987ec363943cdfd9c75e214d9a54
+      size: 12649604
+    - path: data/interim/splits/anomaly_supervised/test.parquet
+      hash: md5
+      md5: 075eb963eb9c29e3faec81685413cff7
+      size: 11533516
+    - path: data/interim/splits/anomaly_supervised/train.parquet
+      hash: md5
+      md5: 41bd4b9c73077af1d89c92dd510a6098
+      size: 48136473
+    - path: data/interim/splits/anomaly_supervised/val.parquet
+      hash: md5
+      md5: b848f89cfef758af2ebce9c33e9e42f0
+      size: 11344105
+    - path: data/interim/splits/classification/test.parquet
+      hash: md5
+      md5: 52bd964f31a72b53287ba3b9f4210fda
+      size: 454386
+    - path: data/interim/splits/classification/train.parquet
+      hash: md5
+      md5: dbda19bac044967233837001b88c2666
+      size: 1386549
+    - path: data/interim/splits/classification/val.parquet
+      hash: md5
+      md5: 065576d16270fc7dd87f438c31ca1fd0
+      size: 211311
+    - path: data/interim/splits/prediction/test.parquet
+      hash: md5
+      md5: 63cc961772e09c3a51dedfc08378cde5
+      size: 11172759
+    - path: data/interim/splits/prediction/train.parquet
+      hash: md5
+      md5: eb152747effda2c34aa36dc04618af4a
+      size: 49256494
+    - path: data/interim/splits/prediction/val.parquet
+      hash: md5
+      md5: 02a83e6fa0eab5ab8d8fdb1acee80529
+      size: 10634532
+    - path: src/data/preprocess_pipeline.py
+      hash: md5
+      md5: 24849c103a2ee88fb3ead9e6e73ec432
+      size: 8038
+    - path: src/data/preprocessing.py
+      hash: md5
+      md5: 3ffc818633b429ce24d2c7e8363f87a6
+      size: 17331
+    outs:
+    - path: data/processed/preprocessed/anomaly_semisup/test.parquet
+      hash: md5
+      md5: 904e5b6827736726901291c03952ba43
+      size: 33296525
+    - path: data/processed/preprocessed/anomaly_semisup/train.parquet
+      hash: md5
+      md5: b3067acaa92ed5246c49fcd762afc906
+      size: 118369469
+    - path: data/processed/preprocessed/anomaly_semisup/val.parquet
+      hash: md5
+      md5: 8e9cc2bbf0888270f26a3f71e5776f89
+      size: 32602712
+    - path: data/processed/preprocessed/anomaly_supervised/test.parquet
+      hash: md5
+      md5: 774fa92fafb8dd491fa7891a87dc5e61
+      size: 29797472
+    - path: data/processed/preprocessed/anomaly_supervised/train.parquet
+      hash: md5
+      md5: fa8d67ab497e448dbcaed078b7087272
+      size: 124906811
+    - path: data/processed/preprocessed/anomaly_supervised/val.parquet
+      hash: md5
+      md5: 84bbcb351f44c1e90c042c149f4bb476
+      size: 29144940
+    - path: data/processed/preprocessed/classification/test.parquet
+      hash: md5
+      md5: 361c4d7214fb8ca97355a7e88c574add
+      size: 1214989
+    - path: data/processed/preprocessed/classification/train.parquet
+      hash: md5
+      md5: 9d68d7f26ceba83b16daac63d4a9ff5c
+      size: 3711365
+    - path: data/processed/preprocessed/classification/val.parquet
+      hash: md5
+      md5: ca01b3ef2abd2102290db0452bdc2706
+      size: 559107
+    - path: data/processed/preprocessed/prediction/test.parquet
+      hash: md5
+      md5: d95f53bc48e12f550bb0ddbbc9052f0c
+      size: 28818511
+    - path: data/processed/preprocessed/prediction/train.parquet
+      hash: md5
+      md5: d975698194d9c3094350828e214f05d7
+      size: 127732668
+    - path: data/processed/preprocessed/prediction/val.parquet
+      hash: md5
+      md5: 46ac86a7f2a8f58c2433a3a1de84a631
+      size: 27226863
+    - path: data/processed/preprocessed/preprocess_manifest.json
+      hash: md5
+      md5: a6872980ebb1b7e4865623d27cf39796
+      size: 26117
