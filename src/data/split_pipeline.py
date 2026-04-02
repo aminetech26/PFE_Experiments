@@ -1,3 +1,18 @@
+"""
+Split Pipeline — Generates all task-specific splits.
+
+Outputs to data/interim/splits/:
+  - anomaly_semisup/    (Task A semi-supervised)
+  - anomaly_supervised/ (Task A supervised)  
+  - classification/     (Task B, evaluable classes only)
+
+Usage:
+    python -m src.data.split_pipeline
+    
+    # Or from project root:
+    cd PFE_Experiments && python -m src.data.split_pipeline
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,155 +23,255 @@ import polars as pl
 import yaml
 from loguru import logger
 
-from src.data.splitting import segment_aware_temporal_split
+from src.data.splitting import (
+    segment_stratified_split,
+    hybrid_semisup_split,
+    filter_to_evaluable_classes,
+    prediction_episode_split,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
 
 
-# Core responsibility: Data IO + deterministic filtering + invoking split algorithm + artifact persistence.
+def load_config() -> dict:
+    """Load split configuration from data_config.yaml."""
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def _load_embargo_seconds_from_eda_json(
-    path: Path,
-    *,
-    json_key_path: str = "acf.embargo_seconds",
-) -> tuple[int, dict]:
-    if not path.exists():
-        return 0, {
-            "status": "fallback",
-            "reason": "eda_json_not_found",
-            "path": str(path),
-            "json_key_path": json_key_path,
-        }
-
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # pragma: no cover - defensive parsing
-        return 0, {
-            "status": "fallback",
-            "reason": "eda_json_parse_error",
-            "path": str(path),
-            "json_key_path": json_key_path,
-            "error": str(exc),
-        }
-
-    current = payload
-    try:
-        for key in json_key_path.split("."):
-            current = current[key]
-        embargo_seconds = int(current)
-    except Exception:
-        return 0, {
-            "status": "fallback",
-            "reason": "eda_json_key_missing",
-            "path": str(path),
-            "json_key_path": json_key_path,
-        }
-
-    if embargo_seconds <= 0:
-        return 0, {
-            "status": "fallback",
-            "reason": "eda_json_non_positive_value",
-            "path": str(path),
-            "json_key_path": json_key_path,
-            "embargo_seconds": int(embargo_seconds),
-        }
-
-    return embargo_seconds, {
-        "status": "derived",
-        "path": str(path),
-        "json_key_path": json_key_path,
-        "embargo_seconds": int(embargo_seconds),
-    }
-
-def main() -> None:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    paths = cfg["paths"]
-    split_cfg = cfg["splits"]
-    label_col = cfg["label_columns"]["reunion"]
-
-    daytime_gti_threshold = float(split_cfg.get("daytime_gti_threshold", 10.0))
-    segmentation_gap_seconds = int(split_cfg.get("segmentation_gap_seconds", 300))
-    segment_gap_count = int(split_cfg.get("segment_gap_count", 0))
-    legacy_manual_seconds = int(split_cfg.get("embargo_seconds", 0))
-    embargo_fallback_seconds = int(split_cfg.get("embargo_fallback_seconds", legacy_manual_seconds))
-    eda_json_relpath = str(split_cfg.get("eda_recommendations_path", "data/interim/eda_split_recommendations.json"))
-    eda_json_key_path = str(split_cfg.get("eda_embargo_key_path", "acf.embargo_seconds"))
-    min_train_count = int(split_cfg.get("min_train_count", 5))
-    min_val_count = int(split_cfg.get("min_val_count", 2))
-    train_min_frac = float(split_cfg.get("train_min_frac", 0.01))
-    val_min_frac = float(split_cfg.get("val_min_frac", 0.005))
-    rare_class_threshold = int(split_cfg.get("rare_class_threshold", 30))
-
+def load_and_segment_data(config: dict) -> pd.DataFrame:
+    """
+    Load merged data and apply daytime filtering + segmentation.
+    
+    Returns DataFrame with 'timestamp', 'label', 'segment_id' columns.
+    """
+    paths = config["paths"]
+    split_cfg = config["splits"]
+    label_col = config["label_columns"]["reunion"]
+    
     interim_dir = PROJECT_ROOT / paths["interim_dir"]
-    processed_dir = PROJECT_ROOT / paths["processed_dir"]
-    split_dir = processed_dir / "splits"
-    split_dir.mkdir(parents=True, exist_ok=True)
-
     input_path = interim_dir / "reunion_dt2_merged.parquet"
-    logger.info(f"Loading ingestion artifact: {input_path}")
-
+    
+    logger.info(f"Loading data from: {input_path}")
     df = pl.read_parquet(input_path).to_pandas()
-    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    df = df.dropna(subset=["time", label_col]).sort_values("time").reset_index(drop=True)
-
-    # Universal deterministic pre-split logic: day filtering and contiguous segmentation.
+    
+    # Standardize column names
+    df["timestamp"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df["label"] = df[label_col]
+    df = df.dropna(subset=["timestamp", "label"]).sort_values("timestamp").reset_index(drop=True)
+    
+    logger.info(f"Loaded {len(df):,} rows")
+    
+    # Daytime filtering
+    daytime_gti_threshold = float(split_cfg.get("daytime_gti_threshold", 10.0))
     gti = df["GTI"].fillna(0) if "GTI" in df.columns else pd.Series(0, index=df.index)
     df["is_daytime"] = gti > daytime_gti_threshold
     df = df[df["is_daytime"]].reset_index(drop=True)
-    dt_s = df["time"].diff().dt.total_seconds().fillna(0)
+    logger.info(f"After daytime filter (GTI > {daytime_gti_threshold}): {len(df):,} rows")
+    
+    # Contiguous segmentation
+    segmentation_gap_seconds = int(split_cfg.get("segmentation_gap_seconds", 300))
+    dt_s = df["timestamp"].diff().dt.total_seconds().fillna(0)
     df["segment_id"] = (dt_s > segmentation_gap_seconds).cumsum().astype(int)
+    
+    n_segments = df["segment_id"].nunique()
+    logger.info(f"Created {n_segments} segments (gap threshold: {segmentation_gap_seconds}s)")
+    
+    return df
 
-    embargo_derivation = {"mode": "eda_json"}
-    eda_json_path = PROJECT_ROOT / eda_json_relpath
-    derived_seconds, derived_info = _load_embargo_seconds_from_eda_json(
-        eda_json_path,
-        json_key_path=eda_json_key_path,
+
+def save_split(artifacts, output_dir: Path, split_name: str) -> None:
+    """Save split artifacts to disk."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    artifacts.train.to_parquet(output_dir / "train.parquet", index=False)
+    artifacts.val.to_parquet(output_dir / "val.parquet", index=False)
+    artifacts.test.to_parquet(output_dir / "test.parquet", index=False)
+    
+    with open(output_dir / "split_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(artifacts.manifest, f, indent=2, default=str)
+    
+    logger.success(
+        f"{split_name}: train={len(artifacts.train):,}, "
+        f"val={len(artifacts.val):,}, test={len(artifacts.test):,}"
     )
-    if derived_seconds > 0:
-        embargo_seconds = derived_seconds
-    else:
-        embargo_seconds = embargo_fallback_seconds
-        derived_info["fallback_seconds"] = int(embargo_fallback_seconds)
-    embargo_derivation.update(derived_info)
 
-    artifacts = segment_aware_temporal_split(
-        df,
-        time_col="time",
-        label_col=label_col,
+
+def run_anomaly_semisup_split(df: pd.DataFrame, config: dict, output_base: Path) -> None:
+    """Generate hybrid split for semi-supervised anomaly detection."""
+    logger.info("=" * 50)
+    logger.info("[1/3] Anomaly Detection — Semi-Supervised (Temporal Hybrid)")
+    logger.info("Train: Normal-only (temporal) | Val/Test: Normal + faults (temporal)")
+    
+    split_cfg = config.get("splits", {})
+    
+    artifacts = hybrid_semisup_split(
+        df=df,
         segment_col="segment_id",
-        train_ratio=float(split_cfg["train_ratio"]),
-        val_ratio=float(split_cfg["val_ratio"]),
-        test_ratio=float(split_cfg["test_ratio"]),
-        gap_segments=segment_gap_count,
-        embargo_seconds=embargo_seconds,
-        min_train_count=min_train_count,
-        min_val_count=min_val_count,
-        train_min_frac=train_min_frac,
-        val_min_frac=val_min_frac,
-        rare_class_threshold=rare_class_threshold,
+        label_col="label",
+        time_col="timestamp",
+        train_ratio=split_cfg.get("train_ratio", 0.70),
+        val_ratio=split_cfg.get("val_ratio", 0.15),
+        embargo_seconds=split_cfg.get("embargo_seconds", 1260),
     )
+    
+    save_split(artifacts, output_base / "anomaly_semisup", "anomaly_semisup")
+    
+    # Verify train is normal-only
+    train_labels = artifacts.train["label"].unique()
+    assert all(l == 0.0 for l in train_labels), "Train should be normal-only!"
+    logger.info(f"Verified: Train contains only normal data ({len(artifacts.train):,} rows)")
 
-    artifacts.manifest["embargo_derivation"] = embargo_derivation
 
-    train_path = split_dir / "train_raw.parquet"
-    val_path = split_dir / "val_raw.parquet"
-    test_path = split_dir / "test_raw.parquet"
-    dropped_path = split_dir / "dropped_embargo_raw.parquet"
-    manifest_path = split_dir / "split_manifest.json"
+def run_anomaly_supervised_split(df: pd.DataFrame, config: dict, output_base: Path) -> None:
+    """Generate temporal-stratified split for supervised anomaly detection."""
+    logger.info("=" * 50)
+    logger.info("[2/3] Anomaly Detection — Supervised (Temporal-Stratified)")
+    logger.info("All sets: Temporal order preserved within each class")
+    
+    split_cfg = config.get("splits", {})
+    
+    artifacts = segment_stratified_split(
+        df=df,
+        segment_col="segment_id",
+        label_col="label",
+        time_col="timestamp",
+        train_ratio=split_cfg.get("train_ratio", 0.70),
+        val_ratio=split_cfg.get("val_ratio", 0.15),
+        embargo_seconds=split_cfg.get("embargo_seconds", 1260),
+    )
+    
+    save_split(artifacts, output_base / "anomaly_supervised", "anomaly_supervised")
 
-    pl.from_pandas(artifacts.train).write_parquet(train_path)
-    pl.from_pandas(artifacts.val).write_parquet(val_path)
-    pl.from_pandas(artifacts.test).write_parquet(test_path)
-    pl.from_pandas(artifacts.dropped).write_parquet(dropped_path)
 
-    manifest_path.write_text(json.dumps(artifacts.manifest, indent=2), encoding="utf-8")
+def run_classification_split(df: pd.DataFrame, config: dict, output_base: Path) -> None:
+    """Generate segment-stratified split for fault classification (evaluable classes only)."""
+    logger.info("=" * 50)
+    logger.info("[3/3] Fault Classification (Temporal-Stratified, Evaluable Classes)")
+    logger.info("Classes: 3.1, 3.2, 4.0 only (no normal, no 1.0/2.x)")
+    
+    split_cfg = config.get("splits", {})
+    evaluable_classes = [3.1, 3.2, 4.0]
+    
+    # First, do temporal-stratified split on full data
+    artifacts = segment_stratified_split(
+        df=df,
+        segment_col="segment_id",
+        label_col="label",
+        time_col="timestamp",
+        train_ratio=split_cfg.get("train_ratio", 0.70),
+        val_ratio=split_cfg.get("val_ratio", 0.15),
+        embargo_seconds=split_cfg.get("embargo_seconds", 1260),
+    )
+    
+    # Filter to evaluable classes only
+    train_filtered = filter_to_evaluable_classes(artifacts.train, evaluable_classes)
+    val_filtered = filter_to_evaluable_classes(artifacts.val, evaluable_classes)
+    test_filtered = filter_to_evaluable_classes(artifacts.test, evaluable_classes)
+    
+    output_dir = output_base / "classification"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    train_filtered.to_parquet(output_dir / "train.parquet", index=False)
+    val_filtered.to_parquet(output_dir / "val.parquet", index=False)
+    test_filtered.to_parquet(output_dir / "test.parquet", index=False)
+    
+    # Update manifest for filtered data
+    manifest = {
+        "split_type": "temporal_stratified_classification",
+        "evaluable_classes": evaluable_classes,
+        "train_rows": len(train_filtered),
+        "val_rows": len(val_filtered),
+        "test_rows": len(test_filtered),
+        "train_class_counts": train_filtered["label"].value_counts().sort_index().to_dict(),
+        "val_class_counts": val_filtered["label"].value_counts().sort_index().to_dict(),
+        "test_class_counts": test_filtered["label"].value_counts().sort_index().to_dict(),
+        "note": "Temporal order preserved. For use after Task A flags anomalies.",
+    }
+    
+    with open(output_dir / "split_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    
+    logger.success(
+        f"classification: train={len(train_filtered):,}, "
+        f"val={len(val_filtered):,}, test={len(test_filtered):,}"
+    )
+    
+    # Report class distribution
+    logger.info("Class distribution in test set:")
+    for cls in evaluable_classes:
+        count = (test_filtered["label"] == cls).sum()
+        logger.info(f"  {cls}: {count:,} samples")
 
-    logger.success("Split artifacts written.")
-    logger.info(json.dumps(artifacts.manifest, indent=2))
+
+def run_prediction_split(df: pd.DataFrame, config: dict, output_base: Path) -> None:
+    """Generate episode-based split for fault prediction (Task C)."""
+    logger.info("=" * 50)
+    logger.info("[4/4] Fault Prediction — Episode-Based (Task C)")
+    logger.info("Episodes split temporally. Pre-fault zones go with their episode.")
+    
+    split_cfg = config.get("splits", {})
+    prediction_cfg = config.get("prediction", {})
+    
+    # Get forecast horizon from config or use default (30 min)
+    forecast_horizon = prediction_cfg.get("forecast_horizon_seconds", 1800)
+    
+    artifacts = prediction_episode_split(
+        df=df,
+        segment_col="segment_id",
+        label_col="label",
+        time_col="timestamp",
+        train_ratio=split_cfg.get("train_ratio", 0.70),
+        val_ratio=split_cfg.get("val_ratio", 0.15),
+        forecast_horizon_seconds=forecast_horizon,
+    )
+    
+    save_split(artifacts, output_base / "prediction", "prediction")
+    
+    # Report episode distribution
+    manifest = artifacts.manifest
+    logger.info(f"Total fault episodes: {manifest['n_fault_episodes']}")
+    logger.info(f"Train episodes: {manifest['train_fault_episodes']}, Test episodes: {manifest['test_fault_episodes']}")
+    logger.info(f"Train pre-fault samples: {manifest['train_prefault_samples']:,}")
+    logger.info(f"Test pre-fault samples: {manifest['test_prefault_samples']:,}")
+    
+    # Show per-class breakdown
+    logger.info("Episodes by class:")
+    for cls, info in manifest["episodes_by_class"].items():
+        status = "✓ evaluable" if info["evaluable"] else "✗ train-only"
+        logger.info(f"  {cls}: {info['n_episodes']} episodes ({status})")
+
+
+def main() -> None:
+    """Run all split pipelines."""
+    logger.info("=" * 60)
+    logger.info("SPLIT PIPELINE — Task-Specific Splits")
+    logger.info("=" * 60)
+    
+    config = load_config()
+    df = load_and_segment_data(config)
+    
+    output_base = PROJECT_ROOT / "data" / "interim" / "splits"
+    logger.info(f"Output directory: {output_base}")
+    
+    # Generate all splits
+    run_anomaly_semisup_split(df, config, output_base)
+    run_anomaly_supervised_split(df, config, output_base)
+    run_classification_split(df, config, output_base)
+    run_prediction_split(df, config, output_base)
+    
+    logger.info("=" * 60)
+    logger.success("All splits generated successfully!")
+    logger.info("=" * 60)
+    
+    # Summary
+    logger.info("Generated splits:")
+    logger.info("  • anomaly_semisup/    — Task A semi-supervised (train=normal-only)")
+    logger.info("  • anomaly_supervised/ — Task A supervised (temporal-stratified)")
+    logger.info("  • classification/     — Task B (evaluable classes only)")
+    logger.info("  • prediction/         — Task C (episode-based, pre-fault zones)")
 
 
 if __name__ == "__main__":
