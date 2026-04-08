@@ -77,17 +77,18 @@ stages:
 
   # Stage 2: Feature Engineering (post-preprocessing)
   featurize:
-    cmd: uv run python -m src.data.featurize_pipeline
+    cmd: uv run python -m src.data.featurize_pipeline --task classification
     deps:
       - src/data/features.py
       - src/data/featurize_pipeline.py
-      - data/processed/preprocessed/anomaly_supervised/train.parquet
-      - data/processed/preprocessed/anomaly_supervised/val.parquet
-      - data/processed/preprocessed/anomaly_supervised/test.parquet
+      - data/processed/preprocessed/classification/train.parquet
+      - data/processed/preprocessed/classification/val.parquet
+      - data/processed/preprocessed/classification/test.parquet
       - configs/data_config.yaml
     outs:
       - data/processed/features/runs
       - data/processed/features/latest_run.txt
+      - data/processed/features/latest_runs.json
 
   # Stage 3: Task A — Anomaly Detection Baselines
   train_anomaly:

@@ -113,6 +113,44 @@ feature_engineering:
     root_dir: data/processed/features
     runs_subdir: runs
 
+  # Task-specific overrides layered on top of base flags/selection/tsfresh.
+  # Resolution order: base config -> profile overrides -> common -> selected task.
+  task_directives:
+    default_task: classification
+    common:
+      flags: {}
+      selection: {}
+      tsfresh: {}
+      eda:
+        mi_top_key: top_features_binary
+        use_mannwhitney: true
+      tsfresh_label_strategy: any_fault
+
+    anomaly_semisup:
+      eda:
+        mi_top_key: top_features_binary
+        use_mannwhitney: true
+
+    anomaly_supervised:
+      eda:
+        mi_top_key: top_features_binary
+        use_mannwhitney: true
+
+    classification:
+      eda:
+        mi_top_key: top_features_multiclass
+        use_mannwhitney: false
+      tsfresh_label_strategy: majority_label
+
+    prediction:
+      selection:
+        eda_prefer_anchors_from_findings: false
+        eda_pre_drop_candidates: false
+      eda:
+        mi_top_key: top_features_binary
+        use_mannwhitney: false
+      tsfresh_label_strategy: any_fault
+
   profiles:
     baseline_raw:
       enable_hour_cyclic: false

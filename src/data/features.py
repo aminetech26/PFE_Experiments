@@ -456,6 +456,7 @@ def extract_tsfresh_segment_features(
     n_segments_sample: int = 60,
     max_rows_per_segment: int = 800,
     n_jobs: int = -1,
+    label_strategy: str = "any_fault",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], dict]:
     """
     Extract tsfresh segment-level features and merge them back per row by segment_id.
@@ -499,12 +500,18 @@ def extract_tsfresh_segment_features(
         impute_function=impute,
     )
 
-    segment_y = (
-        train_sample.groupby(segment_col)[label_col]
-        .apply(lambda s: int((s != 0).any()))
-        .reindex(train_feat.index)
-        .fillna(0)
-    )
+    if label_strategy == "any_fault":
+        segment_y = train_sample.groupby(segment_col)[label_col].apply(lambda s: int((s != 0).any()))
+    elif label_strategy == "majority_label":
+        segment_y = train_sample.groupby(segment_col)[label_col].apply(
+            lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[-1]
+        )
+    elif label_strategy == "fault_fraction":
+        segment_y = train_sample.groupby(segment_col)[label_col].apply(lambda s: float((s != 0).mean()))
+    else:
+        raise ValueError(f"Unsupported tsfresh label_strategy: {label_strategy}")
+
+    segment_y = segment_y.reindex(train_feat.index).fillna(0)
 
     if segment_y.nunique() > 1:
         selected = select_features(train_feat, segment_y)
@@ -549,7 +556,12 @@ def extract_tsfresh_segment_features(
     val_out = _transform_subset(val_df)
     test_out = _transform_subset(test_df)
 
-    meta = {"mode": mode, "selected": len(chosen_prefixed), "columns": chosen_prefixed}
+    meta = {
+        "mode": mode,
+        "selected": len(chosen_prefixed),
+        "columns": chosen_prefixed,
+        "label_strategy": label_strategy,
+    }
     logger.info(f"tsfresh {mode}: selected {len(chosen_prefixed)} features")
     return train_out, val_out, test_out, chosen_prefixed, meta
 

@@ -13,6 +13,7 @@ import json
 import math
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import yaml
@@ -31,8 +32,8 @@ from src.data.features import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
-INPUT_DIR = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "anomaly_supervised"
-OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed" / "features"
+
+TASK_CHOICES = ("anomaly_semisup", "anomaly_supervised", "classification", "prediction")
 
 
 def load_config() -> dict:
@@ -87,6 +88,67 @@ def _resolve_output_root(config: dict) -> tuple[Path, str]:
     return PROJECT_ROOT / root_dir, str(runs_subdir)
 
 
+def _resolve_input_dir(task: str) -> Path:
+    return PROJECT_ROOT / "data" / "processed" / "preprocessed" / task
+
+
+def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_task_and_directives(config: dict, task_arg: str | None) -> tuple[str, dict]:
+    fe_cfg = config.get("feature_engineering", {})
+    task_cfg_all = fe_cfg.get("task_directives", {})
+
+    default_task = str(task_cfg_all.get("default_task", "anomaly_supervised"))
+    task = task_arg or default_task
+    if task not in TASK_CHOICES:
+        raise ValueError(f"Unsupported task '{task}'. Expected one of: {TASK_CHOICES}")
+
+    common_cfg = task_cfg_all.get("common", {})
+    task_cfg = task_cfg_all.get(task, {})
+    merged = _merge_dict(common_cfg, task_cfg)
+    return task, merged
+
+
+def _apply_task_overrides(
+    flags: dict,
+    selection: dict,
+    tsfresh_cfg: dict,
+    task_directives: dict,
+) -> tuple[dict, dict, dict]:
+    eff_flags = dict(flags)
+    eff_selection = dict(selection)
+    eff_tsfresh = dict(tsfresh_cfg)
+
+    for key, value in task_directives.get("flags", {}).items():
+        if key.startswith("enable_"):
+            eff_flags[key] = value
+
+    eff_selection.update(task_directives.get("selection", {}))
+    eff_tsfresh.update(task_directives.get("tsfresh", {}))
+    return eff_flags, eff_selection, eff_tsfresh
+
+
+def _resolve_eda_policy(task: str, task_directives: dict) -> dict:
+    eda_cfg = task_directives.get("eda", {})
+    mi_top_key = eda_cfg.get("mi_top_key")
+    if not mi_top_key:
+        mi_top_key = "top_features_multiclass" if task == "classification" else "top_features_binary"
+
+    use_mannwhitney = bool(eda_cfg.get("use_mannwhitney", task != "prediction"))
+    return {
+        "mi_top_key": str(mi_top_key),
+        "use_mannwhitney": use_mannwhitney,
+    }
+
+
 def _load_eda_findings(project_root: Path, selection_cfg: dict) -> tuple[dict | None, dict]:
     use_eda = bool(selection_cfg.get("use_eda_findings", False))
     rel_path = selection_cfg.get("eda_findings_path", "data/interim/eda_feature_findings.json")
@@ -108,7 +170,11 @@ def _load_eda_findings(project_root: Path, selection_cfg: dict) -> tuple[dict | 
     }
 
 
-def _apply_eda_selection_priors(selection_cfg: dict, eda_findings: dict | None) -> tuple[dict, list[str]]:
+def _apply_eda_selection_priors(
+    selection_cfg: dict,
+    eda_findings: dict | None,
+    eda_policy: dict,
+) -> tuple[dict, list[str]]:
     effective = dict(selection_cfg)
     pre_drop: list[str] = []
 
@@ -125,8 +191,13 @@ def _apply_eda_selection_priors(selection_cfg: dict, eda_findings: dict | None) 
 
     anchors = set(effective.get("anchor_features", []))
     if effective.get("eda_prefer_anchors_from_findings", True):
-        mi_top = eda_findings.get("mutual_information", {}).get("top_features_binary", [])
-        mw_sig = eda_findings.get("mannwhitney", {}).get("significant_features", [])
+        mi_top_key = eda_policy.get("mi_top_key", "top_features_binary")
+        mi_top = eda_findings.get("mutual_information", {}).get(mi_top_key, [])
+        mw_sig = (
+            eda_findings.get("mannwhitney", {}).get("significant_features", [])
+            if eda_policy.get("use_mannwhitney", True)
+            else []
+        )
         anchors.update(mi_top[:5])
         anchors.update(mw_sig[:5])
     effective["anchor_features"] = sorted(anchors)
@@ -200,6 +271,12 @@ def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run feature engineering pipeline.")
     parser.add_argument(
+        "--task",
+        default=None,
+        choices=TASK_CHOICES,
+        help="Task split to featurize (default is configured task_directives.default_task).",
+    )
+    parser.add_argument(
         "--profile",
         default=None,
         help="Optional feature-engineering profile from data_config.yaml",
@@ -207,20 +284,35 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config()
-    flags, selection_cfg, tsfresh_cfg, profile_name = resolve_profile(config, args.profile)
+    task, task_directives = _resolve_task_and_directives(config, args.task)
+
+    base_flags, base_selection_cfg, base_tsfresh_cfg, profile_name = resolve_profile(config, args.profile)
+    flags, selection_cfg, tsfresh_cfg = _apply_task_overrides(
+        base_flags,
+        base_selection_cfg,
+        base_tsfresh_cfg,
+        task_directives,
+    )
+
+    input_dir = _resolve_input_dir(task)
     profile_key = _safe_name(profile_name or "default")
+    task_key = _safe_name(task)
     output_root, runs_subdir = _resolve_output_root(config)
     output_root.mkdir(parents=True, exist_ok=True)
     runs_root = output_root / runs_subdir
     runs_root.mkdir(parents=True, exist_ok=True)
 
+    eda_policy = _resolve_eda_policy(task, task_directives)
     eda_findings, eda_meta = _load_eda_findings(PROJECT_ROOT, selection_cfg)
-    selection_effective, eda_pre_drop = _apply_eda_selection_priors(selection_cfg, eda_findings)
+    selection_effective, eda_pre_drop = _apply_eda_selection_priors(selection_cfg, eda_findings, eda_policy)
     tsfresh_mode = _tsfresh_mode(tsfresh_cfg)
+    tsfresh_label_strategy = str(task_directives.get("tsfresh_label_strategy", "any_fault"))
 
     resolved_for_fingerprint = {
+        "task": task,
         "profile": profile_key,
         "flags": flags,
+        "task_directives": task_directives,
         "selection": {
             "corr_threshold": float(selection_effective.get("corr_threshold", 0.95)),
             "vif_threshold": float(selection_effective.get("vif_threshold", 10.0)),
@@ -239,23 +331,25 @@ def main() -> None:
             "top_k": int(tsfresh_cfg.get("top_k", 20)),
             "n_segments_sample": int(tsfresh_cfg.get("n_segments_sample", 60)),
             "max_rows_per_segment": int(tsfresh_cfg.get("max_rows_per_segment", 800)),
+            "label_strategy": tsfresh_label_strategy,
         },
     }
     config_fingerprint = _build_config_fingerprint(resolved_for_fingerprint)
-    run_dir = runs_root / f"{profile_key}__{config_fingerprint}"
+    run_dir = runs_root / f"{profile_key}__{task_key}__{config_fingerprint}"
 
-    if not INPUT_DIR.exists():
-        raise FileNotFoundError(f"Input directory not found: {INPUT_DIR}")
+    if not input_dir.exists():
+        raise FileNotFoundError(f"Input directory not found for task '{task}': {input_dir}")
 
     logger.info(f"Feature profile: {profile_name or 'default'}")
-    logger.info(f"Input: {INPUT_DIR}")
+    logger.info(f"Task: {task}")
+    logger.info(f"Input: {input_dir}")
     logger.info(f"Output root: {output_root}")
     logger.info(f"Run directory: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
 
     split_frames: dict[str, pd.DataFrame] = {}
     for subset in ("train", "val", "test"):
-        path = INPUT_DIR / f"{subset}.parquet"
+        path = input_dir / f"{subset}.parquet"
         if not path.exists():
             raise FileNotFoundError(f"Missing input split file: {path}")
         frame = pd.read_parquet(path)
@@ -326,6 +420,7 @@ def main() -> None:
                 n_segments_sample=int(tsfresh_cfg.get("n_segments_sample", 60)),
                 max_rows_per_segment=int(tsfresh_cfg.get("max_rows_per_segment", 800)),
                 n_jobs=int(tsfresh_cfg.get("n_jobs", -1)),
+                label_strategy=tsfresh_label_strategy,
             )
         )
 
@@ -350,13 +445,17 @@ def main() -> None:
         "profile": profile_name or "default",
         "config_fingerprint": config_fingerprint,
         "output_directory": str(run_dir),
+        "source_task": task,
+        "source_preprocessed_dir": str(input_dir),
         "label_column": label_col,
         "active_flags": flags,
+        "task_directives_effective": task_directives,
         "selection": {
             "corr_threshold": float(selection_effective.get("corr_threshold", 0.95)),
             "vif_threshold": float(selection_effective.get("vif_threshold", 10.0)),
             "anchor_features": selection_effective.get("anchor_features", []),
             "use_eda_findings": bool(selection_effective.get("use_eda_findings", False)),
+            "eda_policy": eda_policy,
             "eda_pre_drop_applied": eda_pre_drop,
             "corr_dropped": corr_dropped,
             "vif_dropped": vif_dropped,
@@ -374,11 +473,36 @@ def main() -> None:
         json.dump(manifest, f, indent=2, allow_nan=False)
 
     resolved_path = run_dir / "resolved_config.json"
+    resolved_payload = {
+        **to_json_safe(resolved_for_fingerprint),
+        "io": {
+            "input_dir": str(input_dir),
+            "output_root": str(output_root),
+            "run_dir": str(run_dir),
+        },
+    }
     with open(resolved_path, "w", encoding="utf-8") as f:
-        json.dump(to_json_safe(resolved_for_fingerprint), f, indent=2, allow_nan=False)
+        json.dump(resolved_payload, f, indent=2, allow_nan=False)
 
     latest_path = output_root / "latest_run.txt"
-    latest_path.write_text(str(run_dir.relative_to(output_root)), encoding="utf-8")
+    relative_run_dir = str(run_dir.relative_to(output_root))
+    latest_path.write_text(relative_run_dir, encoding="utf-8")
+
+    latest_by_task_path = output_root / "latest_runs.json"
+    latest_by_task: dict[str, Any] = {"latest_by_task": {}}
+    if latest_by_task_path.exists():
+        try:
+            loaded = json.loads(latest_by_task_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                latest_by_task = loaded
+        except Exception:
+            latest_by_task = {"latest_by_task": {}}
+    if "latest_by_task" not in latest_by_task or not isinstance(latest_by_task.get("latest_by_task"), dict):
+        latest_by_task["latest_by_task"] = {}
+
+    latest_by_task["latest_by_task"][task] = relative_run_dir
+    latest_by_task["updated_at"] = datetime.now(UTC).isoformat()
+    latest_by_task_path.write_text(json.dumps(to_json_safe(latest_by_task), indent=2), encoding="utf-8")
 
     logger.success(f"Feature engineering complete. Manifest: {manifest_path}")
 
