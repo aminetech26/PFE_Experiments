@@ -43,7 +43,7 @@ def load_config() -> dict:
 
 def load_and_segment_data(config: dict) -> pd.DataFrame:
     """
-    Load merged data and apply daytime filtering + segmentation.
+    Load merged data and apply segmentation.
     
     Returns DataFrame with 'timestamp', 'label', 'segment_id' columns.
     """
@@ -63,14 +63,7 @@ def load_and_segment_data(config: dict) -> pd.DataFrame:
     df = df.dropna(subset=["timestamp", "label"]).sort_values("timestamp").reset_index(drop=True)
     
     logger.info(f"Loaded {len(df):,} rows")
-    
-    # Daytime filtering
-    daytime_gti_threshold = float(split_cfg.get("daytime_gti_threshold", 10.0))
-    gti = df["GTI"].fillna(0) if "GTI" in df.columns else pd.Series(0, index=df.index)
-    df["is_daytime"] = gti > daytime_gti_threshold
-    df = df[df["is_daytime"]].reset_index(drop=True)
-    logger.info(f"After daytime filter (GTI > {daytime_gti_threshold}): {len(df):,} rows")
-    
+
     # Contiguous segmentation
     segmentation_gap_seconds = int(split_cfg.get("segmentation_gap_seconds", 300))
     dt_s = df["timestamp"].diff().dt.total_seconds().fillna(0)

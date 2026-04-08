@@ -13,7 +13,6 @@ splits:
   val_ratio: 0.15
   test_ratio: 0.15
   segmentation_gap_seconds: 300      # 5 min gap defines segment boundary
-  daytime_gti_threshold: 10.0        # W/m², filter nighttime
 
   # Evaluable fault classes (have ≥3 segments for train/val/test distribution)
   evaluable_classes: [3.1, 3.2, 4.0]
