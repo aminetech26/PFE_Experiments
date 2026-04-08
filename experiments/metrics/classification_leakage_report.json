@@ -1,0 +1,39 @@
+{
+  "label_shuffle": {
+    "real_f1": 1.0,
+    "mean_shuffle_f1": 0.8554748139527121,
+    "is_leaking": "True"
+  },
+  "duplicate_check": {
+    "train_samples": 48716,
+    "val_samples": 6295,
+    "overlapping_samples": 0,
+    "overlap_pct": 0.0,
+    "is_leaking": false
+  },
+  "feature_importance": {
+    "top_feature": "tsfresh__Eg__sum_values",
+    "top_importance": 0.5396145610277795,
+    "flagged_features": {},
+    "is_suspicious": "False"
+  },
+  "sanity_check": {
+    "metric": "val_f1_weighted",
+    "score": 1.0,
+    "warning_threshold": 0.99,
+    "is_suspicious": true
+  },
+  "bootstrap_ci": {
+    "metric": "f1_weighted",
+    "mean": 1.0,
+    "std": 0.0,
+    "ci_lower": 1.0,
+    "ci_upper": 1.0,
+    "n_bootstrap": 1000
+  },
+  "leakage_flags": [
+    "label_shuffle",
+    "sanity_check"
+  ],
+  "is_clean": false
+}

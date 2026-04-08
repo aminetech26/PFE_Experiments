@@ -105,8 +105,12 @@ stages:
     cmd: uv run python -m src.models.train_classification
     deps:
       - src/models/train_classification.py
-      - data/interim/splits/classification/
-      - configs/data_config.yaml
+      - src/training/feature_loader.py
+      - src/training/hyperparameter_optimizer.py
+      - configs/model_config.yaml
+      - data/processed/features/latest_runs.json
     metrics:
       - experiments/metrics/classification_results.json:
           cache: false
+    outs:
+      - experiments/checkpoints/classification/lightgbm_model.pkl

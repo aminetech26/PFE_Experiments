@@ -33,8 +33,8 @@ anomaly_detection:
 # TASK B — Fault Classification
 # ============================================================================
 classification:
+  active_model: lightgbm
   primary_metric: f1_weighted
-  loss: focal             # focal loss for class imbalance
 
   r1_models:
     lightgbm:
@@ -42,6 +42,10 @@ classification:
       learning_rate: [0.05, 0.1]
       num_leaves: [31, 63]
       subsample: [0.8, 1.0]
+      colsample_bytree: [0.7, 1.0]
+      reg_alpha: [1.0e-8, 10.0]
+      reg_lambda: [1.0e-8, 10.0]
+      min_child_samples: [10, 100]
     catboost:
       iterations: [300, 500]
       depth: [6, 8]
@@ -64,9 +68,10 @@ classification:
       n_levels: [4, 6]
 
   hpo:
-    sampler: tpe          # Bayesian TPE via Optuna
-    n_trials_phase1: 50   # wide random search
-    n_trials_phase2: 50   # narrow Bayesian
+    sampler: tpe
+    direction: maximize
+    n_trials_phase1: 50
+    timeout_seconds: null
 
 # ============================================================================
 # TASK C — Fault Forecasting
@@ -125,3 +130,8 @@ training:
   batch_size: 256
   gradient_clip_val: 1.0
   precision: 16-mixed       # mixed precision for faster training
+  threading:
+    prefer_physical_cores: true
+    reserve_cores: 1
+    max_threads: null
+    optuna_parallel_trials: 1
