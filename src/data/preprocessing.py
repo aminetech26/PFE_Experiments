@@ -382,22 +382,29 @@ def apply_irradiance_normalization(
     return df
 
 
-def linear_detrend_per_segment(
+def polynomial_detrend_per_segment(
     df: pd.DataFrame,
     features: list[str],
     segment_col: str = "segment_id",
     suffix: str = "_detrend",
+    degree: int = 2,
 ) -> pd.DataFrame:
     """
-    Remove linear trend within each segment.
+    Remove polynomial trend within each segment.
 
-    For each segment, fits y = a*t + b and subtracts the trend.
+    For each segment, fits y = a*t^n + ... + b*t + c and subtracts the trend.
+    
+    Why polynomial instead of linear?
+    - Temperature follows curved patterns (sunrise → peak → sunset)
+    - Degree 2 (parabola) or 3 (cubic) captures this better than straight line
+    - More accurate detrending = better stationarity
 
     Args:
         df: Input DataFrame (will be copied)
-        features: Features to detrend
+        features: Features to detrend (e.g., ["TA", "TPV"])
         segment_col: Segment ID column
         suffix: Suffix for new column names
+        degree: Polynomial degree (2=quadratic, 3=cubic)
 
     Returns:
         DataFrame with new detrended columns
@@ -408,17 +415,18 @@ def linear_detrend_per_segment(
         new_col = f"{feat}{suffix}"
 
         def detrend_segment(x: pd.Series) -> pd.Series:
-            if len(x) < 2:
-                return x - x.mean()  # Can't fit line with < 2 points
+            if len(x) <= degree:
+                # Not enough points to fit polynomial, just center
+                return x - x.mean()
             t = np.arange(len(x))
-            coeffs = np.polyfit(t, x.values, 1)
+            coeffs = np.polyfit(t, x.values, degree)
             trend = np.polyval(coeffs, t)
             return pd.Series(x.values - trend, index=x.index)
 
         df[new_col] = df.groupby(segment_col)[feat].transform(detrend_segment)
-        logger.debug(f"  Created {new_col} = {feat} (linear detrended per segment)")
+        logger.debug(f"  Created {new_col} = {feat} (polynomial deg={degree} detrended per segment)")
 
-    logger.info(f"Linear detrending: created {len(features)} new features")
+    logger.info(f"Polynomial detrending: created {len(features)} new features (degree={degree})")
     return df
 
 
@@ -454,8 +462,9 @@ def apply_stationarity_transforms(
     if detrend_config:
         features = detrend_config.get("features", [])
         suffix = detrend_config.get("suffix", "_detrend")
+        degree = detrend_config.get("degree", 2)  # Default: quadratic
 
-        df = linear_detrend_per_segment(df, features, segment_col, suffix)
+        df = polynomial_detrend_per_segment(df, features, segment_col, suffix, degree)
         features_detrended = [f"{f}{suffix}" for f in features]
 
     stats = StationarityStats(
@@ -524,7 +533,7 @@ def preprocess(
     df, stat_stats = apply_stationarity_transforms(
         df,
         irradiance_config=stat_config.get("irradiance_normalize"),
-        detrend_config=stat_config.get("linear_detrend"),
+        detrend_config=stat_config.get("polynomial_detrend", stat_config.get("linear_detrend")),
         segment_col=segment_col,
     )
 

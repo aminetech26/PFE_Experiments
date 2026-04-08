@@ -161,9 +161,10 @@ def create_manifest(
         suffix = stat_config["irradiance_normalize"].get("suffix", "_norm")
         manifest["features_created"].extend([f"{f}{suffix}" for f in features])
 
-    if stat_config.get("linear_detrend"):
-        features = stat_config["linear_detrend"].get("features", [])
-        suffix = stat_config["linear_detrend"].get("suffix", "_detrend")
+    detrend_cfg = stat_config.get("polynomial_detrend", stat_config.get("linear_detrend"))
+    if detrend_cfg:
+        features = detrend_cfg.get("features", [])
+        suffix = detrend_cfg.get("suffix", "_detrend")
         manifest["features_created"].extend([f"{f}{suffix}" for f in features])
 
     with open(output_path, "w", encoding="utf-8") as f:

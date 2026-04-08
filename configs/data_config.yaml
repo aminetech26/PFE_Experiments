@@ -86,8 +86,9 @@ preprocessing:
       denominator: GTI
       suffix: _norm
     
-    # Linear detrending: removes slow thermal drift per segment
-    linear_detrend:
+    # Polynomial detrending: removes curved thermal drift per segment
+    polynomial_detrend:
       features: [TA, TPV]               # temperature features
       scope: per_segment
       suffix: _detrend
+      degree: 2                         # polynomial degree (2=quadratic, better for curved temp patterns)
