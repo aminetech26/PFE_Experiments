@@ -336,35 +336,47 @@ def apply_irradiance_normalization(
     features: list[str],
     denominator: str = "GTI",
     suffix: str = "_norm",
-    min_denominator: float = 10.0,
+    min_denominator: float = 5.0,
 ) -> pd.DataFrame:
     """
     Normalize features by irradiance to remove diurnal non-stationarity.
+    
+    ⚠️ IMPORTANT: Since GTI filtering was removed, low GTI values (dawn/dusk/cloudy)
+    are present in the data. Division by very low GTI produces unreliable values.
+    
+    Strategy: Floor GTI to min_denominator before division. When GTI < 5 W/m², 
+    use 5 W/m² for division. This avoids division by near-zero while keeping 
+    data complete (no new NaNs created).
 
     Args:
         df: Input DataFrame (will be copied)
         features: Features to normalize (e.g., ["Pg", "Ig"])
         denominator: Irradiance column to divide by
         suffix: Suffix for new column names
-        min_denominator: Minimum denominator value (safety check)
+        min_denominator: Minimum denominator value for safe division (default: 5 W/m²)
 
     Returns:
         DataFrame with new normalized columns
     """
     df = df.copy()
 
-    # Safety check: verify GTI > min threshold
-    low_gti_count = (df[denominator] < min_denominator).sum()
+    # Count low GTI rows (expected: dawn/dusk/cloudy)
+    low_gti_mask = df[denominator] < min_denominator
+    low_gti_count = low_gti_mask.sum()
+    
     if low_gti_count > 0:
-        logger.warning(
-            f"Found {low_gti_count} rows with {denominator} < {min_denominator}. "
-            f"These should have been filtered. Normalization may produce large values."
+        logger.info(
+            f"Found {low_gti_count} rows ({low_gti_count/len(df)*100:.1f}%) with {denominator} < {min_denominator} W/m². "
+            f"Using floor value {min_denominator} W/m² for division (dawn/dusk/cloudy)."
         )
 
+    # Safe division: floor GTI to min_denominator
+    safe_gti = df[denominator].clip(lower=min_denominator)
+    
     for feat in features:
         new_col = f"{feat}{suffix}"
-        df[new_col] = df[feat] / df[denominator]
-        logger.debug(f"  Created {new_col} = {feat} / {denominator}")
+        df[new_col] = df[feat] / safe_gti
+        logger.debug(f"  Created {new_col} = {feat} / max({denominator}, {min_denominator})")
 
     logger.info(f"Irradiance normalization: created {len(features)} new features")
     return df
