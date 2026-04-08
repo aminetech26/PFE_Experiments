@@ -225,6 +225,19 @@ def _build_config_fingerprint(payload: dict) -> str:
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
 
 
+def _resolve_run_dir(base_run_dir: Path) -> Path:
+    """Return a non-colliding run directory path.
+
+    First run keeps deterministic naming. If the exact directory already exists,
+    append a timestamp suffix so repeated runs don't overwrite prior artifacts.
+    """
+    if not base_run_dir.exists():
+        return base_run_dir
+
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    return base_run_dir.with_name(f"{base_run_dir.name}__{stamp}")
+
+
 def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, list[str]]:
     """Apply enabled feature generators and return added feature names."""
     out = df.copy()
@@ -299,7 +312,8 @@ def main() -> None:
     task_key = _safe_name(task)
     output_root, runs_subdir = _resolve_output_root(config)
     output_root.mkdir(parents=True, exist_ok=True)
-    runs_root = output_root / runs_subdir
+    task_output_root = output_root / task_key
+    runs_root = task_output_root / runs_subdir
     runs_root.mkdir(parents=True, exist_ok=True)
 
     eda_policy = _resolve_eda_policy(task, task_directives)
@@ -335,7 +349,8 @@ def main() -> None:
         },
     }
     config_fingerprint = _build_config_fingerprint(resolved_for_fingerprint)
-    run_dir = runs_root / f"{profile_key}__{task_key}__{config_fingerprint}"
+    base_run_dir = runs_root / f"{profile_key}__{config_fingerprint}"
+    run_dir = _resolve_run_dir(base_run_dir)
 
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory not found for task '{task}': {input_dir}")
@@ -484,9 +499,7 @@ def main() -> None:
     with open(resolved_path, "w", encoding="utf-8") as f:
         json.dump(resolved_payload, f, indent=2, allow_nan=False)
 
-    latest_path = output_root / "latest_run.txt"
     relative_run_dir = str(run_dir.relative_to(output_root))
-    latest_path.write_text(relative_run_dir, encoding="utf-8")
 
     latest_by_task_path = output_root / "latest_runs.json"
     latest_by_task: dict[str, Any] = {"latest_by_task": {}}
@@ -500,7 +513,23 @@ def main() -> None:
     if "latest_by_task" not in latest_by_task or not isinstance(latest_by_task.get("latest_by_task"), dict):
         latest_by_task["latest_by_task"] = {}
 
+    if "latest_by_task_profile" not in latest_by_task or not isinstance(
+        latest_by_task.get("latest_by_task_profile"), dict
+    ):
+        latest_by_task["latest_by_task_profile"] = {}
+
     latest_by_task["latest_by_task"][task] = relative_run_dir
+    task_profile_map = latest_by_task["latest_by_task_profile"].setdefault(task, {})
+    if not isinstance(task_profile_map, dict):
+        task_profile_map = {}
+        latest_by_task["latest_by_task_profile"][task] = task_profile_map
+    task_profile_map[profile_key] = relative_run_dir
+
+    latest_by_task["last_run"] = {
+        "task": task,
+        "profile": profile_key,
+        "path": relative_run_dir,
+    }
     latest_by_task["updated_at"] = datetime.now(UTC).isoformat()
     latest_by_task_path.write_text(json.dumps(to_json_safe(latest_by_task), indent=2), encoding="utf-8")
 

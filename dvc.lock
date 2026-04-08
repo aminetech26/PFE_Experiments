@@ -36,16 +36,16 @@ stages:
     deps:
     - path: configs/data_config.yaml
       hash: md5
-      md5: 2e9c61230894a94fc88a7623f841ea9b
-      size: 3816
+      md5: 939294e5a76396761913ee91876eca5a
+      size: 8669
     - path: data/interim/reunion_dt2_merged.parquet
       hash: md5
       md5: d529e1bbcef3949ede21635c03040701
       size: 44545623
     - path: src/data/split_pipeline.py
       hash: md5
-      md5: 6e436caa7da11ad23bd5fba07c9709f2
-      size: 10563
+      md5: 6fc83f8a6bbbd4819768992c5290a219
+      size: 10720
     - path: src/data/splitting.py
       hash: md5
       md5: 781994e47cfa25c3b2820055cfd8f670
@@ -120,8 +120,8 @@ stages:
     deps:
     - path: configs/data_config.yaml
       hash: md5
-      md5: 2e9c61230894a94fc88a7623f841ea9b
-      size: 3816
+      md5: 939294e5a76396761913ee91876eca5a
+      size: 8669
     - path: data/interim/splits/anomaly_semisup/test.parquet
       hash: md5
       md5: 3672689128fc6489494f800bf538055c
@@ -172,8 +172,8 @@ stages:
       size: 10791478
     - path: src/data/preprocess_pipeline.py
       hash: md5
-      md5: 32f51ef194a3d7cbffd648e506196da0
-      size: 8072
+      md5: 3da76215c39c187153b73cf7e61d884f
+      size: 7994
     - path: src/data/preprocessing.py
       hash: md5
       md5: 1a82e93a6e4031a04868053fb0079977
@@ -229,5 +229,38 @@ stages:
       size: 27613880
     - path: data/processed/preprocessed/preprocess_manifest.json
       hash: md5
-      md5: ea34fdc9a62b85d8d8aebe3c046b6a2a
+      md5: 4bcb0bf7d6fc3497a3cea623adb4489d
       size: 24558
+  featurize:
+    cmd: uv run python -m src.data.featurize_pipeline --profile 
+      plus_tsfresh_minimal --task classification
+    deps:
+    - path: configs/data_config.yaml
+      hash: md5
+      md5: 939294e5a76396761913ee91876eca5a
+      size: 8669
+    - path: data/processed/preprocessed/classification/test.parquet
+      hash: md5
+      md5: d7a41cf4cf28f7e4ac1f41012290edf1
+      size: 1214410
+    - path: data/processed/preprocessed/classification/train.parquet
+      hash: md5
+      md5: fdb0f80823b938e8202db8570ed5af62
+      size: 3710482
+    - path: data/processed/preprocessed/classification/val.parquet
+      hash: md5
+      md5: ac2dfa583c584709fce068ba03d4ddf0
+      size: 558584
+    - path: src/data/features.py
+      hash: md5
+      md5: d5b47b65d15211601b2d51953fc78e74
+      size: 20390
+    - path: src/data/featurize_pipeline.py
+      hash: md5
+      md5: b8963be44f8a66044ba58e7cdf81c8c2
+      size: 21367
+    outs:
+    - path: data/processed/features/latest_runs.json
+      hash: md5
+      md5: 34a24383a2946d0afb7e2e782a5c5f32
+      size: 492
