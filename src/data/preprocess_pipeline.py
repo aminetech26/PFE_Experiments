@@ -20,6 +20,7 @@ import pandas as pd
 import yaml
 from loguru import logger
 
+from src.data.features import DEFAULT_BASE_FEATURE_COLUMNS
 from src.data.preprocessing import preprocess
 
 
@@ -33,10 +34,9 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def get_feature_cols(config: dict) -> list[str]:
-    """Get feature columns from config."""
-    features = config.get("features", {}).get("reunion", {})
-    return features.get("electrical", []) + features.get("meteorological", [])
+def get_feature_cols() -> list[str]:
+    """Get default base feature columns used by preprocessing."""
+    return list(DEFAULT_BASE_FEATURE_COLUMNS)
 
 
 def preprocess_split(
@@ -181,8 +181,8 @@ def main() -> None:
 
     config = load_config()
     preprocess_config = config.get("preprocessing", {})
-    feature_cols = get_feature_cols(config)
-    label_col = config.get("label_columns", {}).get("reunion", "Fault")
+    feature_cols = get_feature_cols()
+    label_col = "Fault"
 
     logger.info(f"Feature columns: {feature_cols}")
     logger.info(f"Label column: {label_col}")

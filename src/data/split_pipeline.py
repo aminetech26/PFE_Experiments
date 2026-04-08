@@ -49,7 +49,7 @@ def load_and_segment_data(config: dict) -> pd.DataFrame:
     """
     paths = config["paths"]
     split_cfg = config["splits"]
-    label_col = config["label_columns"]["reunion"]
+    label_col = "Fault"
     
     interim_dir = PROJECT_ROOT / paths["interim_dir"]
     input_path = interim_dir / "reunion_dt2_merged.parquet"
@@ -59,7 +59,10 @@ def load_and_segment_data(config: dict) -> pd.DataFrame:
     
     # Standardize column names
     df["timestamp"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    df["label"] = df[label_col]
+    if label_col in df.columns:
+        df["label"] = df[label_col]
+    elif "label" not in df.columns:
+        raise KeyError(f"Missing required label column '{label_col}' and no fallback 'label' column found.")
     df = df.dropna(subset=["timestamp", "label"]).sort_values("timestamp").reset_index(drop=True)
     
     logger.info(f"Loaded {len(df):,} rows")

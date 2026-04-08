@@ -86,9 +86,8 @@ stages:
       - data/processed/preprocessed/anomaly_supervised/test.parquet
       - configs/data_config.yaml
     outs:
-      - data/processed/features/train.parquet
-      - data/processed/features/val.parquet
-      - data/processed/features/test.parquet
+      - data/processed/features/runs
+      - data/processed/features/latest_run.txt
 
   # Stage 3: Task A — Anomaly Detection Baselines
   train_anomaly:

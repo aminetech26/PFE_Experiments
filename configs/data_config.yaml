@@ -30,27 +30,6 @@ prediction:
   min_episodes_for_eval: 3           # Minimum episodes to be evaluable
 
 # =============================================================================
-# FEATURE CONFIGURATION
-# =============================================================================
-
-features:
-  reunion:
-    electrical: [Ia, Ig, Eg, Fg, Pg, Va, Vg]
-    meteorological: [GTI, DTI, TA, TPV]
-    physics: [performance_ratio, delta_temp, dP_dt, dV_dt, dI_dt, Vg_normalized]
-
-window:
-  size: 60          # timesteps per window
-  step: 30          # stride (50% overlap)
-
-label_columns:
-  reunion: Fault    # 0.0=normal, 1.0-4.0=fault types
-
-scaling:
-  method: robust    # RobustScaler (outlier-resistant)
-  fit_on: train     
-
-# =============================================================================
 # PREPROCESSING CONFIGURATION
 # =============================================================================
 # Based on EDA findings documented in PREPROCESSING_DECISIONS.md
@@ -92,3 +71,150 @@ preprocessing:
       scope: per_segment
       suffix: _detrend
       degree: 2                         # polynomial degree (2=quadratic, better for curved temp patterns)
+
+# =============================================================================
+# FEATURE ENGINEERING CONFIGURATION
+# =============================================================================
+
+feature_engineering:
+  # Per-component flags for ablation experiments (no code edits required)
+  flags:
+    enable_hour_cyclic: true
+    enable_performance_ratio: true
+    enable_delta_temp: true
+    enable_dP_dt: true
+    enable_dV_dt: true
+    enable_dI_dt: true
+    enable_Vg_normalized: true
+    enable_corr_pruning: true
+    enable_vif_pruning: true
+    enable_wavelet: false
+    enable_differential_signal: false
+
+  selection:
+    corr_threshold: 0.95
+    vif_threshold: 10.0
+    max_vif_rows: 50000
+    anchor_features: [performance_ratio, delta_temp, dP_dt, dV_dt, dI_dt]
+    use_eda_findings: true
+    eda_findings_path: data/interim/eda_feature_findings.json
+    eda_prefer_anchors_from_findings: true
+    eda_pre_drop_candidates: true
+    eda_override_thresholds: false
+
+  tsfresh:
+    mode: minimal               # off | minimal | extensive
+    top_k: 20
+    n_segments_sample: 60
+    max_rows_per_segment: 800
+    n_jobs: 1
+
+  outputs:
+    root_dir: data/processed/features
+    runs_subdir: runs
+
+  profiles:
+    baseline_raw:
+      enable_hour_cyclic: false
+      enable_performance_ratio: false
+      enable_delta_temp: false
+      enable_dP_dt: false
+      enable_dV_dt: false
+      enable_dI_dt: false
+      enable_Vg_normalized: false
+      enable_corr_pruning: false
+      enable_vif_pruning: false
+      enable_wavelet: false
+      enable_differential_signal: false
+      tsfresh_mode: "off"
+    plus_physics:
+      enable_hour_cyclic: false
+      enable_performance_ratio: true
+      enable_delta_temp: true
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_Vg_normalized: true
+      enable_corr_pruning: true
+      enable_vif_pruning: true
+      enable_wavelet: false
+      enable_differential_signal: false
+      tsfresh_mode: "off"
+    plus_temporal:
+      enable_hour_cyclic: true
+      enable_performance_ratio: true
+      enable_delta_temp: true
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_Vg_normalized: true
+      enable_corr_pruning: true
+      enable_vif_pruning: true
+      enable_wavelet: false
+      enable_differential_signal: false
+      tsfresh_mode: "off"
+    plus_tsfresh_minimal:
+      enable_hour_cyclic: true
+      enable_performance_ratio: true
+      enable_delta_temp: true
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_Vg_normalized: true
+      enable_corr_pruning: true
+      enable_vif_pruning: true
+      enable_wavelet: false
+      enable_differential_signal: false
+      tsfresh_mode: "minimal"
+    plus_tsfresh_extensive:
+      enable_hour_cyclic: true
+      enable_performance_ratio: true
+      enable_delta_temp: true
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_Vg_normalized: true
+      enable_corr_pruning: true
+      enable_vif_pruning: true
+      enable_wavelet: false
+      enable_differential_signal: false
+      tsfresh_mode: "extensive"
+    plus_wavelet:
+      enable_hour_cyclic: true
+      enable_performance_ratio: true
+      enable_delta_temp: true
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_Vg_normalized: true
+      enable_corr_pruning: true
+      enable_vif_pruning: true
+      enable_wavelet: true
+      enable_differential_signal: false
+      tsfresh_mode: "off"
+    plus_differential:
+      enable_hour_cyclic: true
+      enable_performance_ratio: true
+      enable_delta_temp: true
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_Vg_normalized: true
+      enable_corr_pruning: true
+      enable_vif_pruning: true
+      enable_wavelet: false
+      enable_differential_signal: true
+      tsfresh_mode: "off"
+    plus_all:
+      enable_hour_cyclic: true
+      enable_performance_ratio: true
+      enable_delta_temp: true
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_Vg_normalized: true
+      enable_corr_pruning: true
+      enable_vif_pruning: true
+      enable_wavelet: true
+      enable_differential_signal: true
+      tsfresh_mode: "extensive"
