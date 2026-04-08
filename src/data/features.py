@@ -83,6 +83,11 @@ def create_sliding_windows(
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """
     Convert a time-series DataFrame into overlapping windows.
+    
+    ⚠️ TODO: Add segment_col parameter to respect segment boundaries!
+    Current implementation can create windows that span overnight gaps
+    and multi-day gaps, violating the constraint in EDA that windows
+    should only contain rows with the same segment_id.
 
     Args:
         df: DataFrame sorted by time

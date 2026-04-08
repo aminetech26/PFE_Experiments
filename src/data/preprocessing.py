@@ -246,22 +246,34 @@ def compute_iqr_bounds(
     return lower, upper
 
 
-def clip_outliers(
+def winsorize_outliers(
     df: pd.DataFrame,
     feature_cols: list[str],
     label_col: str = "Fault",
-    multiplier: float = 3.0,
+    iqr_multiplier: float = 3.0,
+    lower_percentile: float = 0.05,
+    upper_percentile: float = 0.95,
     scope: Literal["normal_only", "all"] = "normal_only",
 ) -> tuple[pd.DataFrame, OutlierStats]:
     """
-    Clip outliers using IQR method.
+    Two-step outlier handling: IQR detection + percentile winsorizing.
+    
+    Step 1: Detect outliers using IQR bounds (Q1 - k×IQR, Q3 + k×IQR)
+    Step 2: Replace detected outliers with percentile values (5th, 95th)
+    
+    This approach:
+    - Uses conservative IQR bounds to flag extreme values
+    - Replaces them with less extreme percentile values
+    - Preserves more data distribution than hard clipping
 
     Args:
         df: Input DataFrame (will be copied)
         feature_cols: Columns to process
         label_col: Label column (0 = normal)
-        multiplier: IQR multiplier (3.0 = far outliers)
-        scope: "normal_only" clips only normal data, "all" clips everything
+        iqr_multiplier: IQR multiplier for detection (3.0 = far outliers)
+        lower_percentile: Lower replacement value (e.g., 0.05 = 5th percentile)
+        upper_percentile: Upper replacement value (e.g., 0.95 = 95th percentile)
+        scope: "normal_only" processes only normal data, "all" processes everything
 
     Returns:
         Tuple of (processed DataFrame, statistics)
@@ -273,34 +285,42 @@ def clip_outliers(
     bounds: dict[str, tuple[float, float]] = {}
 
     for col in feature_cols:
-        # Compute bounds on normal data only
+        # Compute on normal data only
         col_data = df.loc[normal_mask, col].dropna()
         if col_data.empty:
             continue
 
-        lower, upper = compute_iqr_bounds(col_data, multiplier)
-        bounds[col] = (lower, upper)
+        # Step 1: Compute IQR bounds for outlier DETECTION
+        iqr_lower, iqr_upper = compute_iqr_bounds(col_data, iqr_multiplier)
+        
+        # Step 2: Compute percentile values for REPLACEMENT
+        percentile_lower = col_data.quantile(lower_percentile)
+        percentile_upper = col_data.quantile(upper_percentile)
+        
+        bounds[col] = (percentile_lower, percentile_upper)
 
-        # Apply clipping based on scope
+        # Apply based on scope
         if scope == "normal_only":
-            clip_mask = normal_mask
+            process_mask = normal_mask
         else:
-            clip_mask = pd.Series(True, index=df.index)
+            process_mask = pd.Series(True, index=df.index)
 
-        # Count outliers before clipping
-        outlier_mask = clip_mask & ((df[col] < lower) | (df[col] > upper))
+        # Identify outliers using IQR bounds
+        outlier_mask = process_mask & ((df[col] < iqr_lower) | (df[col] > iqr_upper))
         clipped_counts[col] = outlier_mask.sum()
 
-        # Clip
-        df.loc[clip_mask, col] = df.loc[clip_mask, col].clip(lower, upper)
+        # Replace outliers with percentile values
+        df.loc[process_mask & (df[col] < iqr_lower), col] = percentile_lower
+        df.loc[process_mask & (df[col] > iqr_upper), col] = percentile_upper
 
         if clipped_counts[col] > 0:
             logger.debug(
-                f"  {col}: clipped {clipped_counts[col]} outliers to [{lower:.2f}, {upper:.2f}]"
+                f"  {col}: detected {clipped_counts[col]} outliers (IQR bounds [{iqr_lower:.2f}, {iqr_upper:.2f}]), "
+                f"replaced with percentiles [{percentile_lower:.2f}, {percentile_upper:.2f}]"
             )
 
     total_clipped = sum(clipped_counts.values())
-    logger.info(f"Outlier clipping: {total_clipped} values clipped across {len(feature_cols)} features")
+    logger.info(f"Outlier winsorizing: {total_clipped} values winsorized across {len(feature_cols)} features")
 
     stats = OutlierStats(clipped_counts=clipped_counts, bounds=bounds)
     return df, stats
@@ -477,11 +497,13 @@ def preprocess(
 
     # 2. Outlier treatment
     outlier_config = config.get("outliers", {})
-    df, outlier_stats = clip_outliers(
+    df, outlier_stats = winsorize_outliers(
         df,
         feature_cols=feature_cols,
         label_col=label_col,
-        multiplier=outlier_config.get("iqr_multiplier", 3.0),
+        iqr_multiplier=outlier_config.get("iqr_multiplier", 3.0),
+        lower_percentile=outlier_config.get("lower_percentile", 0.05),
+        upper_percentile=outlier_config.get("upper_percentile", 0.95),
         scope=outlier_config.get("scope", "normal_only"),
     )
 

@@ -69,10 +69,11 @@ preprocessing:
   # IQR 3× is conservative — only catches far outliers (sensor errors)
   # Fault data outliers are expected signatures, not errors
   outliers:
-    method: iqr
-    iqr_multiplier: 3.0                # 3× IQR (far outliers only)
-    action: clip                        # winsorize to bounds
-    scope: normal_only                  # don't touch fault data
+    method: iqr_winsorize                # IQR detection + percentile replacement
+    iqr_multiplier: 3.0                  # 3× IQR for outlier detection
+    lower_percentile: 0.05               # Replace outliers with 5th percentile
+    upper_percentile: 0.95               # Replace outliers with 95th percentile
+    scope: normal_only                   # don't touch fault data
   
   # --- Stationarity Correction ---
   # STL not applicable (segments < 2 seasonal cycles)
