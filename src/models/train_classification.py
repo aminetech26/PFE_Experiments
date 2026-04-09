@@ -176,13 +176,20 @@ def main() -> None:
 
     features = manifest.get("final_features", [])
     label_column = manifest.get("label_column", "label")
+    effective_profile = str(manifest.get("profile") or args.profile)
+    requested_profile = args.profile
+    effective_run_id = resolved_run_dir.name
+    run_selection_mode = (
+        "run_id" if args.run_id else "run_dir" if args.run_dir else "profile_latest"
+    )
     if not features:
         raise ValueError("features_manifest.json does not contain final_features")
 
     logger.info(
-        "Using feature run | dir={} profile={} run_id={} n_features={}",
+        "Using feature run | dir={} requested_profile={} effective_profile={} run_id={} n_features={}",
         resolved_run_dir,
-        args.profile,
+        requested_profile,
+        effective_profile,
         args.run_id,
         len(features),
     )
@@ -213,8 +220,10 @@ def main() -> None:
             {
                 "task": args.task,
                 "model_family": "lightgbm",
-                "feature_profile": args.profile,
-                "feature_run_id": args.run_id or "",
+                "feature_profile": effective_profile,
+                "feature_profile_requested": requested_profile,
+                "feature_run_id": effective_run_id,
+                "feature_run_selection_mode": run_selection_mode,
                 "feature_run_dir": str(resolved_run_dir),
             }
         )
@@ -222,11 +231,15 @@ def main() -> None:
         mlflow.log_params(
             {
                 "task": args.task,
-                "feature_profile": args.profile,
+                "feature_profile": effective_profile,
+                "feature_profile_requested": requested_profile,
+                "feature_run_id": effective_run_id,
+                "feature_run_selection_mode": run_selection_mode,
                 "feature_count": len(features),
                 "label_column": label_column,
                 "optuna_enabled": not args.no_optuna,
-                "optuna_n_trials": int(n_trials),
+                "optuna_n_trials_requested": int(n_trials),
+                "optuna_n_trials_executed": 0 if args.no_optuna else int(n_trials),
                 "cpu_logical_cores": int(threading_plan["cpu_logical_cores"]),
                 "cpu_physical_cores": int(threading_plan["cpu_physical_cores"]) if threading_plan["cpu_physical_cores"] else -1,
                 "thread_budget": int(threading_plan["thread_budget"]),
@@ -320,7 +333,10 @@ def main() -> None:
             "model": "lightgbm",
             "run_name": run_name,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "feature_profile": args.profile,
+            "feature_profile": effective_profile,
+            "feature_profile_requested": requested_profile,
+            "feature_run_id": effective_run_id,
+            "feature_run_selection_mode": run_selection_mode,
             "feature_run_dir": str(resolved_run_dir),
             "feature_count": len(features),
             "n_classes": int(len(encoder.classes_)),
@@ -396,11 +412,14 @@ def main() -> None:
             "run_name": run_name,
             "task": args.task,
             "model": "lightgbm",
-            "feature_profile": args.profile,
-            "feature_run_id": args.run_id,
+            "feature_profile": effective_profile,
+            "feature_profile_requested": requested_profile,
+            "feature_run_id": effective_run_id,
+            "feature_run_selection_mode": run_selection_mode,
             "feature_run_dir": str(resolved_run_dir),
             "optuna_enabled": not args.no_optuna,
-            "optuna_n_trials": int(n_trials),
+            "optuna_n_trials_requested": int(n_trials),
+            "optuna_n_trials_executed": 0 if args.no_optuna else int(n_trials),
             "test_accuracy": accuracy,
             "test_f1_weighted": f1_weighted,
             "test_f1_macro": f1_macro,

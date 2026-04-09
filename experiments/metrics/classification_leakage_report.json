@@ -1,7 +1,7 @@
 {
   "label_shuffle": {
-    "real_f1": 1.0,
-    "mean_shuffle_f1": 0.8554748139527121,
+    "real_f1": 0.9729288975864319,
+    "mean_shuffle_f1": 0.9112246127856615,
     "is_leaking": "True"
   },
   "duplicate_check": {
@@ -12,8 +12,8 @@
     "is_leaking": false
   },
   "feature_importance": {
-    "top_feature": "tsfresh__Eg__sum_values",
-    "top_importance": 0.5396145610277795,
+    "top_feature": "Eg",
+    "top_importance": 0.16279700880472753,
     "flagged_features": {},
     "is_suspicious": "False"
   },
