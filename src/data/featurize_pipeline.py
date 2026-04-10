@@ -35,6 +35,22 @@ CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
 
 TASK_CHOICES = ("anomaly_semisup", "anomaly_supervised", "classification", "prediction")
 
+PROFILE_FLAG_KEYS = {
+    "wavelet_threshold_strategy",
+    "include_preprocessed_stationarity_features",
+    "preprocessed_stationarity_suffixes",
+}
+
+DERIVED_FEATURE_ENABLE_FLAGS = {
+    "delta_temp": "enable_delta_temp",
+    "dP_dt": "enable_dP_dt",
+    "dV_dt": "enable_dV_dt",
+    "dI_dt": "enable_dI_dt",
+    "Vg_normalized": "enable_Vg_normalized",
+    "Pg_wavelet": "enable_wavelet",
+    "delta_p": "enable_differential_signal",
+}
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -53,9 +69,7 @@ def resolve_profile(config: dict, profile_name: str | None) -> tuple[dict, dict,
         if profile is None:
             raise ValueError(f"Unknown feature engineering profile: {profile_name}")
         for key, value in profile.items():
-            if key.startswith("enable_"):
-                flags[key] = value
-            elif key == "wavelet_threshold_strategy":
+            if key.startswith("enable_") or key in PROFILE_FLAG_KEYS:
                 flags[key] = value
             elif key == "tsfresh_mode":
                 tsfresh_cfg["mode"] = value
@@ -130,7 +144,7 @@ def _apply_task_overrides(
     eff_tsfresh = dict(tsfresh_cfg)
 
     for key, value in task_directives.get("flags", {}).items():
-        if key.startswith("enable_"):
+        if key.startswith("enable_") or key in PROFILE_FLAG_KEYS:
             eff_flags[key] = value
 
     eff_selection.update(task_directives.get("selection", {}))
@@ -240,6 +254,93 @@ def _resolve_run_dir(base_run_dir: Path) -> Path:
     return base_run_dir.with_name(f"{base_run_dir.name}__{stamp}")
 
 
+def _detect_preprocessed_stationarity_columns(
+    split_frames: dict[str, pd.DataFrame],
+    suffixes: list[str],
+) -> list[str]:
+    """Detect stationarity columns already created during preprocessing.
+
+    A column is included if it ends with one of the configured suffixes and
+    exists across train/val/test, so downstream column selection remains safe.
+    """
+    if not suffixes:
+        return []
+
+    train_cols = list(split_frames["train"].columns)
+    matched = [c for c in train_cols if any(c.endswith(suffix) for suffix in suffixes)]
+    return [c for c in matched if all(c in split_frames[s].columns for s in ("val", "test"))]
+
+
+def _apply_eda_predrop_before_feature_generation(
+    split_frames: dict[str, pd.DataFrame],
+    pre_drop_cols: list[str],
+) -> tuple[dict[str, pd.DataFrame], list[str], list[str]]:
+    """Drop EDA pre-drop columns from all splits before feature generation."""
+    applied: list[str] = []
+    unavailable: list[str] = []
+
+    for col in pre_drop_cols:
+        if any(col in split_frames[s].columns for s in ("train", "val", "test")):
+            applied.append(col)
+        else:
+            unavailable.append(col)
+
+    if not applied:
+        return split_frames, applied, unavailable
+
+    updated: dict[str, pd.DataFrame] = {}
+    for subset, frame in split_frames.items():
+        drop_cols = [c for c in applied if c in frame.columns]
+        updated[subset] = frame.drop(columns=drop_cols)
+    return updated, applied, unavailable
+
+
+def _apply_predrop_derived_blocking(flags: dict, predropped_cols: list[str]) -> tuple[dict, list[dict]]:
+    """Disable derived features that depend on EDA pre-dropped sources."""
+    predropped = set(predropped_cols)
+    effective = dict(flags)
+    blocked: list[dict] = []
+
+    def _block(feature_name: str, blocked_sources: list[str]) -> None:
+        enable_key = DERIVED_FEATURE_ENABLE_FLAGS[feature_name]
+        if not effective.get(enable_key, False):
+            return
+        effective[enable_key] = False
+        blocked.append(
+            {
+                "feature": feature_name,
+                "flag": enable_key,
+                "reason": "source_predropped_by_eda",
+                "blocked_by_sources": blocked_sources,
+            }
+        )
+
+    for feature_name, source_cols in {
+        "delta_temp": {"TPV", "TA"},
+        "dP_dt": {"Pg"},
+        "dV_dt": {"Vg"},
+        "dI_dt": {"Ig"},
+        "Vg_normalized": {"Vg"},
+        "Pg_wavelet": {"Pg"},
+    }.items():
+        overlap = sorted(source_cols.intersection(predropped))
+        if overlap:
+            _block(feature_name, overlap)
+
+    # delta_p can be computed from either inverter pair or Pg/Pg_ref pair.
+    if effective.get("enable_differential_signal", False):
+        source_groups = [
+            {"Pg_inv1", "Pg_inv2"},
+            {"Pg", "Pg_ref"},
+        ]
+        group_is_viable = [group.isdisjoint(predropped) for group in source_groups]
+        if not any(group_is_viable):
+            blocked_sources = sorted({c for g in source_groups for c in g if c in predropped})
+            _block("delta_p", blocked_sources)
+
+    return effective, blocked
+
+
 def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, list[str]]:
     """Apply enabled feature generators and return added feature names."""
     out = df.copy()
@@ -327,6 +428,17 @@ def main() -> None:
     selection_effective, eda_pre_drop = _apply_eda_selection_priors(selection_cfg, eda_findings, eda_policy)
     tsfresh_mode = _tsfresh_mode(tsfresh_cfg)
     tsfresh_label_strategy = str(task_directives.get("tsfresh_label_strategy", "any_fault"))
+    predrop_before_featurization = bool(selection_effective.get("eda_apply_predrop_before_feature_generation", True))
+    block_derived_from_predrop = bool(selection_effective.get("eda_block_derived_from_predropped_sources", True))
+    include_preprocessed_stationarity = bool(flags.get("include_preprocessed_stationarity_features", False))
+
+    raw_stationarity_suffixes = flags.get("preprocessed_stationarity_suffixes", ["_norm", "_detrend"])
+    if isinstance(raw_stationarity_suffixes, str):
+        stationarity_suffixes = [raw_stationarity_suffixes]
+    elif isinstance(raw_stationarity_suffixes, list):
+        stationarity_suffixes = [str(s) for s in raw_stationarity_suffixes if str(s)]
+    else:
+        stationarity_suffixes = ["_norm", "_detrend"]
 
     resolved_for_fingerprint = {
         "task": task,
@@ -345,6 +457,8 @@ def main() -> None:
             ),
             "eda_pre_drop_candidates": bool(selection_effective.get("eda_pre_drop_candidates", True)),
             "eda_override_thresholds": bool(selection_effective.get("eda_override_thresholds", False)),
+            "eda_apply_predrop_before_feature_generation": predrop_before_featurization,
+            "eda_block_derived_from_predropped_sources": block_derived_from_predrop,
         },
         "tsfresh": {
             "mode": tsfresh_mode,
@@ -378,18 +492,39 @@ def main() -> None:
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
         split_frames[subset] = frame
 
+    eda_predrop_applied_before_fe: list[str] = []
+    eda_predrop_unavailable_before_fe: list[str] = []
+    if predrop_before_featurization and eda_pre_drop:
+        split_frames, eda_predrop_applied_before_fe, eda_predrop_unavailable_before_fe = (
+            _apply_eda_predrop_before_feature_generation(split_frames, eda_pre_drop)
+        )
+
+    generation_flags = dict(flags)
+    derived_blocked_by_predrop: list[dict] = []
+    if block_derived_from_predrop and eda_predrop_applied_before_fe:
+        generation_flags, derived_blocked_by_predrop = _apply_predrop_derived_blocking(
+            generation_flags,
+            eda_predrop_applied_before_fe,
+        )
+
     label_col = infer_label_column(split_frames["train"])
     base_cols = get_base_feature_columns(split_frames["train"])
+    stationarity_cols = (
+        _detect_preprocessed_stationarity_columns(split_frames, stationarity_suffixes)
+        if include_preprocessed_stationarity
+        else []
+    )
 
     generated_cols: dict[str, list[str]] = {}
     for subset in ("train", "val", "test"):
-        split_frames[subset], added = add_optional_features(split_frames[subset], flags)
+        split_frames[subset], added = add_optional_features(split_frames[subset], generation_flags)
         generated_cols[subset] = added
 
     candidate_features = sorted(
-        set(base_cols + generated_cols["train"] + generated_cols["val"] + generated_cols["test"])
+        set(base_cols + stationarity_cols + generated_cols["train"] + generated_cols["val"] + generated_cols["test"])
     )
     candidate_features = [c for c in candidate_features if c in split_frames["train"].columns]
+    candidate_predrop_applied = [c for c in eda_pre_drop if c in set(candidate_features)]
     if eda_pre_drop:
         candidate_features = [c for c in candidate_features if c not in set(eda_pre_drop)]
 
@@ -470,14 +605,29 @@ def main() -> None:
         "source_preprocessed_dir": str(input_dir),
         "label_column": label_col,
         "active_flags": flags,
+        "effective_generation_flags": generation_flags,
         "task_directives_effective": task_directives,
+        "preprocessed_stationarity": {
+            "enabled": include_preprocessed_stationarity,
+            "suffixes": stationarity_suffixes,
+            "included_columns": stationarity_cols,
+            "count": len(stationarity_cols),
+        },
         "selection": {
             "corr_threshold": float(selection_effective.get("corr_threshold", 0.95)),
             "vif_threshold": float(selection_effective.get("vif_threshold", 10.0)),
             "anchor_features": selection_effective.get("anchor_features", []),
             "use_eda_findings": bool(selection_effective.get("use_eda_findings", False)),
             "eda_policy": eda_policy,
-            "eda_pre_drop_applied": eda_pre_drop,
+            "eda_pre_drop_candidates": eda_pre_drop,
+            "eda_predrop_before_featurization_enabled": predrop_before_featurization,
+            "eda_pre_drop_applied_before_featurization": eda_predrop_applied_before_fe,
+            "eda_pre_drop_unavailable_before_featurization": eda_predrop_unavailable_before_fe,
+            "eda_pre_drop_applied_candidate_filter": candidate_predrop_applied,
+            "derived_blocking": {
+                "enabled": block_derived_from_predrop,
+                "blocked_features": derived_blocked_by_predrop,
+            },
             "corr_dropped": corr_dropped,
             "vif_dropped": vif_dropped,
         },

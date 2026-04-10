@@ -89,6 +89,8 @@ feature_engineering:
     enable_vif_pruning: true
     enable_wavelet: false
     wavelet_threshold_strategy: per_segment   # per_segment | global
+    include_preprocessed_stationarity_features: true
+    preprocessed_stationarity_suffixes: ["_norm", "_detrend"]
     enable_differential_signal: false
 
   selection:
@@ -101,6 +103,8 @@ feature_engineering:
     eda_prefer_anchors_from_findings: true
     eda_pre_drop_candidates: true
     eda_override_thresholds: false
+    eda_apply_predrop_before_feature_generation: true
+    eda_block_derived_from_predropped_sources: true
 
   tsfresh:
     mode: minimal               # off | minimal | extensive
