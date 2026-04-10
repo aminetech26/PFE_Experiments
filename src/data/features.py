@@ -112,7 +112,6 @@ def add_physics_features(
     Add physics-informed features controlled by flags.
 
     Supported flags:
-      - enable_performance_ratio
       - enable_delta_temp
       - enable_dP_dt
       - enable_dV_dt
@@ -128,10 +127,6 @@ def add_physics_features(
         out = out.sort_values([segment_col, time_col])
     else:
         original_index = None
-
-    if flags.get("enable_performance_ratio", True) and {"Pg", "GTI"}.issubset(out.columns):
-        gti_safe = out["GTI"].clip(lower=gti_min)
-        out["performance_ratio"] = out["Pg"] / (gti_safe / 1000.0)
 
     if flags.get("enable_delta_temp", True) and {"TPV", "TA"}.issubset(out.columns):
         out["delta_temp"] = out["TPV"] - out["TA"]

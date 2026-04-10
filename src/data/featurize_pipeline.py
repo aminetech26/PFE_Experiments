@@ -251,7 +251,6 @@ def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, 
 
     out = add_physics_features(out, flags=flags)
     physics_cols = [
-        "performance_ratio",
         "delta_temp",
         "dP_dt",
         "dV_dt",

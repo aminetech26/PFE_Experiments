@@ -80,7 +80,6 @@ feature_engineering:
   # Per-component flags for ablation experiments (no code edits required)
   flags:
     enable_hour_cyclic: true
-    enable_performance_ratio: true
     enable_delta_temp: true
     enable_dP_dt: true
     enable_dV_dt: true
@@ -95,7 +94,7 @@ feature_engineering:
     corr_threshold: 0.95
     vif_threshold: 10.0
     max_vif_rows: 50000
-    anchor_features: [performance_ratio, delta_temp, dP_dt, dV_dt, dI_dt]
+    anchor_features: [delta_temp, dP_dt, dV_dt, dI_dt]
     use_eda_findings: true
     eda_findings_path: data/interim/eda_feature_findings.json
     eda_prefer_anchors_from_findings: true
@@ -154,7 +153,6 @@ feature_engineering:
   profiles:
     baseline_raw:
       enable_hour_cyclic: false
-      enable_performance_ratio: false
       enable_delta_temp: false
       enable_dP_dt: false
       enable_dV_dt: false
@@ -167,7 +165,6 @@ feature_engineering:
       tsfresh_mode: "off"
     plus_physics:
       enable_hour_cyclic: false
-      enable_performance_ratio: true
       enable_delta_temp: true
       enable_dP_dt: true
       enable_dV_dt: true
@@ -180,7 +177,6 @@ feature_engineering:
       tsfresh_mode: "off"
     plus_temporal:
       enable_hour_cyclic: true
-      enable_performance_ratio: true
       enable_delta_temp: true
       enable_dP_dt: true
       enable_dV_dt: true
@@ -193,7 +189,6 @@ feature_engineering:
       tsfresh_mode: "off"
     plus_tsfresh_minimal:
       enable_hour_cyclic: true
-      enable_performance_ratio: true
       enable_delta_temp: true
       enable_dP_dt: true
       enable_dV_dt: true
@@ -206,7 +201,6 @@ feature_engineering:
       tsfresh_mode: "minimal"
     plus_tsfresh_extensive:
       enable_hour_cyclic: true
-      enable_performance_ratio: true
       enable_delta_temp: true
       enable_dP_dt: true
       enable_dV_dt: true
@@ -219,7 +213,6 @@ feature_engineering:
       tsfresh_mode: "extensive"
     plus_wavelet:
       enable_hour_cyclic: true
-      enable_performance_ratio: true
       enable_delta_temp: true
       enable_dP_dt: true
       enable_dV_dt: true
@@ -232,7 +225,6 @@ feature_engineering:
       tsfresh_mode: "off"
     plus_differential:
       enable_hour_cyclic: true
-      enable_performance_ratio: true
       enable_delta_temp: true
       enable_dP_dt: true
       enable_dV_dt: true
@@ -245,7 +237,6 @@ feature_engineering:
       tsfresh_mode: "off"
     plus_all:
       enable_hour_cyclic: true
-      enable_performance_ratio: true
       enable_delta_temp: true
       enable_dP_dt: true
       enable_dV_dt: true
