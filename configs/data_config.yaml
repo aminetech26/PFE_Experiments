@@ -88,6 +88,7 @@ feature_engineering:
     enable_corr_pruning: true
     enable_vif_pruning: true
     enable_wavelet: false
+    wavelet_threshold_strategy: per_segment   # per_segment | global
     enable_differential_signal: false
 
   selection:
@@ -161,6 +162,7 @@ feature_engineering:
       enable_corr_pruning: false
       enable_vif_pruning: false
       enable_wavelet: false
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode: "off"
     plus_physics:
@@ -173,6 +175,7 @@ feature_engineering:
       enable_corr_pruning: true
       enable_vif_pruning: true
       enable_wavelet: false
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode: "off"
     plus_temporal:
@@ -185,6 +188,7 @@ feature_engineering:
       enable_corr_pruning: true
       enable_vif_pruning: true
       enable_wavelet: false
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode: "off"
     plus_tsfresh_minimal:
@@ -197,6 +201,7 @@ feature_engineering:
       enable_corr_pruning: true
       enable_vif_pruning: true
       enable_wavelet: false
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode: "minimal"
     plus_tsfresh_extensive:
@@ -209,6 +214,7 @@ feature_engineering:
       enable_corr_pruning: true
       enable_vif_pruning: true
       enable_wavelet: false
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode: "extensive"
     plus_wavelet:
@@ -221,6 +227,7 @@ feature_engineering:
       enable_corr_pruning: true
       enable_vif_pruning: true
       enable_wavelet: true
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode: "off"
     plus_differential:
@@ -233,6 +240,7 @@ feature_engineering:
       enable_corr_pruning: true
       enable_vif_pruning: true
       enable_wavelet: false
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: true
       tsfresh_mode: "off"
     plus_all:
@@ -245,5 +253,6 @@ feature_engineering:
       enable_corr_pruning: true
       enable_vif_pruning: true
       enable_wavelet: true
+      wavelet_threshold_strategy: per_segment
       enable_differential_signal: true
       tsfresh_mode: "extensive"

@@ -161,13 +161,33 @@ def add_physics_features(
 # ============================================================================
 
 
-def wavelet_denoise_series(series: np.ndarray, wavelet: str = "db4", level: int = 4) -> np.ndarray:
-    """Denoise a 1D series using wavelet thresholding."""
+def _estimate_wavelet_threshold(series: np.ndarray, wavelet: str = "db4", level: int = 4) -> float:
+    """Estimate a universal wavelet threshold for one signal series."""
     import pywt
 
     coeffs = pywt.wavedec(series, wavelet, level=level)
-    threshold = np.sqrt(2 * np.log(len(series))) * np.median(np.abs(coeffs[-1])) / 0.6745
-    coeffs_thresh = [pywt.threshold(c, threshold, mode="soft") for c in coeffs]
+    if len(coeffs) < 2 or len(series) <= 1:
+        return 0.0
+    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+    if not np.isfinite(sigma) or sigma <= 0:
+        return 0.0
+    return float(np.sqrt(2 * np.log(len(series))) * sigma)
+
+
+def wavelet_denoise_series(
+    series: np.ndarray,
+    wavelet: str = "db4",
+    level: int = 4,
+    threshold: float | None = None,
+) -> np.ndarray:
+    """Denoise a 1D series using wavelet soft-thresholding."""
+    import pywt
+
+    coeffs = pywt.wavedec(series, wavelet, level=level)
+    if threshold is None:
+        threshold = _estimate_wavelet_threshold(series, wavelet=wavelet, level=level)
+
+    coeffs_thresh = [coeffs[0]] + [pywt.threshold(c, threshold, mode="soft") for c in coeffs[1:]]
     return pywt.waverec(coeffs_thresh, wavelet)[: len(series)]
 
 
@@ -176,20 +196,44 @@ def add_wavelet_feature(
     source_col: str = "Pg",
     segment_col: str = "segment_id",
     target_col: str = "Pg_wavelet",
+    wavelet: str = "db4",
+    level: int = 4,
+    threshold_strategy: str = "per_segment",
 ) -> pd.DataFrame:
-    """Add a denoised wavelet feature from source_col."""
+    """Add a denoised wavelet feature from source_col.
+
+    threshold_strategy:
+      - "per_segment": estimate threshold independently for each segment.
+      - "global": estimate one threshold on full source column and reuse it.
+    """
     if source_col not in df.columns:
         return df
 
     out = df.copy()
+    strategy = str(threshold_strategy).lower()
+    if strategy not in {"per_segment", "global"}:
+        raise ValueError(f"Unsupported wavelet threshold strategy: {threshold_strategy}")
 
     if segment_col not in out.columns:
-        out[target_col] = wavelet_denoise_series(out[source_col].to_numpy(dtype=np.float64))
+        values = out[source_col].to_numpy(dtype=np.float64)
+        threshold = _estimate_wavelet_threshold(values, wavelet=wavelet, level=level)
+        out[target_col] = wavelet_denoise_series(values, wavelet=wavelet, level=level, threshold=threshold)
         return out
 
     out[target_col] = 0.0
-    for seg_id, seg_df in out.groupby(segment_col):
-        den = wavelet_denoise_series(seg_df[source_col].to_numpy(dtype=np.float64))
+    global_threshold = None
+    if strategy == "global":
+        full_values = out[source_col].to_numpy(dtype=np.float64)
+        global_threshold = _estimate_wavelet_threshold(full_values, wavelet=wavelet, level=level)
+
+    for _, seg_df in out.groupby(segment_col, sort=False):
+        values = seg_df[source_col].to_numpy(dtype=np.float64)
+        threshold = (
+            global_threshold
+            if strategy == "global"
+            else _estimate_wavelet_threshold(values, wavelet=wavelet, level=level)
+        )
+        den = wavelet_denoise_series(values, wavelet=wavelet, level=level, threshold=threshold)
         out.loc[seg_df.index, target_col] = den
     return out
 

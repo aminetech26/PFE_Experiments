@@ -55,6 +55,8 @@ def resolve_profile(config: dict, profile_name: str | None) -> tuple[dict, dict,
         for key, value in profile.items():
             if key.startswith("enable_"):
                 flags[key] = value
+            elif key == "wavelet_threshold_strategy":
+                flags[key] = value
             elif key == "tsfresh_mode":
                 tsfresh_cfg["mode"] = value
 
@@ -262,7 +264,12 @@ def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, 
             added.append(c)
 
     if flags.get("enable_wavelet", False):
-        out = add_wavelet_feature(out, source_col="Pg", target_col="Pg_wavelet")
+        out = add_wavelet_feature(
+            out,
+            source_col="Pg",
+            target_col="Pg_wavelet",
+            threshold_strategy=str(flags.get("wavelet_threshold_strategy", "per_segment")),
+        )
         if "Pg_wavelet" in out.columns:
             added.append("Pg_wavelet")
 
