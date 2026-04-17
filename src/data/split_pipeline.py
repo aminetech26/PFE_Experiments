@@ -1,20 +1,20 @@
 """
 Split Pipeline — Generates all task-specific splits.
 
-Outputs to data/interim/splits/:
+Outputs to data/interim/splits/<dataset>/:
   - anomaly_semisup/    (Task A semi-supervised)
-  - anomaly_supervised/ (Task A supervised)  
+  - anomaly_supervised/ (Task A supervised)
   - classification/     (Task B, evaluable classes only)
 
 Usage:
-    python -m src.data.split_pipeline
-    
-    # Or from project root:
-    cd PFE_Experiments && python -m src.data.split_pipeline
+    python -m src.data.split_pipeline                    # reunion (default)
+    python -m src.data.split_pipeline --dataset costa
+    python -m src.data.split_pipeline --dataset mendeley
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -41,31 +41,56 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def load_and_segment_data(config: dict) -> pd.DataFrame:
+def load_and_segment_data(config: dict, dataset: str = "reunion") -> pd.DataFrame:
     """
-    Load merged data and apply segmentation.
-    
-    Returns DataFrame with 'timestamp', 'label', 'segment_id' columns.
+    Load merged data for the specified dataset and apply segmentation.
+
+    Reads the dataset-specific merged parquet from data/interim/ and applies
+    contiguous segmentation (gap > segmentation_gap_seconds → new segment).
+
+    Returns DataFrame with standardised columns: timestamp | label | segment_id | <sensors>
     """
     paths = config["paths"]
     split_cfg = config["splits"]
-    label_col = "Fault"
-    
+
+    # Resolve dataset config from registry
+    dataset_cfg = paths.get("datasets", {}).get(dataset)
+    if dataset_cfg is None:
+        raise KeyError(
+            f"Dataset '{dataset}' not found in data_config.yaml paths.datasets. "
+            f"Available: {list(paths.get('datasets', {}).keys())}"
+        )
+
     interim_dir = PROJECT_ROOT / paths["interim_dir"]
-    input_path = interim_dir / "reunion_dt2_merged.parquet"
-    
-    logger.info(f"Loading data from: {input_path}")
+    input_path = interim_dir / dataset_cfg["merged_output"]
+
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Merged parquet not found: {input_path}\n"
+            f"Run: uv run python -m src.data.ingestion --dataset {dataset}"
+        )
+
+    logger.info(f"Loading dataset={dataset} from: {input_path}")
     df = pl.read_parquet(input_path).to_pandas()
-    
-    # Standardize column names
-    df["timestamp"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+
+    # Standardize timestamp column
+    ts_col = dataset_cfg.get("timestamp_col", "time")
+    if ts_col not in df.columns:
+        raise KeyError(f"Timestamp column '{ts_col}' not found. Check paths.datasets.{dataset}.timestamp_col")
+    df["timestamp"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+
+    # Standardize label column
+    label_col = dataset_cfg.get("label_col", "label")
     if label_col in df.columns:
         df["label"] = df[label_col]
     elif "label" not in df.columns:
-        raise KeyError(f"Missing required label column '{label_col}' and no fallback 'label' column found.")
+        raise KeyError(
+            f"Label column '{label_col}' not found. "
+            f"Check paths.datasets.{dataset}.label_col in data_config.yaml"
+        )
+
     df = df.dropna(subset=["timestamp", "label"]).sort_values("timestamp").reset_index(drop=True)
-    
-    logger.info(f"Loaded {len(df):,} rows")
+    logger.info(f"Loaded {len(df):,} rows | dataset={dataset}")
 
     # Contiguous segmentation
     segmentation_gap_seconds = int(split_cfg.get("segmentation_gap_seconds", 300))
@@ -241,33 +266,41 @@ def run_prediction_split(df: pd.DataFrame, config: dict, output_base: Path) -> N
 
 
 def main() -> None:
-    """Run all split pipelines."""
+    """Run all split pipelines for a given dataset."""
+    parser = argparse.ArgumentParser(description="Generate task-specific splits for a PV dataset")
+    parser.add_argument(
+        "--dataset",
+        default="reunion",
+        help="Which dataset to split (must match a key in data_config.yaml paths.datasets). Default: reunion",
+    )
+    args = parser.parse_args()
+
     logger.info("=" * 60)
-    logger.info("SPLIT PIPELINE — Task-Specific Splits")
+    logger.info("SPLIT PIPELINE — dataset={}", args.dataset)
     logger.info("=" * 60)
-    
+
     config = load_config()
-    df = load_and_segment_data(config)
-    
-    output_base = PROJECT_ROOT / "data" / "interim" / "splits"
+    df = load_and_segment_data(config, dataset=args.dataset)
+
+    # Dataset-namespaced output directory so different datasets don't clobber each other
+    output_base = PROJECT_ROOT / "data" / "interim" / "splits" / args.dataset
     logger.info(f"Output directory: {output_base}")
-    
-    # Generate all splits
+
+    # Task A splits (FDD — Fault Detection)
     run_anomaly_semisup_split(df, config, output_base)
     run_anomaly_supervised_split(df, config, output_base)
+
+    # Task B split (FDD — Fault Diagnosis)
     run_classification_split(df, config, output_base)
-    run_prediction_split(df, config, output_base)
-    
+
     logger.info("=" * 60)
-    logger.success("All splits generated successfully!")
+    logger.success("All splits generated | dataset={}", args.dataset)
     logger.info("=" * 60)
-    
-    # Summary
+
     logger.info("Generated splits:")
     logger.info("  • anomaly_semisup/    — Task A semi-supervised (train=normal-only)")
     logger.info("  • anomaly_supervised/ — Task A supervised (temporal-stratified)")
     logger.info("  • classification/     — Task B (evaluable classes only)")
-    logger.info("  • prediction/         — Task C (episode-based, pre-fault zones)")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from loguru import logger
 from sklearn.metrics import accuracy_score, average_precision_score, classification_report, f1_score
 from sklearn.preprocessing import LabelEncoder, label_binarize
 
+from src.data.splitting import PerClassSegmentTimeSeriesCV
 from src.evaluation.leakage_checks import run_leakage_report
 from src.mlflow_setup import init_tracking
 from src.training.feature_loader import load_features_for_task
@@ -57,15 +58,31 @@ def _compute_pr_auc_multiclass(y_true_encoded: np.ndarray, y_proba: np.ndarray, 
 def _train_lightgbm(
     X_train,
     y_train,
-    X_val,
-    y_val,
     params: dict,
-):
+    eval_sets: list | None = None,
+) -> tuple:
+    """Train a LightGBM classifier and optionally capture per-tree eval curves.
+
+    Args:
+        eval_sets: list of (X, y) tuples passed to eval_set. First entry is typically
+                   (X_train, y_train), second is (X_test, y_test). If None, no curves.
+
+    Returns:
+        (model, evals_result) where evals_result is a dict of {split_name: {metric: [values]}}
+        or an empty dict if eval_sets is None.
+    """
+    evals_result: dict = {}
     model = lgb.LGBMClassifier(**params)
-    model.fit(X_train, y_train)
-    val_pred = model.predict(X_val)
-    val_f1 = float(f1_score(y_val, val_pred, average="weighted"))
-    return model, val_f1
+    if eval_sets:
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=eval_sets,
+            callbacks=[lgb.record_evaluation(evals_result)],
+        )
+    else:
+        model.fit(X_train, y_train)
+    return model, evals_result
 
 
 def _build_lightgbm_params(base: dict, seed: int, n_classes: int) -> dict:
@@ -211,6 +228,23 @@ def main() -> None:
         list(encoder.classes_),
     )
 
+    # Prepare combined train+val arrays for segment-aware CV during HPO
+    X_cv = pd.concat([X_train, X_val], axis=0, ignore_index=True)
+    y_cv = np.concatenate([y_train, y_val])
+    n_cv_folds = int(config.get("experiment", {}).get("n_cv_folds", 3))
+    if "segment_id" in train_df.columns:
+        segments_cv = pd.concat(
+            [train_df["segment_id"], val_df["segment_id"]], ignore_index=True
+        ).values
+        logger.info(
+            "Segment-aware CV enabled | n_splits={} combined_samples={}",
+            n_cv_folds,
+            len(X_cv),
+        )
+    else:
+        segments_cv = None
+        logger.warning("segment_id column not found — falling back to fixed holdout for HPO")
+
     init_tracking("classification")
     run_name = f"classification_lightgbm_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
@@ -245,6 +279,8 @@ def main() -> None:
                 "thread_budget": int(threading_plan["thread_budget"]),
                 "optuna_parallel_trials": int(threading_plan["optuna_parallel_trials"]),
                 "threads_per_trial": int(threading_plan["threads_per_trial"]),
+                "cv_strategy": "segment_aware_per_class" if segments_cv is not None else "fixed_holdout",
+                "cv_n_splits": n_cv_folds if segments_cv is not None else 1,
             }
         )
 
@@ -266,10 +302,25 @@ def main() -> None:
                 model_params = _build_lightgbm_params(trial_params, seed=hpo_seed, n_classes=len(encoder.classes_))
                 model_params["n_jobs"] = int(threading_plan["threads_per_trial"])
                 model_params["num_threads"] = int(threading_plan["threads_per_trial"])
-                model = lgb.LGBMClassifier(**model_params)
-                model.fit(X_train, y_train)
-                val_pred = model.predict(X_val)
-                return float(f1_score(y_val, val_pred, average="weighted"))
+
+                if segments_cv is not None:
+                    # Segment-aware temporal CV: respects segment boundaries and class balance
+                    cv = PerClassSegmentTimeSeriesCV(n_splits=n_cv_folds, min_train_segments=1)
+                    fold_scores = []
+                    for fold_train_idx, fold_val_idx in cv.split(X_cv, y_cv, groups=segments_cv):
+                        m = lgb.LGBMClassifier(**model_params)
+                        m.fit(X_cv.iloc[fold_train_idx], y_cv[fold_train_idx])
+                        fold_pred = m.predict(X_cv.iloc[fold_val_idx])
+                        fold_scores.append(
+                            float(f1_score(y_cv[fold_val_idx], fold_pred, average="weighted", zero_division=0))
+                        )
+                    return float(np.mean(fold_scores)) if fold_scores else 0.0
+                else:
+                    # Fallback: fixed holdout (no segment_id available)
+                    model = lgb.LGBMClassifier(**model_params)
+                    model.fit(X_train, y_train)
+                    val_pred = model.predict(X_val)
+                    return float(f1_score(y_val, val_pred, average="weighted"))
 
             def on_trial_complete(study, trial):
                 logger.info(
@@ -308,9 +359,13 @@ def main() -> None:
         X_train_final = pd.concat([X_train, X_val], axis=0, ignore_index=True)
         y_train_final = np.concatenate([y_train, y_val])
 
-        final_model = lgb.LGBMClassifier(**best_params)
         logger.info("Training final model | params={}", best_params)
-        final_model.fit(X_train_final, y_train_final)
+        final_model, evals_result = _train_lightgbm(
+            X_train_final,
+            y_train_final,
+            params=best_params,
+            eval_sets=[(X_train_final, y_train_final), (X_test, y_test)],
+        )
 
         test_pred = final_model.predict(X_test)
         test_pred_proba = final_model.predict_proba(X_test)
@@ -398,6 +453,34 @@ def main() -> None:
         )
         if not np.isnan(pr_auc_weighted):
             mlflow.log_metric("test_pr_auc_weighted", pr_auc_weighted)
+
+        # Log per-tree training curves as step metrics and JSON artifact
+        if evals_result:
+            split_names = list(evals_result.keys())  # e.g. ["valid_0", "valid_1"]
+            first_split_metrics = evals_result.get(split_names[0], {})
+            curve_metric = next(iter(first_split_metrics.keys()), None)  # e.g. "multi_logloss"
+            if curve_metric:
+                split_labels = ["train", "test"][: len(split_names)]
+                all_curves: dict[str, list] = {
+                    label: evals_result[sn].get(curve_metric, [])
+                    for label, sn in zip(split_labels, split_names)
+                }
+                n_steps = max(len(v) for v in all_curves.values()) if all_curves else 0
+                log_interval = max(1, n_steps // 100)  # at most 100 logged points per metric
+                for step in range(0, n_steps, log_interval):
+                    for label, vals in all_curves.items():
+                        if step < len(vals):
+                            mlflow.log_metric(f"final_{label}_{curve_metric}", vals[step], step=step)
+                curves_artifact_path = PROJECT_ROOT / "experiments" / "metrics" / "classification_training_curves.json"
+                curves_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                curves_artifact_path.write_text(json.dumps(evals_result, default=str), encoding="utf-8")
+                mlflow.log_artifact(str(curves_artifact_path))
+                logger.info(
+                    "Training curves logged | metric={} n_trees={} splits={}",
+                    curve_metric,
+                    n_steps,
+                    split_labels,
+                )
 
         mlflow.log_artifact(str(metrics_path))
         mlflow.log_artifact(str(leakage_report_path))

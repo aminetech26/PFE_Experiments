@@ -74,38 +74,18 @@ classification:
     timeout_seconds: null
 
 # ============================================================================
-# TASK C — Fault Forecasting
+# TASK C — Dropped (April 2026)
+# Performance forecasting residuals are structurally identical to reconstruction-
+# based anomaly detection (the family used in Task A). It is NOT a separate task.
+# Forecasting-based residuals may appear as ONE METHOD within Task A experiments,
+# not as a standalone contribution. Project scope is FDD: Task A + Task B.
 # ============================================================================
-forecasting:
-  primary_metric: mae
-  horizons_min: [5, 10]
-
-  r1_models:
-    xgboost_lag:
-      n_lags: [12, 24, 48]    # lookback windows
-      n_estimators: [200, 500]
-
-  r2_models:
-    lstm:
-      hidden_dim: [64, 128]
-      num_layers: [2, 3]
-    gru:
-      hidden_dim: [64, 128]
-      num_layers: [2, 3]
-
-  foundation_models:       # Zero-shot benchmarks only
-    time_moe:
-      mode: zero_shot
-      note: "Evaluate as upper bound reference — NOT deployed to Jetson"
-    timesfm:
-      mode: zero_shot
-      note: "Same — zero-shot reference only"
 
 # ============================================================================
-# MULTI-TASK LEARNING
+# MULTI-TASK LEARNING (Task A + Task B shared encoder)
 # ============================================================================
 multitask:
-  enabled: true
+  enabled: false           # Reserved for R2 phase once baselines are established
   shared_encoder:
     type: gru              # or tcn
     hidden_dim: 128
@@ -113,8 +93,7 @@ multitask:
   task_weights:
     anomaly: 1.0
     classification: 1.0
-    forecasting: 1.0
-  weight_tuning: optuna    # tune α, β, γ via Optuna
+  weight_tuning: optuna    # tune α, β via Optuna
 
 # ============================================================================
 # TRAINING
