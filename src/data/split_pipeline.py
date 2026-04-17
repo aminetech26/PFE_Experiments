@@ -270,8 +270,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate task-specific splits for a PV dataset")
     parser.add_argument(
         "--dataset",
-        default="reunion",
-        help="Which dataset to split (must match a key in data_config.yaml paths.datasets). Default: reunion",
+        default="la_reunion",
+        help="Which dataset to split (must match a key in data_config.yaml paths.datasets). Default: la_reunion",
     )
     args = parser.parse_args()
 

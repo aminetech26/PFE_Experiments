@@ -1,17 +1,18 @@
 """
 Preprocessing Pipeline — Runs preprocessing on all split datasets.
 
-Reads from data/interim/splits/{task}/ and outputs to data/processed/preprocessed/{task}/
+Reads from data/interim/splits/<dataset>/{task}/ and outputs to
+data/processed/preprocessed/<dataset>/{task}/
 
 Usage:
-    python -m src.data.preprocess_pipeline
-    
-    # Or from project root:
-    cd PFE_Experiments && python -m src.data.preprocess_pipeline
+    python -m src.data.preprocess_pipeline                      # default: la_reunion
+    python -m src.data.preprocess_pipeline --dataset costa
+    python -m src.data.preprocess_pipeline --dataset mendeley
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -175,8 +176,16 @@ def create_manifest(
 
 def main() -> None:
     """Run preprocessing pipeline on all splits."""
+    parser = argparse.ArgumentParser(description="Preprocess split data for a given dataset")
+    parser.add_argument(
+        "--dataset",
+        default="la_reunion",
+        help="Dataset to preprocess (must match data_config.yaml paths.datasets key). Default: la_reunion",
+    )
+    args = parser.parse_args()
+
     logger.info("=" * 60)
-    logger.info("PREPROCESSING PIPELINE")
+    logger.info("PREPROCESSING PIPELINE — dataset={}", args.dataset)
     logger.info("=" * 60)
 
     config = load_config()
@@ -187,8 +196,8 @@ def main() -> None:
     logger.info(f"Feature columns: {feature_cols}")
     logger.info(f"Label column: {label_col}")
 
-    input_base = PROJECT_ROOT / "data" / "interim" / "splits"
-    output_base = PROJECT_ROOT / "data" / "processed" / "preprocessed"
+    input_base = PROJECT_ROOT / "data" / "interim" / "splits" / args.dataset
+    output_base = PROJECT_ROOT / "data" / "processed" / "preprocessed" / args.dataset
 
     if not input_base.exists():
         logger.error(f"Input directory not found: {input_base}")
