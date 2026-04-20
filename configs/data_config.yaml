@@ -1,133 +1,256 @@
-# Data configuration — controls all dataset loading and splitting
-# Modify here, not in code, to keep experiments consistent.
+# =============================================================================
+# DATA CONFIGURATION
+# Controls dataset loading, splitting, preprocessing, and feature engineering.
+# All pipeline scripts read from here — modify here, not in code.
+#
+# Resolution order for per-stage settings:
+#   global default  <  dataset override  <  task_directive  <  profile override
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# PATHS
+# -----------------------------------------------------------------------------
 paths:
-  raw_dir: "data/raw"
-  interim_dir: "data/interim"
+  raw_dir:       "data/raw"
+  interim_dir:   "data/interim"
   processed_dir: "data/processed"
 
-  # Dataset registry — one entry per dataset.
-  # Each entry defines where raw files live and which columns map to the standard schema.
-  # Standard schema downstream: timestamp | label | segment_id + sensor columns
-  # Ingestion outputs live under interim_dir/ingestion/<dataset>/
-  # Split outputs live under interim_dir/splits/<dataset>/
-  # EDA outputs live under interim_dir/eda/<dataset>/
+  # ---------------------------------------------------------------------------
+  # DATASET REGISTRY
+  # One entry per dataset. Each entry defines:
+  #   - where raw files live (dir, relative to raw_dir)
+  #   - where ingested parquet lives (merged_output, relative to interim_dir)
+  #   - standard schema mapping (label_col, timestamp_col)
+  #   - dataset-specific overrides for splits / preprocessing / features / EDA
+  #
+  # Standard output schema after ingestion:
+  #   timestamp | label | segment_id | <sensor_cols>
+  #
+  # Directory layout:
+  #   data/interim/ingestion/<dataset>/   ← ingestion outputs
+  #   data/interim/splits/<dataset>/      ← split outputs
+  #   data/interim/eda/<dataset>/         ← EDA outputs
+  #   data/processed/preprocessed/<dataset>/
+  #   data/processed/features/<dataset>/
+  # ---------------------------------------------------------------------------
   datasets:
+
+    # -------------------------------------------------------------------------
+    # LA RÉUNION — Real labeled faults, ~7 s sampling, inverter data
+    # Source: University of La Réunion
+    # -------------------------------------------------------------------------
     la_reunion:
-      dir: "University of La Réunion Data"                          # relative to raw_dir
+      dir: "University of La Réunion Data"   # relative to raw_dir
       merged_output: "ingestion/la_reunion/reunion_dt2_merged.parquet"  # relative to interim_dir
-      label_col: "Fault"
+      label_col:     "Fault"
       timestamp_col: "time"
-      sampling_hz: 0.143   # ~7s intervals
+      sampling_hz:   0.143    # ~7 s intervals
 
+      eda_findings_path: "data/interim/eda/la_reunion/eda_feature_findings.json"
+
+      splits:
+        # Fault classes with ≥3 segments → evaluable in val/test
+        evaluable_classes:  [3.1, 3.2, 4.0]
+        # Fault classes with <3 segments → training contribution only (Task A)
+        train_only_classes: [1.0, 2.1, 2.2, 2.3]
+        # Gap threshold: >5 min between consecutive rows → new segment
+        segmentation_gap_seconds: 300
+
+      preprocessing:
+        stationarity:
+          # Irradiance normalization: Power/GTI ≈ efficiency (diurnal-invariant)
+          irradiance_normalize:
+            features:    [Pg, Ig, Eg, Fg, Ia]
+            denominator: GTI
+            suffix:      _norm
+          # Polynomial detrend: removes curved thermal drift per segment
+          polynomial_detrend:
+            features: [TA, TPV]
+            degree:   2
+            scope:    per_segment
+            suffix:   _detrend
+
+      feature_engineering:
+        sensor_columns: [Pg, Vg, Ig, Eg, Fg, Ia, GTI, TA, TPV]
+        flags:
+          enable_hour_cyclic:        true   # real timestamps, time-of-day is meaningful
+          enable_delta_temp:         true   # TA and TPV both present
+          enable_dP_dt:              true
+          enable_dV_dt:              true
+          enable_dI_dt:              true
+          enable_Vg_normalized:      true
+          enable_differential_signal: false  # requires dt3 (healthy inverter ref)
+        selection:
+          anchor_features: [delta_temp, dP_dt, dV_dt, dI_dt]
+
+    # -------------------------------------------------------------------------
+    # COSTA — Real labeled faults, 1 Hz, 2-string grid-tied PV plant (Brazil)
+    # Source: Costa et al., Sensors 20(17) 4688 (2020)
+    # Labels: 0=Normal 1=ShortCircuit 2=Degradation 3=OpenCircuit 4=Shadowing
+    # Note: label 4 (Shadowing) is NATURAL, not artificially induced.
+    # Faults 1-3: artificially induced ~10-min blocks, daytime only.
+    # Night data retained; use is_daytime (irr > 5 W/m²) to filter upstream.
+    # Timestamp: synthetic 1 Hz, epoch 2020-01-01T03:38:00Z (≈01:38 BRST).
+    #   Epoch derived from solar geometry (Curitiba lon 49.27°W) cross-checked
+    #   with paper fault schedule → both methods agree within 4 min.
+    # -------------------------------------------------------------------------
     costa:
-      dir: "Costa PV Fault Dataset"                      # relative to raw_dir
+      dir: "Costa PV Fault Dataset"         # relative to raw_dir
       merged_output: "ingestion/costa/costa_merged.parquet"  # relative to interim_dir
-      label_col: "label"          # standardised by load_costa() during ingestion
-      timestamp_col: "timestamp"  # synthetic 1Hz, epoch 2020-01-01T03:38:00Z (≈01:38 BRST)
-      sampling_hz: 1.0
-      # Epoch derived from solar geometry (Curitiba lon 49.27°W → solar noon 15:17 UTC)
-      # cross-checked with paper fault schedule → t0 = 03:38 UTC = 01:38 BRST (UTC-2).
-      # Fault classes: 0=Normal 1=ShortCircuit 2=Degradation 3=OpenCircuit 4=Shadowing
-      # Note: label 4 (Shadowing) is NATURAL (buildings/clouds), NOT artificially induced.
-      # Faults 1-3 are artificially induced ~10-min blocks during daytime.
-      # Use is_daytime column (irr > 5 W/m²) to filter nighttime rows upstream.
+      label_col:     "label"
+      timestamp_col: "timestamp"
+      sampling_hz:   1.0
 
+      eda_findings_path: "data/interim/eda/costa/eda_feature_findings.json"
+
+      splits:
+        evaluable_classes:  [1, 2, 3, 4]   # all four fault types — integer labels
+        train_only_classes: []
+        segmentation_gap_seconds: 300
+        # Recommended: filter is_daytime=True before Task A/B to avoid
+        # trivial night-vs-day separation (faults 1-3 are daytime-only)
+        daytime_filter_recommended: true
+
+      preprocessing:
+        stationarity:
+          # Power / irradiance ≈ efficiency (removes irradiance-driven diurnal trend)
+          irradiance_normalize:
+            features:    [pdc, pdc1, pdc2]
+            denominator: irr
+            suffix:      _norm
+          # PV module temperature: mild thermal drift, linear detrend sufficient
+          polynomial_detrend:
+            features: [pvt]
+            degree:   1       # linear — Costa shows less curvature than La Réunion
+            scope:    per_segment
+            suffix:   _detrend
+
+      feature_engineering:
+        sensor_columns: [vdc1, vdc2, idc1, idc2, pdc1, pdc2, pdc, irr, pvt]
+        flags:
+          enable_hour_cyclic:        true   # corrected epoch → time-of-day meaningful
+          enable_delta_temp:         false  # no ambient temp sensor (only pvt)
+          enable_dP_dt:              true
+          enable_dV_dt:              true
+          enable_dI_dt:              true
+          enable_Vg_normalized:      false  # no grid voltage sensor in Costa
+          enable_differential_signal: false  # single-inverter dataset
+        selection:
+          anchor_features: [dP_dt, dV_dt, dI_dt]
+
+    # -------------------------------------------------------------------------
+    # MENDELEY / GPVS-FAULTS — Lab experiments, ~10 kHz → 1 kHz, grid-connected
+    # Source: Bakdi et al., Int. J. Electrical Power & Energy Systems (2020)
+    # 16 experiments: F0-F7 × {L=IPPT, M=MPPT}
+    # Labels: 0=Normal (F0 files + pre-fault halves), 1-7=seven fault types
+    # Fault injection: MANUALLY at experiment midpoint.
+    #   Use phase=="fault" for active-fault samples, fault_class==0 for clean normal.
+    # Timestamp: synthetic UTC, epoch 2021-01-01T00:00Z, 1-hour windows per experiment.
+    #   Each experiment is ~14.4 s → 16 segments after gap-based segmentation.
+    # -------------------------------------------------------------------------
     mendeley:
-      dir: "GPVS-Faults/CSV_Files"                          # relative to raw_dir
+      dir: "GPVS-Faults/CSV_Files"          # relative to raw_dir
       merged_output: "ingestion/mendeley/mendeley_merged.parquet"  # relative to interim_dir
-      label_col: "label"          # active fault label: 0=Normal, 1-7=fault class
-      timestamp_col: "timestamp"  # synthetic UTC, epoch 2021-01-01T00:00Z, 1-hour windows
-      sampling_hz: 1000.0         # downsampled from ~10 kHz to 1 kHz during ingestion
-      # 16 experiments: F0-F7 × {L=IPPT, M=MPPT}. Each experiment ~14.4 s.
-      # F0 files: fault-free (label=0). F1-F7: first half pre-fault (label=0),
-      # second half active fault (label=fault_class). Use phase column to filter:
-      #   phase=="fault" → active fault samples
-      #   fault_class==0 → clean normal (F0 experiments only)
-      # Columns: Ipv, Vpv, Vdc, ia, ib, ic, va, vb, vc, Iabc, If, Vabc, Vf
-      # fault_class: raw fault index (0-7) independent of phase
+      label_col:     "label"
+      timestamp_col: "timestamp"
+      sampling_hz:   1000.0   # downsampled from ~10 kHz to 1 kHz during ingestion
 
+      eda_findings_path: "data/interim/eda/mendeley/eda_feature_findings.json"
+
+      splits:
+        evaluable_classes:  [1, 2, 3, 4, 5, 6, 7]  # all seven fault types
+        train_only_classes: []
+        # Within-experiment dt ≈ 1 ms; between-experiment gap ≈ 3585 s.
+        # 300 s threshold correctly yields 1 segment per experiment (16 total).
+        segmentation_gap_seconds: 300
+        # For classification: recommend filtering phase=="fault" for fault samples
+        # and fault_class==0 for normal samples (avoids pre-fault contamination).
+        phase_filter_recommended: true
+
+      preprocessing:
+        stationarity:
+          # No irradiance sensor in Mendeley — skip irradiance normalization
+          irradiance_normalize: null
+          # Simulated data: no thermal drift across 14.4 s experiments
+          polynomial_detrend: null
+
+      feature_engineering:
+        # DC-side PV: Ipv, Vpv, Vdc. AC-side: ia/ib/ic, va/vb/vc.
+        # Positive-sequence phasors: Iabc, If, Vabc, Vf.
+        sensor_columns: [Ipv, Vpv, Vdc, ia, ib, ic, va, vb, vc, Iabc, If, Vabc, Vf]
+        flags:
+          enable_hour_cyclic:        false  # synthetic timestamps, no real time-of-day
+          enable_delta_temp:         false  # no temperature sensor
+          enable_dP_dt:              true   # Ipv*Vpv is PV power — rate useful
+          enable_dV_dt:              true
+          enable_dI_dt:              true
+          enable_Vg_normalized:      false  # no GTI/irradiance reference
+          enable_differential_signal: false
+        selection:
+          anchor_features: [dP_dt, dV_dt, dI_dt]
+
+
+# =============================================================================
+# GLOBAL SPLIT DEFAULTS
+# Overridden per-dataset under paths.datasets.<dataset>.splits
+# =============================================================================
 splits:
-  seed: 42
+  seed:        42
   train_ratio: 0.70
-  val_ratio: 0.15
-  test_ratio: 0.15
-  segmentation_gap_seconds: 300      # 5 min gap defines segment boundary
+  val_ratio:   0.15
+  test_ratio:  0.15
+  embargo_seconds: 1260    # 21 min embargo between train and val/test boundaries
 
-  # Evaluable fault classes (have ≥3 segments for train/val/test distribution)
-  evaluable_classes: [3.1, 3.2, 4.0]
-  
-  # Train-only fault classes (insufficient segments, contribute to Task A only)
-  train_only_classes: [1.0, 2.1, 2.2, 2.3]
 
 # =============================================================================
-# TASK C: PREDICTION CONFIGURATION
+# GLOBAL PREPROCESSING DEFAULTS
+# Applied when a dataset does not define an override for a given key.
+# Dataset-specific overrides live under paths.datasets.<dataset>.preprocessing
 # =============================================================================
-
-prediction:
-  forecast_horizon_seconds: 1800     # 30 min — how far ahead to predict
-  window_size_seconds: 3600          # 60 min — history used as features
-  min_episodes_for_eval: 3           # Minimum episodes to be evaluable
-
-# =============================================================================
-# PREPROCESSING CONFIGURATION
-# =============================================================================
-# Based on EDA findings documented in PREPROCESSING_DECISIONS.md
-
 preprocessing:
   # --- Missing Value Handling ---
-  # Tiered strategy: ffill for short gaps, interpolate for medium, drop for long
-  # Rule: NEVER impute on fault data (would fabricate fault signatures)
+  # Tiered strategy: ffill for short gaps, interpolate for medium, drop for long.
+  # NEVER impute on fault-labeled rows — would fabricate fault signatures.
   missing_values:
-    ffill_max_gap_seconds: 60          # < 1 min → forward-fill (normal only)
-    interp_max_gap_seconds: 300        # 1-5 min → linear interpolation (normal only)
-    # > 5 min → DROP rows
-    # Any gap on fault data → DROP rows
-  
+    ffill_max_gap_seconds:  60    # < 1 min  → forward-fill (normal only)
+    interp_max_gap_seconds: 300   # 1-5 min  → linear interpolation (normal only)
+    # > 5 min OR any fault gap → DROP rows
+
   # --- Outlier Treatment ---
-  # IQR 3× is conservative — only catches far outliers (sensor errors)
-  # Fault data outliers are expected signatures, not errors
+  # IQR 3× is conservative — only catches far outliers (sensor errors).
+  # Fault data outliers are expected fault signatures — never winsorize them.
   outliers:
-    method: iqr_winsorize                # IQR detection + percentile replacement
-    iqr_multiplier: 3.0                  # 3× IQR for outlier detection
-    lower_percentile: 0.05               # Replace outliers with 5th percentile
-    upper_percentile: 0.95               # Replace outliers with 95th percentile
-    scope: normal_only                   # don't touch fault data
-  
-  # --- Stationarity Correction ---
-  # STL not applicable (segments < 2 seasonal cycles)
-  # Use physics-based normalization instead
+    method:           iqr_winsorize   # IQR detection + percentile clamp
+    iqr_multiplier:   3.0
+    lower_percentile: 0.05
+    upper_percentile: 0.95
+    scope:            normal_only
+
+  # --- Stationarity Correction (global fallback — override per dataset) ---
   stationarity:
-    # Irradiance normalization: removes diurnal dependency
-    # Power/GTI ≈ efficiency, which is ~constant throughout day
-    irradiance_normalize:
-      features: [Pg, Ig, Eg, Fg, Ia]   # power-related features
-      denominator: GTI
-      suffix: _norm
-    
-    # Polynomial detrending: removes curved thermal drift per segment
-    polynomial_detrend:
-      features: [TA, TPV]               # temperature features
-      scope: per_segment
-      suffix: _detrend
-      degree: 2                         # polynomial degree (2=quadratic, better for curved temp patterns)
+    irradiance_normalize: null
+    polynomial_detrend:   null
+
 
 # =============================================================================
-# FEATURE ENGINEERING CONFIGURATION
+# GLOBAL FEATURE ENGINEERING DEFAULTS
+# Dataset-specific flag/selection overrides live under
+# paths.datasets.<dataset>.feature_engineering
+# Profile and task_directive overrides layer on top.
 # =============================================================================
-
 feature_engineering:
-  # Per-component flags for ablation experiments (no code edits required)
+
+  # Global flag defaults — overridden by dataset, then profile, then task_directive
   flags:
-    enable_hour_cyclic: true
-    enable_delta_temp: true
-    enable_dP_dt: true
-    enable_dV_dt: true
-    enable_dI_dt: true
-    enable_Vg_normalized: true
-    enable_corr_pruning: true
-    enable_vif_pruning: true
-    enable_wavelet: false
+    enable_hour_cyclic:        true
+    enable_delta_temp:         true
+    enable_dP_dt:              true
+    enable_dV_dt:              true
+    enable_dI_dt:              true
+    enable_Vg_normalized:      true
+    enable_corr_pruning:       true
+    enable_vif_pruning:        true
+    enable_wavelet:            false
     wavelet_threshold_strategy: per_segment   # per_segment | global
     include_preprocessed_stationarity_features: true
     preprocessed_stationarity_suffixes: ["_norm", "_detrend"]
@@ -135,168 +258,187 @@ feature_engineering:
 
   selection:
     corr_threshold: 0.95
-    vif_threshold: 10.0
-    max_vif_rows: 50000
-    anchor_features: [delta_temp, dP_dt, dV_dt, dI_dt]
-    use_eda_findings: true
-    eda_findings_path: data/interim/eda/la_reunion/eda_feature_findings.json
-    eda_prefer_anchors_from_findings: true
-    eda_pre_drop_candidates: true
-    eda_override_thresholds: false
+    vif_threshold:  10.0
+    max_vif_rows:   50000
+    # anchor_features: overridden per dataset (dataset has the right column names)
+    anchor_features: [dP_dt, dV_dt, dI_dt]   # safe global default
+    use_eda_findings:                    true
+    # eda_findings_path: resolved from paths.datasets.<dataset>.eda_findings_path at runtime
+    eda_prefer_anchors_from_findings:    true
+    eda_pre_drop_candidates:             true
+    eda_override_thresholds:             false
     eda_apply_predrop_before_feature_generation: true
-    eda_block_derived_from_predropped_sources: true
+    eda_block_derived_from_predropped_sources:   true
 
   tsfresh:
-    mode: minimal               # off | minimal | extensive
-    top_k: 20
-    n_segments_sample: 60
+    mode:                minimal   # off | minimal | extensive
+    top_k:               20
+    n_segments_sample:   60
     max_rows_per_segment: 800
-    n_jobs: 1
+    n_jobs:              1
 
   outputs:
-    root_dir: data/processed/features
+    root_dir:    data/processed/features
     runs_subdir: runs
 
-  # Task-specific overrides layered on top of base flags/selection/tsfresh.
-  # Resolution order: base config -> profile overrides -> common -> selected task.
+  # ---------------------------------------------------------------------------
+  # TASK DIRECTIVES
+  # Overrides layered on top of base flags/selection/tsfresh per task.
+  # Resolution: global defaults → dataset overrides → task_directive → profile
+  # ---------------------------------------------------------------------------
   task_directives:
     default_task: classification
+
     common:
       flags: {}
       selection: {}
       tsfresh: {}
       eda:
-        mi_top_key: top_features_binary
+        mi_top_key:      top_features_binary
         use_mannwhitney: true
       tsfresh_label_strategy: any_fault
 
     anomaly_semisup:
       eda:
-        mi_top_key: top_features_binary
+        mi_top_key:      top_features_binary
         use_mannwhitney: true
 
     anomaly_supervised:
       eda:
-        mi_top_key: top_features_binary
+        mi_top_key:      top_features_binary
         use_mannwhitney: true
 
     classification:
       eda:
-        mi_top_key: top_features_multiclass
+        mi_top_key:      top_features_multiclass
         use_mannwhitney: false
       tsfresh_label_strategy: majority_label
 
     prediction:
       selection:
         eda_prefer_anchors_from_findings: false
-        eda_pre_drop_candidates: false
+        eda_pre_drop_candidates:          false
       eda:
-        mi_top_key: top_features_binary
+        mi_top_key:      top_features_binary
         use_mannwhitney: false
       tsfresh_label_strategy: any_fault
 
+  # ---------------------------------------------------------------------------
+  # ABLATION PROFILES
+  # Named feature sets for systematic ablation experiments.
+  # Additive layers: baseline_raw < plus_physics < plus_temporal
+  #                  < plus_tsfresh_* / plus_wavelet / plus_differential < plus_all
+  # Run: uv run python -m src.data.featurize_pipeline --profile <name> --task <task>
+  # ---------------------------------------------------------------------------
   profiles:
     baseline_raw:
-      enable_hour_cyclic: false
-      enable_delta_temp: false
-      enable_dP_dt: false
-      enable_dV_dt: false
-      enable_dI_dt: false
-      enable_Vg_normalized: false
-      enable_corr_pruning: false
-      enable_vif_pruning: false
-      enable_wavelet: false
+      enable_hour_cyclic:         false
+      enable_delta_temp:          false
+      enable_dP_dt:               false
+      enable_dV_dt:               false
+      enable_dI_dt:               false
+      enable_Vg_normalized:       false
+      enable_corr_pruning:        false
+      enable_vif_pruning:         false
+      enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
-      tsfresh_mode: "off"
+      tsfresh_mode:               "off"
+
     plus_physics:
-      enable_hour_cyclic: false
-      enable_delta_temp: true
-      enable_dP_dt: true
-      enable_dV_dt: true
-      enable_dI_dt: true
-      enable_Vg_normalized: true
-      enable_corr_pruning: true
-      enable_vif_pruning: true
-      enable_wavelet: false
+      enable_hour_cyclic:         false
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
-      tsfresh_mode: "off"
+      tsfresh_mode:               "off"
+
     plus_temporal:
-      enable_hour_cyclic: true
-      enable_delta_temp: true
-      enable_dP_dt: true
-      enable_dV_dt: true
-      enable_dI_dt: true
-      enable_Vg_normalized: true
-      enable_corr_pruning: true
-      enable_vif_pruning: true
-      enable_wavelet: false
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
-      tsfresh_mode: "off"
+      tsfresh_mode:               "off"
+
     plus_tsfresh_minimal:
-      enable_hour_cyclic: true
-      enable_delta_temp: true
-      enable_dP_dt: true
-      enable_dV_dt: true
-      enable_dI_dt: true
-      enable_Vg_normalized: true
-      enable_corr_pruning: true
-      enable_vif_pruning: true
-      enable_wavelet: false
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
-      tsfresh_mode: "minimal"
+      tsfresh_mode:               "minimal"
+
     plus_tsfresh_extensive:
-      enable_hour_cyclic: true
-      enable_delta_temp: true
-      enable_dP_dt: true
-      enable_dV_dt: true
-      enable_dI_dt: true
-      enable_Vg_normalized: true
-      enable_corr_pruning: true
-      enable_vif_pruning: true
-      enable_wavelet: false
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
-      tsfresh_mode: "extensive"
+      tsfresh_mode:               "extensive"
+
     plus_wavelet:
-      enable_hour_cyclic: true
-      enable_delta_temp: true
-      enable_dP_dt: true
-      enable_dV_dt: true
-      enable_dI_dt: true
-      enable_Vg_normalized: true
-      enable_corr_pruning: true
-      enable_vif_pruning: true
-      enable_wavelet: true
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             true
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
-      tsfresh_mode: "off"
+      tsfresh_mode:               "off"
+
     plus_differential:
-      enable_hour_cyclic: true
-      enable_delta_temp: true
-      enable_dP_dt: true
-      enable_dV_dt: true
-      enable_dI_dt: true
-      enable_Vg_normalized: true
-      enable_corr_pruning: true
-      enable_vif_pruning: true
-      enable_wavelet: false
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: true
-      tsfresh_mode: "off"
+      tsfresh_mode:               "off"
+
     plus_all:
-      enable_hour_cyclic: true
-      enable_delta_temp: true
-      enable_dP_dt: true
-      enable_dV_dt: true
-      enable_dI_dt: true
-      enable_Vg_normalized: true
-      enable_corr_pruning: true
-      enable_vif_pruning: true
-      enable_wavelet: true
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             true
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: true
-      tsfresh_mode: "extensive"
+      tsfresh_mode:               "extensive"

@@ -96,16 +96,37 @@ def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in value)
 
 
-def _resolve_output_root(config: dict) -> tuple[Path, str]:
+def _resolve_output_root(config: dict, dataset: str) -> tuple[Path, str]:
     fe_cfg = config.get("feature_engineering", {})
     out_cfg = fe_cfg.get("outputs", {})
     root_dir = out_cfg.get("root_dir", "data/processed/features")
     runs_subdir = out_cfg.get("runs_subdir", "runs")
-    return PROJECT_ROOT / root_dir, str(runs_subdir)
+    return PROJECT_ROOT / root_dir / dataset, str(runs_subdir)
 
 
-def _resolve_input_dir(task: str) -> Path:
-    return PROJECT_ROOT / "data" / "processed" / "preprocessed" / task
+def _apply_dataset_overrides(config: dict, dataset: str, flags: dict, selection: dict) -> tuple[dict, dict]:
+    """Merge dataset-specific feature_engineering flags and selection into global defaults."""
+    ds_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
+    ds_fe = ds_cfg.get("feature_engineering", {})
+
+    # Dataset flag overrides (only keys explicitly set in dataset config)
+    for key, value in ds_fe.get("flags", {}).items():
+        flags[key] = value
+
+    # Dataset selection overrides (anchor_features etc.)
+    for key, value in ds_fe.get("selection", {}).items():
+        selection[key] = value
+
+    # Inject dataset-specific eda_findings_path into selection so _load_eda_findings picks it up
+    ds_eda_path = ds_cfg.get("eda_findings_path")
+    if ds_eda_path:
+        selection["eda_findings_path"] = ds_eda_path
+
+    return flags, selection
+
+
+def _resolve_input_dir(dataset: str, task: str) -> Path:
+    return PROJECT_ROOT / "data" / "processed" / "preprocessed" / dataset / task
 
 
 def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -391,6 +412,11 @@ def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run feature engineering pipeline.")
     parser.add_argument(
+        "--dataset",
+        default="la_reunion",
+        help="Dataset to featurize (must match a key in data_config.yaml paths.datasets). Default: la_reunion",
+    )
+    parser.add_argument(
         "--task",
         default=None,
         choices=TASK_CHOICES,
@@ -404,9 +430,21 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config()
+
+    # Validate dataset
+    available_datasets = list(config.get("paths", {}).get("datasets", {}).keys())
+    if args.dataset not in available_datasets:
+        raise ValueError(
+            f"Unknown dataset '{args.dataset}'. Available: {available_datasets}"
+        )
+
     task, task_directives = _resolve_task_and_directives(config, args.task)
 
+    # Resolution order: global defaults → dataset overrides → task_directive → profile
     base_flags, base_selection_cfg, base_tsfresh_cfg, profile_name = resolve_profile(config, args.profile)
+    base_flags, base_selection_cfg = _apply_dataset_overrides(
+        config, args.dataset, base_flags, base_selection_cfg
+    )
     flags, selection_cfg, tsfresh_cfg = _apply_task_overrides(
         base_flags,
         base_selection_cfg,
@@ -414,10 +452,10 @@ def main() -> None:
         task_directives,
     )
 
-    input_dir = _resolve_input_dir(task)
+    input_dir = _resolve_input_dir(args.dataset, task)
     profile_key = _safe_name(profile_name or "default")
     task_key = _safe_name(task)
-    output_root, runs_subdir = _resolve_output_root(config)
+    output_root, runs_subdir = _resolve_output_root(config, args.dataset)
     output_root.mkdir(parents=True, exist_ok=True)
     task_output_root = output_root / task_key
     runs_root = task_output_root / runs_subdir
