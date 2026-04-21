@@ -1,97 +1,50 @@
+vars:
+  - configs/data_config.yaml
+
 stages:
-  # Stage 0: Data Ingestion → Parquet
-  # Outputs go to data/interim/ingestion/<dataset>/
+  # Stage 0: Costa ingestion -> Parquet
   ingest:
-    cmd: uv run python -m src.data.ingestion --dataset la_reunion
+    cmd: uv run python -m src.data.ingestion --dataset ${active_dataset}
     deps:
       - src/data/ingestion.py
-      - data/raw/University of La Réunion Data/dt1_solar_and_meteorological_measurement.csv
-      - data/raw/University of La Réunion Data/dt2_electrical_production_inverter_1_with_faults.csv
-      - data/raw/University of La Réunion Data/dt3_electrical_production_inverter_2.csv
+      - configs/data_config.yaml
     outs:
-      - data/interim/ingestion/la_reunion/reunion_dt2_merged.parquet
-      - data/interim/ingestion/la_reunion/reunion_dt3_merged.parquet
+      - data/interim/ingestion/${active_dataset}/
 
-  # Stage 1: Task-Specific Splits
-  # Outputs go to data/interim/splits/<dataset>/
-  # Split types: anomaly_semisup, anomaly_supervised, classification
+  # Stage 1: active dataset task-specific splits
   split:
-    cmd: uv run python -m src.data.split_pipeline --dataset la_reunion
+    cmd: uv run python -m src.data.split_pipeline --dataset ${active_dataset}
     deps:
       - src/data/splitting.py
       - src/data/split_pipeline.py
-      - data/interim/ingestion/la_reunion/reunion_dt2_merged.parquet
+      - data/interim/ingestion/${active_dataset}/
       - configs/data_config.yaml
     outs:
-      - data/interim/splits/la_reunion/anomaly_semisup/train.parquet
-      - data/interim/splits/la_reunion/anomaly_semisup/val.parquet
-      - data/interim/splits/la_reunion/anomaly_semisup/test.parquet
-      - data/interim/splits/la_reunion/anomaly_semisup/split_manifest.json
-      - data/interim/splits/la_reunion/anomaly_supervised/train.parquet
-      - data/interim/splits/la_reunion/anomaly_supervised/val.parquet
-      - data/interim/splits/la_reunion/anomaly_supervised/test.parquet
-      - data/interim/splits/la_reunion/anomaly_supervised/split_manifest.json
-      - data/interim/splits/la_reunion/classification/train.parquet
-      - data/interim/splits/la_reunion/classification/val.parquet
-      - data/interim/splits/la_reunion/classification/test.parquet
-      - data/interim/splits/la_reunion/classification/split_manifest.json
+      - data/interim/splits/${active_dataset}/
 
-  # Stage 1.5: Preprocessing (post-split)
-  # Handles: missing values, outliers, stationarity transforms
-  # See PREPROCESSING_DECISIONS.md for rationale
+  # Stage 1.5: active dataset preprocessing
   preprocess:
-    cmd: uv run python -m src.data.preprocess_pipeline --dataset la_reunion
+    cmd: uv run python -m src.data.preprocess_pipeline --dataset ${active_dataset}
     deps:
       - src/data/preprocessing.py
       - src/data/preprocess_pipeline.py
-      - data/interim/splits/la_reunion/anomaly_semisup/train.parquet
-      - data/interim/splits/la_reunion/anomaly_semisup/val.parquet
-      - data/interim/splits/la_reunion/anomaly_semisup/test.parquet
-      - data/interim/splits/la_reunion/anomaly_supervised/train.parquet
-      - data/interim/splits/la_reunion/anomaly_supervised/val.parquet
-      - data/interim/splits/la_reunion/anomaly_supervised/test.parquet
-      - data/interim/splits/la_reunion/classification/train.parquet
-      - data/interim/splits/la_reunion/classification/val.parquet
-      - data/interim/splits/la_reunion/classification/test.parquet
+      - data/interim/splits/${active_dataset}/
       - configs/data_config.yaml
     outs:
-      - data/processed/preprocessed/la_reunion/anomaly_semisup/train.parquet
-      - data/processed/preprocessed/la_reunion/anomaly_semisup/val.parquet
-      - data/processed/preprocessed/la_reunion/anomaly_semisup/test.parquet
-      - data/processed/preprocessed/la_reunion/anomaly_supervised/train.parquet
-      - data/processed/preprocessed/la_reunion/anomaly_supervised/val.parquet
-      - data/processed/preprocessed/la_reunion/anomaly_supervised/test.parquet
-      - data/processed/preprocessed/la_reunion/classification/train.parquet
-      - data/processed/preprocessed/la_reunion/classification/val.parquet
-      - data/processed/preprocessed/la_reunion/classification/test.parquet
-      - data/processed/preprocessed/la_reunion/preprocess_manifest.json
+      - data/processed/preprocessed/${active_dataset}/
 
-  # Stage 2: Feature Engineering (post-preprocessing)
+  # Stage 2: active dataset feature engineering
   featurize:
-    cmd: uv run python -m src.data.featurize_pipeline --profile plus_tsfresh_minimal --task classification
+    cmd: uv run python -m src.data.featurize_pipeline --dataset ${active_dataset} --profile plus_tsfresh_minimal --task classification
     deps:
       - src/data/features.py
       - src/data/featurize_pipeline.py
-      - data/processed/preprocessed/la_reunion/classification/train.parquet
-      - data/processed/preprocessed/la_reunion/classification/val.parquet
-      - data/processed/preprocessed/la_reunion/classification/test.parquet
+      - data/processed/preprocessed/${active_dataset}/classification/
       - configs/data_config.yaml
     outs:
       - data/processed/features/latest_runs.json
 
-  # Stage 3: Task A — Anomaly Detection Baselines
-  train_anomaly:
-    cmd: uv run python -m src.models.train_anomaly
-    deps:
-      - src/models/train_anomaly.py
-      - data/interim/splits/la_reunion/anomaly_semisup/
-      - data/interim/splits/la_reunion/anomaly_supervised/
-      - configs/data_config.yaml
-    metrics:
-      - experiments/metrics/anomaly_results.json:
-          cache: false
-
-  # Stage 4: Task B — Classification Baselines
+  # Stage 3: active dataset Task B classification baseline
   train_classification:
     cmd: uv run python -m src.models.train_classification
     deps:

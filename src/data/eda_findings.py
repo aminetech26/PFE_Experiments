@@ -217,6 +217,7 @@ def export_eda_feature_findings(
     pdf_complete: pd.DataFrame,
     feature_cols: list[str],
     label_col: str,
+    dataset: str,
     output_dir: Path,
     corr_threshold: float = 0.95,
     vif_threshold: float = 10.0,
@@ -242,7 +243,7 @@ def export_eda_feature_findings(
     consolidated = {
         "version": 1,
         "created_at": datetime.now(UTC).isoformat(),
-        "dataset": "reunion_dt2",
+        "dataset": dataset,
         "label_column": label_col,
         "feature_columns": list(feature_cols),
         "mannwhitney": findings_mw,
@@ -270,7 +271,9 @@ def export_eda_feature_findings(
 
     for path, payload in payloads.items():
         safe_payload = _to_json_safe(payload)
-        path.write_text(json.dumps(safe_payload, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+        path.write_text(
+            json.dumps(safe_payload, indent=2, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
 
     return consolidated, {k: str(v) for k, v in files.items()}
-

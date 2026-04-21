@@ -33,7 +33,7 @@ from src.data.features import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
 
-TASK_CHOICES = ("anomaly_semisup", "anomaly_supervised", "classification", "prediction")
+TASK_CHOICES = ("anomaly_semisup", "anomaly_supervised", "classification")
 
 PROFILE_FLAG_KEYS = {
     "wavelet_threshold_strategy",
@@ -55,6 +55,10 @@ DERIVED_FEATURE_ENABLE_FLAGS = {
 def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def get_active_dataset(config: dict) -> str:
+    return str(config.get("active_dataset", "la_reunion"))
 
 
 def resolve_profile(config: dict, profile_name: str | None) -> tuple[dict, dict, dict, str | None]:
@@ -104,7 +108,9 @@ def _resolve_output_root(config: dict, dataset: str) -> tuple[Path, str]:
     return PROJECT_ROOT / root_dir / dataset, str(runs_subdir)
 
 
-def _apply_dataset_overrides(config: dict, dataset: str, flags: dict, selection: dict) -> tuple[dict, dict]:
+def _apply_dataset_overrides(
+    config: dict, dataset: str, flags: dict, selection: dict
+) -> tuple[dict, dict]:
     """Merge dataset-specific feature_engineering flags and selection into global defaults."""
     ds_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
     ds_fe = ds_cfg.get("feature_engineering", {})
@@ -177,9 +183,11 @@ def _resolve_eda_policy(task: str, task_directives: dict) -> dict:
     eda_cfg = task_directives.get("eda", {})
     mi_top_key = eda_cfg.get("mi_top_key")
     if not mi_top_key:
-        mi_top_key = "top_features_multiclass" if task == "classification" else "top_features_binary"
+        mi_top_key = (
+            "top_features_multiclass" if task == "classification" else "top_features_binary"
+        )
 
-    use_mannwhitney = bool(eda_cfg.get("use_mannwhitney", task != "prediction"))
+    use_mannwhitney = bool(eda_cfg.get("use_mannwhitney", True))
     return {
         "mi_top_key": str(mi_top_key),
         "use_mannwhitney": use_mannwhitney,
@@ -316,7 +324,9 @@ def _apply_eda_predrop_before_feature_generation(
     return updated, applied, unavailable
 
 
-def _apply_predrop_derived_blocking(flags: dict, predropped_cols: list[str]) -> tuple[dict, list[dict]]:
+def _apply_predrop_derived_blocking(
+    flags: dict, predropped_cols: list[str]
+) -> tuple[dict, list[dict]]:
     """Disable derived features that depend on EDA pre-dropped sources."""
     predropped = set(predropped_cols)
     effective = dict(flags)
@@ -404,17 +414,21 @@ def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, 
             out["delta_p"] = out["Pg"] - out["Pg_ref"]
             added.append("delta_p")
         else:
-            logger.warning("Differential signal enabled but required columns are missing; skipping.")
+            logger.warning(
+                "Differential signal enabled but required columns are missing; skipping."
+            )
 
     return out, added
 
 
 def main() -> None:
+    config = load_config()
+    default_dataset = get_active_dataset(config)
     parser = argparse.ArgumentParser(description="Run feature engineering pipeline.")
     parser.add_argument(
         "--dataset",
-        default="la_reunion",
-        help="Dataset to featurize (must match a key in data_config.yaml paths.datasets). Default: la_reunion",
+        default=default_dataset,
+        help=f"Dataset to featurize (must match a key in data_config.yaml paths.datasets). Default: {default_dataset}",
     )
     parser.add_argument(
         "--task",
@@ -429,19 +443,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = load_config()
-
     # Validate dataset
     available_datasets = list(config.get("paths", {}).get("datasets", {}).keys())
     if args.dataset not in available_datasets:
-        raise ValueError(
-            f"Unknown dataset '{args.dataset}'. Available: {available_datasets}"
-        )
+        raise ValueError(f"Unknown dataset '{args.dataset}'. Available: {available_datasets}")
 
     task, task_directives = _resolve_task_and_directives(config, args.task)
 
     # Resolution order: global defaults → dataset overrides → task_directive → profile
-    base_flags, base_selection_cfg, base_tsfresh_cfg, profile_name = resolve_profile(config, args.profile)
+    base_flags, base_selection_cfg, base_tsfresh_cfg, profile_name = resolve_profile(
+        config, args.profile
+    )
     base_flags, base_selection_cfg = _apply_dataset_overrides(
         config, args.dataset, base_flags, base_selection_cfg
     )
@@ -463,14 +475,24 @@ def main() -> None:
 
     eda_policy = _resolve_eda_policy(task, task_directives)
     eda_findings, eda_meta = _load_eda_findings(PROJECT_ROOT, selection_cfg)
-    selection_effective, eda_pre_drop = _apply_eda_selection_priors(selection_cfg, eda_findings, eda_policy)
+    selection_effective, eda_pre_drop = _apply_eda_selection_priors(
+        selection_cfg, eda_findings, eda_policy
+    )
     tsfresh_mode = _tsfresh_mode(tsfresh_cfg)
     tsfresh_label_strategy = str(task_directives.get("tsfresh_label_strategy", "any_fault"))
-    predrop_before_featurization = bool(selection_effective.get("eda_apply_predrop_before_feature_generation", True))
-    block_derived_from_predrop = bool(selection_effective.get("eda_block_derived_from_predropped_sources", True))
-    include_preprocessed_stationarity = bool(flags.get("include_preprocessed_stationarity_features", False))
+    predrop_before_featurization = bool(
+        selection_effective.get("eda_apply_predrop_before_feature_generation", True)
+    )
+    block_derived_from_predrop = bool(
+        selection_effective.get("eda_block_derived_from_predropped_sources", True)
+    )
+    include_preprocessed_stationarity = bool(
+        flags.get("include_preprocessed_stationarity_features", False)
+    )
 
-    raw_stationarity_suffixes = flags.get("preprocessed_stationarity_suffixes", ["_norm", "_detrend"])
+    raw_stationarity_suffixes = flags.get(
+        "preprocessed_stationarity_suffixes", ["_norm", "_detrend"]
+    )
     if isinstance(raw_stationarity_suffixes, str):
         stationarity_suffixes = [raw_stationarity_suffixes]
     elif isinstance(raw_stationarity_suffixes, list):
@@ -493,8 +515,12 @@ def main() -> None:
             "eda_prefer_anchors_from_findings": bool(
                 selection_effective.get("eda_prefer_anchors_from_findings", True)
             ),
-            "eda_pre_drop_candidates": bool(selection_effective.get("eda_pre_drop_candidates", True)),
-            "eda_override_thresholds": bool(selection_effective.get("eda_override_thresholds", False)),
+            "eda_pre_drop_candidates": bool(
+                selection_effective.get("eda_pre_drop_candidates", True)
+            ),
+            "eda_override_thresholds": bool(
+                selection_effective.get("eda_override_thresholds", False)
+            ),
             "eda_apply_predrop_before_feature_generation": predrop_before_featurization,
             "eda_block_derived_from_predropped_sources": block_derived_from_predrop,
         },
@@ -559,7 +585,13 @@ def main() -> None:
         generated_cols[subset] = added
 
     candidate_features = sorted(
-        set(base_cols + stationarity_cols + generated_cols["train"] + generated_cols["val"] + generated_cols["test"])
+        set(
+            base_cols
+            + stationarity_cols
+            + generated_cols["train"]
+            + generated_cols["val"]
+            + generated_cols["test"]
+        )
     )
     candidate_features = [c for c in candidate_features if c in split_frames["train"].columns]
     candidate_predrop_applied = [c for c in eda_pre_drop if c in set(candidate_features)]
@@ -571,28 +603,36 @@ def main() -> None:
     selected_features = candidate_features.copy()
 
     if flags.get("enable_corr_pruning", False) and selected_features:
-        split_frames["train"], split_frames["val"], split_frames["test"], selected_features, corr_dropped = (
-            apply_correlation_pruning(
-                split_frames["train"],
-                split_frames["val"],
-                split_frames["test"],
-                selected_features,
-                threshold=float(selection_effective.get("corr_threshold", 0.95)),
-                anchor_cols=selection_effective.get("anchor_features", []),
-            )
+        (
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            corr_dropped,
+        ) = apply_correlation_pruning(
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            threshold=float(selection_effective.get("corr_threshold", 0.95)),
+            anchor_cols=selection_effective.get("anchor_features", []),
         )
 
     if flags.get("enable_vif_pruning", False) and selected_features:
-        split_frames["train"], split_frames["val"], split_frames["test"], selected_features, vif_dropped = (
-            apply_vif_pruning(
-                split_frames["train"],
-                split_frames["val"],
-                split_frames["test"],
-                selected_features,
-                threshold=float(selection_effective.get("vif_threshold", 10.0)),
-                anchor_cols=selection_effective.get("anchor_features", []),
-                max_rows=int(selection_effective.get("max_vif_rows", 50000)),
-            )
+        (
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            vif_dropped,
+        ) = apply_vif_pruning(
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            threshold=float(selection_effective.get("vif_threshold", 10.0)),
+            anchor_cols=selection_effective.get("anchor_features", []),
+            max_rows=int(selection_effective.get("max_vif_rows", 50000)),
         )
 
     tsfresh_top_k = int(tsfresh_cfg.get("top_k", 20))
@@ -600,22 +640,26 @@ def main() -> None:
     tsfresh_meta: dict = {"mode": tsfresh_mode, "selected": 0}
 
     if tsfresh_mode != "off":
-        split_frames["train"], split_frames["val"], split_frames["test"], tsfresh_cols, tsfresh_meta = (
-            extract_tsfresh_segment_features(
-                split_frames["train"],
-                split_frames["val"],
-                split_frames["test"],
-                feature_cols=selected_features,
-                mode=tsfresh_mode,
-                top_k=tsfresh_top_k,
-                segment_col="segment_id",
-                time_col="timestamp",
-                label_col=label_col,
-                n_segments_sample=int(tsfresh_cfg.get("n_segments_sample", 60)),
-                max_rows_per_segment=int(tsfresh_cfg.get("max_rows_per_segment", 800)),
-                n_jobs=int(tsfresh_cfg.get("n_jobs", -1)),
-                label_strategy=tsfresh_label_strategy,
-            )
+        (
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            tsfresh_cols,
+            tsfresh_meta,
+        ) = extract_tsfresh_segment_features(
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            feature_cols=selected_features,
+            mode=tsfresh_mode,
+            top_k=tsfresh_top_k,
+            segment_col="segment_id",
+            time_col="timestamp",
+            label_col=label_col,
+            n_segments_sample=int(tsfresh_cfg.get("n_segments_sample", 60)),
+            max_rows_per_segment=int(tsfresh_cfg.get("max_rows_per_segment", 800)),
+            n_jobs=int(tsfresh_cfg.get("n_jobs", -1)),
+            label_strategy=tsfresh_label_strategy,
         )
 
     final_feature_cols = []
@@ -623,7 +667,11 @@ def main() -> None:
         if col in split_frames["train"].columns and col not in final_feature_cols:
             final_feature_cols.append(col)
 
-    meta_cols = [c for c in ("timestamp", "segment_id", "label", "Fault") if c in split_frames["train"].columns]
+    meta_cols = [
+        c
+        for c in ("timestamp", "segment_id", "label", "Fault")
+        if c in split_frames["train"].columns
+    ]
     if label_col not in meta_cols and label_col in split_frames["train"].columns:
         meta_cols.append(label_col)
 
@@ -631,7 +679,9 @@ def main() -> None:
         out_df = split_frames[subset][meta_cols + final_feature_cols].copy()
         out_path = run_dir / f"{subset}.parquet"
         out_df.to_parquet(out_path, index=False)
-        logger.info(f"Saved {subset}: {out_path} ({len(out_df):,} rows, {len(final_feature_cols)} features)")
+        logger.info(
+            f"Saved {subset}: {out_path} ({len(out_df):,} rows, {len(final_feature_cols)} features)"
+        )
 
     manifest = {
         "version": 1,
@@ -682,8 +732,12 @@ def main() -> None:
         json.dump(manifest, f, indent=2, allow_nan=False)
 
     resolved_path = run_dir / "resolved_config.json"
+    resolved_base = to_json_safe(resolved_for_fingerprint)
+    if not isinstance(resolved_base, dict):
+        raise TypeError("Resolved feature config must serialize to a mapping")
+
     resolved_payload = {
-        **to_json_safe(resolved_for_fingerprint),
+        **resolved_base,
         "io": {
             "input_dir": str(input_dir),
             "output_root": str(output_root),
@@ -704,7 +758,9 @@ def main() -> None:
                 latest_by_task = loaded
         except Exception:
             latest_by_task = {"latest_by_task": {}}
-    if "latest_by_task" not in latest_by_task or not isinstance(latest_by_task.get("latest_by_task"), dict):
+    if "latest_by_task" not in latest_by_task or not isinstance(
+        latest_by_task.get("latest_by_task"), dict
+    ):
         latest_by_task["latest_by_task"] = {}
 
     if "latest_by_task_profile" not in latest_by_task or not isinstance(
@@ -725,11 +781,12 @@ def main() -> None:
         "path": relative_run_dir,
     }
     latest_by_task["updated_at"] = datetime.now(UTC).isoformat()
-    latest_by_task_path.write_text(json.dumps(to_json_safe(latest_by_task), indent=2), encoding="utf-8")
+    latest_by_task_path.write_text(
+        json.dumps(to_json_safe(latest_by_task), indent=2), encoding="utf-8"
+    )
 
     logger.success(f"Feature engineering complete. Manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
     main()
-

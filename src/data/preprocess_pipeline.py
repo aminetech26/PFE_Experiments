@@ -35,6 +35,10 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def get_active_dataset(config: dict) -> str:
+    return str(config.get("active_dataset", "la_reunion"))
+
+
 def get_feature_cols() -> list[str]:
     """Get default base feature columns used by preprocessing."""
     return list(DEFAULT_BASE_FEATURE_COLUMNS)
@@ -176,11 +180,13 @@ def create_manifest(
 
 def main() -> None:
     """Run preprocessing pipeline on all splits."""
+    config = load_config()
+    default_dataset = get_active_dataset(config)
     parser = argparse.ArgumentParser(description="Preprocess split data for a given dataset")
     parser.add_argument(
         "--dataset",
-        default="la_reunion",
-        help="Dataset to preprocess (must match data_config.yaml paths.datasets key). Default: la_reunion",
+        default=default_dataset,
+        help=f"Dataset to preprocess (must match data_config.yaml paths.datasets key). Default: {default_dataset}",
     )
     args = parser.parse_args()
 
@@ -188,7 +194,6 @@ def main() -> None:
     logger.info("PREPROCESSING PIPELINE — dataset={}", args.dataset)
     logger.info("=" * 60)
 
-    config = load_config()
     preprocess_config = config.get("preprocessing", {})
     feature_cols = get_feature_cols()
     label_col = "Fault"
@@ -209,7 +214,6 @@ def main() -> None:
         "anomaly_semisup",
         "anomaly_supervised",
         "classification",
-        "prediction",
     ]
 
     all_split_stats = {}
@@ -252,7 +256,9 @@ def main() -> None:
     # Summary
     total_in = sum(s["total_input_rows"] for s in all_split_stats.values())
     total_out = sum(s["total_output_rows"] for s in all_split_stats.values())
-    logger.info(f"Total rows processed: {total_in:,} → {total_out:,} ({total_in - total_out:,} lost)")
+    logger.info(
+        f"Total rows processed: {total_in:,} → {total_out:,} ({total_in - total_out:,} lost)"
+    )
 
 
 if __name__ == "__main__":

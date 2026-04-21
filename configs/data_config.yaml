@@ -7,6 +7,9 @@
 #   global default  <  dataset override  <  task_directive  <  profile override
 # =============================================================================
 
+# Active dataset for pipeline defaults. CLI flags can still override this.
+active_dataset: costa
+
 # -----------------------------------------------------------------------------
 # PATHS
 # -----------------------------------------------------------------------------
@@ -42,8 +45,8 @@ paths:
     la_reunion:
       dir: "University of La Réunion Data"   # relative to raw_dir
       merged_output: "ingestion/la_reunion/reunion_dt2_merged.parquet"  # relative to interim_dir
-      label_col:     "Fault"
-      timestamp_col: "time"
+      label_col:     "label"
+      timestamp_col: "timestamp"
       sampling_hz:   0.143    # ~7 s intervals
 
       eda_findings_path: "data/interim/eda/la_reunion/eda_feature_findings.json"
@@ -89,10 +92,14 @@ paths:
     # Labels: 0=Normal 1=ShortCircuit 2=Degradation 3=OpenCircuit 4=Shadowing
     # Note: label 4 (Shadowing) is NATURAL, not artificially induced.
     # Faults 1-3: artificially induced ~10-min blocks, daytime only.
-    # Night data retained; use is_daytime (irr > 5 W/m²) to filter upstream.
-    # Timestamp: synthetic 1 Hz, epoch 2020-01-01T03:38:00Z (≈01:38 BRST).
-    #   Epoch derived from solar geometry (Curitiba lon 49.27°W) cross-checked
-    #   with paper fault schedule → both methods agree within 4 min.
+    # Ingestion trims Costa to irr >= 100 W/m² to retain meaningful operating
+    # conditions and match the paper-scale daytime subset (~516k rows).
+    # Timestamp: synthetic 1 Hz, epoch 2020-01-01T03:38:00Z.
+    #   Raw .mat files do not expose trustworthy wall-clock timestamps.
+    #   This epoch is a solar-aligned synthetic anchor chosen so irradiance peaks
+    #   land near plausible local solar noon for Curitiba (lat -25.438686,
+    #   lon -49.268487). Treat relative timing as trustworthy; absolute clock
+    #   semantics remain approximate.
     # -------------------------------------------------------------------------
     costa:
       dir: "Costa PV Fault Dataset"         # relative to raw_dir
@@ -100,6 +107,7 @@ paths:
       label_col:     "label"
       timestamp_col: "timestamp"
       sampling_hz:   1.0
+      daytime_irr_threshold_wm2: 100.0
 
       eda_findings_path: "data/interim/eda/costa/eda_feature_findings.json"
 
@@ -107,9 +115,6 @@ paths:
         evaluable_classes:  [1, 2, 3, 4]   # all four fault types — integer labels
         train_only_classes: []
         segmentation_gap_seconds: 300
-        # Recommended: filter is_daytime=True before Task A/B to avoid
-        # trivial night-vs-day separation (faults 1-3 are daytime-only)
-        daytime_filter_recommended: true
 
       preprocessing:
         stationarity:
@@ -313,15 +318,6 @@ feature_engineering:
         mi_top_key:      top_features_multiclass
         use_mannwhitney: false
       tsfresh_label_strategy: majority_label
-
-    prediction:
-      selection:
-        eda_prefer_anchors_from_findings: false
-        eda_pre_drop_candidates:          false
-      eda:
-        mi_top_key:      top_features_binary
-        use_mannwhitney: false
-      tsfresh_label_strategy: any_fault
 
   # ---------------------------------------------------------------------------
   # ABLATION PROFILES

@@ -20,7 +20,6 @@ Usage
     uv run python -m src.data.eda_pipeline                      # default: la_reunion
     uv run python -m src.data.eda_pipeline --dataset costa
     uv run python -m src.data.eda_pipeline --dataset mendeley
-    uv run python -m src.data.eda_pipeline --dataset costa --daytime-only
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ import argparse
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -39,16 +39,46 @@ from loguru import logger
 from src.data.eda_findings import export_eda_feature_findings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH  = PROJECT_ROOT / "configs" / "data_config.yaml"
+CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
+
+
+def _build_artifact_manifest(
+    dataset: str, output_dir: Path, report_path: Path, file_paths: dict[str, str]
+) -> dict:
+    return {
+        "version": 1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "dataset": dataset,
+        "output_dir": str(output_dir),
+        "artifacts": {
+            "dataset_report": str(report_path),
+            **file_paths,
+        },
+    }
+
+
+def _to_json_safe(value):
+    if isinstance(value, dict):
+        return {k: _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 # =============================================================================
 # CONFIG HELPERS
 # =============================================================================
 
+
 def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def get_active_dataset(config: dict) -> str:
+    return str(config.get("active_dataset", "la_reunion"))
 
 
 def get_dataset_cfg(config: dict, dataset: str) -> dict:
@@ -62,6 +92,7 @@ def get_dataset_cfg(config: dict, dataset: str) -> dict:
 # =============================================================================
 # DATA LOADING AND PREPARATION
 # =============================================================================
+
 
 def load_dataset(config: dict, dataset: str) -> pd.DataFrame:
     """Load the ingested parquet and standardise label + timestamp columns."""
@@ -97,16 +128,15 @@ def load_dataset(config: dict, dataset: str) -> pd.DataFrame:
     return df
 
 
-def prepare_eda_frame(df: pd.DataFrame, dataset: str, daytime_only: bool) -> tuple[pd.DataFrame, str]:
+def prepare_eda_frame(df: pd.DataFrame, dataset: str) -> tuple[pd.DataFrame, str]:
     """
     Apply dataset-specific filtering to get a clean frame for statistical tests.
 
     Returns (eda_df, description_string).
 
     Costa
-      Faults 1-3 are daytime-only artificially induced blocks. Night rows are all
-      label=0 (normal) and would trivially inflate normal-vs-fault separation via
-      the irradiance channel. daytime_only=True filters to is_daytime=True first.
+      Current ingestion already trims Costa to meaningful operating irradiance
+      (`irr >= 100 W/m²`). No extra day/night filtering is required in EDA.
 
     Mendeley
       Each experiment has a pre-fault half (label=0) and a fault half (label=fault_class).
@@ -122,21 +152,22 @@ def prepare_eda_frame(df: pd.DataFrame, dataset: str, daytime_only: bool) -> tup
     desc_parts = []
 
     if dataset == "costa":
-        if daytime_only and "is_daytime" in df.columns:
-            n_before = len(df)
-            df = df[df["is_daytime"]].reset_index(drop=True)
-            logger.info("Costa daytime filter: {:,} → {:,} rows", n_before, len(df))
-            desc_parts.append("daytime_only=True")
-        else:
-            desc_parts.append("daytime_only=False (all rows including night)")
+        desc_parts.append("irradiance_trimmed_at_ingestion=True")
 
     elif dataset == "mendeley":
         if "phase" in df.columns and "fault_class" in df.columns:
             n_before = len(df)
-            is_normal  = df["fault_class"] == 0           # F0 experiments
-            is_fault   = df["phase"] == "fault"            # active fault half of F1-F7
-            df = df[is_normal | is_fault].reset_index(drop=True)
-            logger.info("Mendeley phase filter: {:,} → {:,} rows (F0 normal + fault-phase only)", n_before, len(df))
+            is_normal = pd.Series(df["fault_class"] == 0, index=df.index)  # F0 experiments
+            is_fault = pd.Series(
+                df["phase"] == "fault", index=df.index
+            )  # active fault half of F1-F7
+            filtered_df = df.loc[is_normal | is_fault].reset_index(drop=True)
+            df = filtered_df
+            logger.info(
+                "Mendeley phase filter: {:,} → {:,} rows (F0 normal + fault-phase only)",
+                n_before,
+                len(filtered_df),
+            )
             desc_parts.append("phase_filter=F0_normal+fault_active")
         else:
             desc_parts.append("phase_filter=none (phase column missing)")
@@ -149,6 +180,7 @@ def prepare_eda_frame(df: pd.DataFrame, dataset: str, daytime_only: bool) -> tup
 # =============================================================================
 # GAP ANALYSIS
 # =============================================================================
+
 
 def analyse_gaps(df: pd.DataFrame, configured_gap_s: int) -> dict:
     """
@@ -181,22 +213,18 @@ def analyse_gaps(df: pd.DataFrame, configured_gap_s: int) -> dict:
     gaps_above = {f">{t}s": int((dt_s > t).sum()) for t in thresholds}
 
     # Gap-based segment count (current strategy)
-    gap_seg_ids   = (dt_s > configured_gap_s).cumsum()
+    gap_seg_ids = (dt_s > configured_gap_s).cumsum()
     n_gap_segments = int(gap_seg_ids.max()) + 1
 
     # Label-transition + gap segmentation
-    label_change  = df["label"].ne(df["label"].shift()).fillna(False).values
+    label_change = df["label"].ne(df["label"].shift()).fillna(False).values
     combined_mask = (dt_s > configured_gap_s) | label_change
     trans_seg_ids = combined_mask.cumsum()
     n_trans_segments = int(trans_seg_ids.max()) + 1
 
     # Warn if gap-based gives very few segments (synthetic continuous timestamps)
     gap_appropriate = n_gap_segments >= 3
-    recommendation = (
-        "gap_based"
-        if n_gap_segments >= 3
-        else "label_transition"
-    )
+    recommendation = "gap_based" if n_gap_segments >= 3 else "label_transition"
 
     return {
         "configured_gap_seconds": int(configured_gap_s),
@@ -210,8 +238,7 @@ def analyse_gaps(df: pd.DataFrame, configured_gap_s: int) -> dict:
         "note": (
             "gap_based produces ≥3 segments — threshold is appropriate."
             if gap_appropriate
-            else
-            "WARNING: gap_based yields <3 segments (likely synthetic/continuous timestamps). "
+            else "WARNING: gap_based yields <3 segments (likely synthetic/continuous timestamps). "
             "Use label_transition strategy instead."
         ),
     }
@@ -220,6 +247,7 @@ def analyse_gaps(df: pd.DataFrame, configured_gap_s: int) -> dict:
 # =============================================================================
 # CLASS AND SEGMENT DISTRIBUTION
 # =============================================================================
+
 
 def analyse_class_distribution(
     df: pd.DataFrame,
@@ -243,16 +271,18 @@ def analyse_class_distribution(
         mask = df["label"] == lbl
         rows = int(mask.sum())
         segs = int(df.loc[mask, "_seg_id"].nunique())
-        class_stats.append({
-            "label": float(lbl),
-            "n_rows": rows,
-            "pct_rows": round(100 * rows / total, 2),
-            "n_segments": segs,
-            "evaluable": segs >= min_segments_for_eval and lbl != 0.0,
-        })
+        class_stats.append(
+            {
+                "label": float(lbl),
+                "n_rows": rows,
+                "pct_rows": round(100 * rows / total, 2),
+                "n_segments": segs,
+                "evaluable": segs >= min_segments_for_eval and lbl != 0.0,
+            }
+        )
 
-    evaluable   = [r["label"] for r in class_stats if r["evaluable"]]
-    train_only  = [r["label"] for r in class_stats if not r["evaluable"] and r["label"] != 0.0]
+    evaluable = [r["label"] for r in class_stats if r["evaluable"]]
+    train_only = [r["label"] for r in class_stats if not r["evaluable"] and r["label"] != 0.0]
     n_total_seg = int(df["_seg_id"].nunique())
 
     return {
@@ -270,44 +300,21 @@ def analyse_class_distribution(
 # DATASET-SPECIFIC DIAGNOSTICS
 # =============================================================================
 
+
 def diagnose_costa(df: pd.DataFrame) -> dict:
     """
     Costa-specific diagnostics:
-    - Daytime vs nighttime label distribution
-    - Night data = trivially all-normal → quantify how much this inflates separation
+    - Validate that ingest-time irradiance trimming is in effect
+    - Summarize the retained operating regime
     """
-    if "is_daytime" not in df.columns:
-        return {"error": "is_daytime column not found"}
-
-    total = len(df)
-    day   = df["is_daytime"]
-    night = ~df["is_daytime"]
-
-    def label_dist(mask: pd.Series) -> dict:
-        sub = df[mask]
-        counts = sub["label"].value_counts().sort_index()
-        return {str(int(k)): int(v) for k, v in counts.items()}
-
-    night_fault_rows  = int((df[night]["label"] != 0).sum())
-    day_normal_rows   = int((df[day]["label"] == 0).sum())
-    day_fault_rows    = int((df[day]["label"] != 0).sum())
-
     return {
-        "total_rows": total,
-        "daytime_rows": int(day.sum()),
-        "nighttime_rows": int(night.sum()),
-        "night_label_distribution": label_dist(night),
-        "day_label_distribution":   label_dist(day),
-        "night_fault_rows": night_fault_rows,
-        "night_is_all_normal": night_fault_rows == 0,
-        "daytime_normal_rows": day_normal_rows,
-        "daytime_fault_rows":  day_fault_rows,
+        "ingestion_trimmed": True,
+        "total_rows": int(len(df)),
+        "irr_min": float(df["irr"].min()) if "irr" in df.columns and len(df) else None,
+        "irr_max": float(df["irr"].max()) if "irr" in df.columns and len(df) else None,
         "recommendation": (
-            "Filter to is_daytime=True before Task A/B — night data is trivially all-normal "
-            "and would inflate normal-vs-fault separation via irradiance. "
-            f"Daytime rows: {int(day.sum()):,} ({100*day.mean():.1f}% of dataset)."
-            if night_fault_rows == 0
-            else "Night contains fault rows — daytime filter not strictly required."
+            "Costa ingestion already removed low-irradiance rows; no additional "
+            "day/night filtering is needed for EDA or downstream modeling."
         ),
     }
 
@@ -327,21 +334,24 @@ def diagnose_mendeley(df: pd.DataFrame) -> dict:
     # Per fault_class: how many experiments (mode × fault_class)
     exp_counts = []
     if "mode" in df.columns:
-        for (fc, mode), grp in df.groupby(["fault_class", "mode"]):
-            exp_counts.append({
-                "fault_class": int(fc),
-                "mode": str(mode),
-                "rows": len(grp),
-                "phases": grp["phase"].value_counts().to_dict(),
-            })
+        for keys, grp in df.groupby(["fault_class", "mode"]):
+            fc, mode = cast(tuple[float | int, object], keys)
+            exp_counts.append(
+                {
+                    "fault_class": int(fc),
+                    "mode": str(mode),
+                    "rows": len(grp),
+                    "phases": grp["phase"].value_counts().to_dict(),
+                }
+            )
 
     return {
         "total_rows": total,
         "phase_distribution": {k: int(v) for k, v in phase_counts.items()},
         "experiments": exp_counts,
         "usable_for_eda": {
-            "normal_rows":  int((df["fault_class"] == 0).sum()),
-            "fault_rows":   int((df["phase"] == "fault").sum()),
+            "normal_rows": int((df["fault_class"] == 0).sum()),
+            "fault_rows": int((df["phase"] == "fault").sum()),
             "prefault_rows_excluded": int((df["phase"] == "pre_fault").sum()),
         },
         "recommendation": (
@@ -358,6 +368,7 @@ def diagnose_mendeley(df: pd.DataFrame) -> dict:
 # SPLIT RECOMMENDATIONS
 # =============================================================================
 
+
 def build_split_recommendations(
     gap_analysis: dict,
     class_dist: dict,
@@ -372,7 +383,7 @@ def build_split_recommendations(
         "segmentation_strategy",
         gap_analysis.get("recommended_segmentation_strategy", "gap_based"),
     )
-    current_gap    = ds_splits.get(
+    current_gap = ds_splits.get(
         "segmentation_gap_seconds",
         global_splits.get("segmentation_gap_seconds", 300),
     )
@@ -384,8 +395,8 @@ def build_split_recommendations(
             f"segmentation_strategy: '{current_strategy}' → '{recommended_strategy}'"
         )
 
-    current_eval  = ds_splits.get("evaluable_classes", [])
-    rec_eval      = class_dist.get("recommended_evaluable_classes", [])
+    current_eval = ds_splits.get("evaluable_classes", [])
+    rec_eval = class_dist.get("recommended_evaluable_classes", [])
     if sorted(current_eval) != sorted(rec_eval):
         changes_needed.append(f"evaluable_classes: {current_eval} → {rec_eval}")
 
@@ -405,18 +416,15 @@ def build_split_recommendations(
 # MAIN
 # =============================================================================
 
+
 def main() -> None:
+    config = load_config()
+    default_dataset = get_active_dataset(config)
     parser = argparse.ArgumentParser(description="Run per-dataset EDA and export findings.")
     parser.add_argument(
         "--dataset",
-        default="la_reunion",
-        help="Dataset to analyse (must match data_config.yaml paths.datasets key). Default: la_reunion",
-    )
-    parser.add_argument(
-        "--daytime-only",
-        action="store_true",
-        default=False,
-        help="Costa only: filter to is_daytime=True before computing statistics.",
+        default=default_dataset,
+        help=f"Dataset to analyse (must match data_config.yaml paths.datasets key). Default: {default_dataset}",
     )
     args = parser.parse_args()
 
@@ -424,18 +432,17 @@ def main() -> None:
     logger.info("EDA PIPELINE — dataset={}", args.dataset)
     logger.info("=" * 60)
 
-    config     = load_config()
-    ds_cfg     = get_dataset_cfg(config, args.dataset)
-    ds_splits  = ds_cfg.get("splits", {})
-    gap_s      = ds_splits.get(
+    ds_cfg = get_dataset_cfg(config, args.dataset)
+    ds_splits = ds_cfg.get("splits", {})
+    gap_s = ds_splits.get(
         "segmentation_gap_seconds",
         config.get("splits", {}).get("segmentation_gap_seconds", 300),
     )
-    ds_fe      = ds_cfg.get("feature_engineering", {})
+    ds_fe = ds_cfg.get("feature_engineering", {})
     sensor_cols = ds_fe.get("sensor_columns", [])
-    global_sel  = config.get("feature_engineering", {}).get("selection", {})
-    corr_thr    = float(global_sel.get("corr_threshold", 0.95))
-    vif_thr     = float(global_sel.get("vif_threshold", 10.0))
+    global_sel = config.get("feature_engineering", {}).get("selection", {})
+    corr_thr = float(global_sel.get("corr_threshold", 0.95))
+    vif_thr = float(global_sel.get("vif_threshold", 10.0))
 
     # Output directory
     output_dir = PROJECT_ROOT / "data" / "interim" / "eda" / args.dataset
@@ -459,8 +466,9 @@ def main() -> None:
         gap_analysis["n_segments_label_transition"],
     )
     if not gap_analysis["gap_based_appropriate"]:
-        logger.warning("  {} → recommend switching to label_transition strategy",
-                       gap_analysis["note"])
+        logger.warning(
+            "  {} → recommend switching to label_transition strategy", gap_analysis["note"]
+        )
 
     # -------------------------------------------------------------------------
     # 3. Class / segment distribution
@@ -470,8 +478,11 @@ def main() -> None:
     for row in class_dist["per_class"]:
         logger.info(
             "  label={} | {:>8,} rows ({:5.1f}%) | {:3d} segments | evaluable={}",
-            row["label"], row["n_rows"], row["pct_rows"],
-            row["n_segments"], row["evaluable"],
+            row["label"],
+            row["n_rows"],
+            row["pct_rows"],
+            row["n_segments"],
+            row["evaluable"],
         )
 
     # -------------------------------------------------------------------------
@@ -481,7 +492,11 @@ def main() -> None:
     dataset_specific: dict = {}
     if args.dataset == "costa":
         dataset_specific = diagnose_costa(df_raw)
-        logger.info("  Costa night-is-all-normal: {}", dataset_specific.get("night_is_all_normal"))
+        logger.info(
+            "  Costa ingestion-trimmed: {} | irr_min={}",
+            dataset_specific.get("ingestion_trimmed"),
+            dataset_specific.get("irr_min"),
+        )
     elif args.dataset == "mendeley":
         dataset_specific = diagnose_mendeley(df_raw)
         logger.info("  Mendeley usable rows: {}", dataset_specific.get("usable_for_eda"))
@@ -490,7 +505,7 @@ def main() -> None:
     # 5. Statistical tests — on filtered/prepared EDA frame
     # -------------------------------------------------------------------------
     logger.info("[4/5] Statistical tests (Mann-Whitney, Spearman, VIF, MI) ...")
-    df_eda, eda_desc = prepare_eda_frame(df_raw, args.dataset, args.daytime_only)
+    df_eda, eda_desc = prepare_eda_frame(df_raw, args.dataset)
 
     # Only keep sensor columns that actually exist in this dataset's parquet
     available_sensors = [c for c in sensor_cols if c in df_eda.columns]
@@ -508,12 +523,11 @@ def main() -> None:
         pdf_complete=df_eda,
         feature_cols=available_sensors,
         label_col="label",
+        dataset=args.dataset,
         output_dir=output_dir,
         corr_threshold=corr_thr,
         vif_threshold=vif_thr,
     )
-    # Patch dataset field (export_eda_feature_findings hardcodes "reunion_dt2")
-    consolidated["dataset"] = args.dataset
     consolidated["eda_frame_description"] = eda_desc
 
     # -------------------------------------------------------------------------
@@ -546,15 +560,23 @@ def main() -> None:
 
     report_path = output_dir / "eda_dataset_report.json"
     report_path.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False, default=str),
+        json.dumps(_to_json_safe(report), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     logger.success("Dataset report → {}", report_path)
 
+    artifact_manifest = _build_artifact_manifest(args.dataset, output_dir, report_path, file_paths)
+    artifact_manifest_path = output_dir / "eda_artifact_manifest.json"
+    artifact_manifest_path.write_text(
+        json.dumps(_to_json_safe(artifact_manifest), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.success("Artifact manifest → {}", artifact_manifest_path)
+
     # Re-write consolidated findings with patched dataset field
     consolidated_path = output_dir / "eda_feature_findings.json"
     consolidated_path.write_text(
-        json.dumps(consolidated, indent=2, ensure_ascii=False, allow_nan=False, default=str),
+        json.dumps(_to_json_safe(consolidated), indent=2, ensure_ascii=False, allow_nan=False),
         encoding="utf-8",
     )
     logger.success("Consolidated findings → {}", consolidated_path)
@@ -565,8 +587,10 @@ def main() -> None:
     logger.info("  Segments (gap-based):        {:>4}", gap_analysis["n_segments_gap_based"])
     logger.info("  Segments (label-transition): {:>4}", gap_analysis["n_segments_label_transition"])
     logger.info("  Evaluable fault classes:     {}", split_recs["recommended_evaluable_classes"])
-    logger.info("  Top binary MI features:      {}",
-                consolidated.get("mutual_information", {}).get("top_features_binary", [])[:5])
+    logger.info(
+        "  Top binary MI features:      {}",
+        consolidated.get("mutual_information", {}).get("top_features_binary", [])[:5],
+    )
     if split_recs["action_required"]:
         logger.warning("  ACTION REQUIRED — update data_config.yaml:")
         for c in split_recs["config_changes_needed"]:
