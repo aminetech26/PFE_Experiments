@@ -236,7 +236,7 @@ def load_reunion_dt3(output_path: Path | None = None) -> pl.DataFrame:
 #   A synthetic epoch is therefore required for downstream windowing, splitting,
 #   and time-based features.
 #
-#   Chosen anchor: 2020-01-01T03:38:00Z.
+#   Chosen anchor: 2020-04-06T03:38:00Z.
 #   Rationale: align the daily irradiance cycle with plausible local solar time
 #   for the plant location in Curitiba, Brazil (lat -25.438686, lon -49.268487).
 #   Longitude implies solar noon ≈ 15:17 UTC ≈ 12:17 local (UTC-3). Under this
@@ -257,7 +257,7 @@ def load_costa(output_path: Path | None = None) -> pl.DataFrame:
 
     Output columns
     --------------
-    timestamp : datetime[us, UTC]  — synthetic, 1 Hz, epoch 2020-01-01T03:38:00Z
+    timestamp : datetime[us, UTC]  — synthetic, 1 Hz, epoch 2020-04-06T03:38:00Z
     label     : int32              — 0=Normal 1=ShortCircuit 2=Degradation
                                      3=OpenCircuit 4=Shadowing
     vdc1/2    : float64            — String voltage (V)
@@ -325,11 +325,11 @@ def load_costa(output_path: Path | None = None) -> pl.DataFrame:
     # Synthetic timestamp: 1 Hz anchored to a solar-aligned synthetic epoch.
     # The raw Costa files do not provide trustworthy wall-clock timestamps, so we
     # choose an anchor that keeps the diurnal irradiance pattern physically
-    # coherent for Curitiba (lat -25.438686, lon -49.268487). With 03:38 UTC as
-    # the epoch, irradiance peaks land near plausible local solar noon and the
-    # long induced fault blocks remain daytime-only.
+    # coherent for Curitiba (lat -25.438686, lon -49.268487). With 2020-04-06
+    # 03:38 UTC as the epoch, irradiance peaks land near plausible local solar
+    # noon and the long induced fault blocks remain daytime-only.
     # Polars Datetime("us") stores microseconds since Unix epoch — compute in µs directly.
-    epoch_us = pd.Timestamp("2020-01-01 03:38:00", tz="UTC").value // 1_000  # ns → µs
+    epoch_us = pd.Timestamp("2020-04-06 03:38:00", tz="UTC").value // 1_000  # ns → µs
     ts_us = epoch_us + np.arange(n_samples, dtype=np.int64) * 1_000_000  # 1 s = 1,000,000 µs
 
     keep_mask = irr >= daytime_irr_threshold

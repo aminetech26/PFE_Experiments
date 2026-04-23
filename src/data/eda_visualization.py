@@ -22,8 +22,6 @@ import seaborn as sns
 import yaml
 from loguru import logger
 
-from src.data.eda_pipeline import load_dataset, prepare_eda_frame
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
 
@@ -196,6 +194,99 @@ def plot_mutual_information(findings: dict, output_dir: Path, manifest: list[dic
     save_figure(fig, output_dir / "mutual_information.png", manifest, "Mutual information")
 
 
+def plot_class_imbalance(report: dict, output_dir: Path, manifest: list[dict]) -> None:
+    rows = report.get("class_imbalance", {}).get("per_class", [])
+    if not rows:
+        logger.warning("Skipping class imbalance plot: no class imbalance section found")
+        return
+
+    df = pd.DataFrame(rows)
+    melted = df.melt(
+        id_vars=["label"],
+        value_vars=["pct_rows", "pct_episodes"],
+        var_name="share_type",
+        value_name="pct",
+    )
+    melted["share_type"] = melted["share_type"].map(
+        {"pct_rows": "Rows", "pct_episodes": "Episodes"}
+    )
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    sns.barplot(data=melted, x="label", y="pct", hue="share_type", ax=ax)
+    ax.set_title("Class Imbalance: Row Share vs Episode Share")
+    ax.set_xlabel("Label")
+    ax.set_ylabel("Share (%)")
+    save_figure(
+        fig,
+        output_dir / "class_imbalance_rows_vs_episodes.png",
+        manifest,
+        "Class imbalance rows vs episodes",
+    )
+
+
+def plot_regime_binned_correlation(findings: dict, output_dir: Path, manifest: list[dict]) -> None:
+    regime = findings.get("spearman", {}).get("contexts", {}).get("normal_only_irr_bins", {})
+    profiles = regime.get("focus_pair_profiles", [])
+    if not profiles:
+        logger.warning("Skipping regime-binned correlation plot: no profile data found")
+        return
+
+    rows = []
+    for profile in profiles:
+        pair = f"{profile['feature_a']} ~ {profile['feature_b']}"
+        for item in profile.get("by_bin", []):
+            rows.append({"pair": pair, "bin_label": item["bin_label"], "rho": item["rho"]})
+    corr_df = pd.DataFrame(rows)
+    if corr_df.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    sns.lineplot(data=corr_df, x="bin_label", y="rho", hue="pair", marker="o", ax=ax)
+    ax.set_title("Normal-Only Correlation by Irradiance Regime")
+    ax.set_xlabel("Irradiance quantile bin")
+    ax.set_ylabel("Spearman rho")
+    ax.tick_params(axis="x", rotation=25)
+    save_figure(
+        fig,
+        output_dir / "regime_binned_correlation_profiles.png",
+        manifest,
+        "Regime-binned correlation profiles",
+    )
+
+
+def plot_vdc1_outlier_localization(report: dict, output_dir: Path, manifest: list[dict]) -> None:
+    outliers = report.get("vdc1_outlier_localization", {})
+    top_days = outliers.get("top_days", [])
+    hourly = outliers.get("hourly_distribution", [])
+    if not top_days and not hourly:
+        logger.warning("Skipping VDC1 outlier localization plots: no data found")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    if top_days:
+        daily_df = pd.DataFrame(top_days)
+        sns.barplot(data=daily_df, x="date", y="n_outliers", ax=axes[0], color="#C1121F")
+        axes[0].tick_params(axis="x", rotation=35)
+        axes[0].set_title("Top Days for Normal-Period VDC1 Outliers")
+        axes[0].set_xlabel("Date")
+        axes[0].set_ylabel("Outlier rows")
+    else:
+        axes[0].set_visible(False)
+
+    if hourly:
+        hourly_df = pd.DataFrame(hourly)
+        sns.barplot(data=hourly_df, x="hour", y="n_outliers", ax=axes[1], color="#669BBC")
+        axes[1].set_title("Hourly Distribution of Normal-Period VDC1 Outliers")
+        axes[1].set_xlabel("Hour of day")
+        axes[1].set_ylabel("Outlier rows")
+    else:
+        axes[1].set_visible(False)
+
+    save_figure(
+        fig, output_dir / "vdc1_outlier_localization.png", manifest, "VDC1 outlier localization"
+    )
+
+
 def write_manifest(
     output_dir: Path, dataset: str, figures: list[dict], source_artifacts: dict
 ) -> None:
@@ -212,22 +303,14 @@ def write_manifest(
     logger.success("Figure manifest → {}", manifest_path)
 
 
-def main() -> None:
-    config = load_config()
-    default_dataset = get_active_dataset(config)
-    parser = argparse.ArgumentParser(
-        description="Generate dataset-scoped EDA figures from computation artifacts."
-    )
-    parser.add_argument(
-        "--dataset", default=default_dataset, help="Dataset key from data_config.yaml"
-    )
-    args = parser.parse_args()
+def generate_visualizations(config: dict, dataset: str) -> int:
+    from src.data.eda_pipeline import load_dataset, prepare_eda_frame
 
     setup_plot_style()
-    dataset_cfg = config["paths"]["datasets"][args.dataset]
+    dataset_cfg = config["paths"]["datasets"][dataset]
     sensor_columns = list(dataset_cfg.get("feature_engineering", {}).get("sensor_columns", []))
 
-    output_root = PROJECT_ROOT / "data" / "interim" / "eda" / args.dataset
+    output_root = PROJECT_ROOT / "data" / "interim" / "eda" / dataset
     figures_dir = output_root / "figures"
 
     report_path = output_root / "eda_dataset_report.json"
@@ -238,9 +321,9 @@ def main() -> None:
     findings = load_artifact(findings_path)
     artifact_manifest = load_artifact(artifact_manifest_path)
 
-    logger.info("Loading dataset for visualization: {}", args.dataset)
-    df_raw = load_dataset(config, args.dataset)
-    df_eda, _ = prepare_eda_frame(df_raw, args.dataset)
+    logger.info("Loading dataset for visualization: {}", dataset)
+    df_raw = load_dataset(config, dataset)
+    df_eda, _ = prepare_eda_frame(df_raw, dataset)
 
     figures: list[dict] = []
     plot_sampling_intervals(df_raw, figures_dir, figures)
@@ -250,10 +333,13 @@ def main() -> None:
     plot_top_feature_boxplots(df_eda, findings, figures_dir, figures)
     plot_correlation_heatmap(df_eda, sensor_columns, figures_dir, figures)
     plot_mutual_information(findings, figures_dir, figures)
+    plot_class_imbalance(report, figures_dir, figures)
+    plot_regime_binned_correlation(findings, figures_dir, figures)
+    plot_vdc1_outlier_localization(report, figures_dir, figures)
 
     write_manifest(
         figures_dir,
-        args.dataset,
+        dataset,
         figures,
         {
             "artifact_manifest": str(artifact_manifest_path),
@@ -265,9 +351,21 @@ def main() -> None:
         },
     )
 
-    logger.success(
-        "EDA visualization complete | dataset={} | figures={}", args.dataset, len(figures)
+    logger.success("EDA visualization complete | dataset={} | figures={}", dataset, len(figures))
+    return len(figures)
+
+
+def main() -> None:
+    config = load_config()
+    default_dataset = get_active_dataset(config)
+    parser = argparse.ArgumentParser(
+        description="Generate dataset-scoped EDA figures from computation artifacts."
     )
+    parser.add_argument(
+        "--dataset", default=default_dataset, help="Dataset key from data_config.yaml"
+    )
+    args = parser.parse_args()
+    generate_visualizations(config, args.dataset)
 
 
 if __name__ == "__main__":

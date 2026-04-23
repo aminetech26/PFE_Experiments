@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from scipy.fft import rfft
+from scipy.signal import welch
 
 # ============================================================================
 # BASIC HELPERS
@@ -45,12 +46,21 @@ def infer_label_column(df: pd.DataFrame, preferred: tuple[str, ...] = ("label", 
     raise ValueError(f"Could not infer label column from candidates: {preferred}")
 
 
+_PHYSICS_SUFFIXES = ("_norm", "_irr_residual")
+
+
 def infer_base_feature_columns(
     df: pd.DataFrame,
     preferred: Iterable[str] = DEFAULT_BASE_FEATURE_COLUMNS,
 ) -> list[str]:
-    """Infer base engineering columns from known canonical signals."""
-    return [col for col in preferred if col in df.columns]
+    """Infer base feature columns: known sensor signals + physics-derived columns.
+
+    Physics-derived columns (_norm, _irr_residual) are created at preprocessing
+    and are automatically included here so no separate detection flag is needed.
+    """
+    sensor_cols = [col for col in preferred if col in df.columns]
+    physics_cols = [c for c in df.columns if any(c.endswith(s) for s in _PHYSICS_SUFFIXES)]
+    return sorted(set(sensor_cols + physics_cols))
 
 
 def add_time_cyclic_features(
@@ -72,6 +82,117 @@ def add_time_cyclic_features(
     return out
 
 
+def _parse_int_list(values: Iterable[int] | str | None, default: list[int]) -> list[int]:
+    if values is None:
+        return default
+    if isinstance(values, str):
+        parsed = [v.strip() for v in values.split(",") if v.strip()]
+        out = [int(v) for v in parsed]
+    else:
+        out = [int(v) for v in values]
+    out = sorted({v for v in out if v > 0})
+    return out or default
+
+
+def _parse_str_list(values: Iterable[str] | str | None, default: list[str]) -> list[str]:
+    if values is None:
+        return default
+    if isinstance(values, str):
+        out = [v.strip() for v in values.split(",") if v.strip()]
+    else:
+        out = [str(v).strip() for v in values if str(v).strip()]
+    return out or default
+
+
+def add_rolling_statistics_features(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    segment_col: str = "segment_id",
+    time_col: str = "timestamp",
+    windows: Iterable[int] | str | None = None,
+    stats: Iterable[str] | str | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Add causal segment-safe rolling statistics as row-aligned features."""
+    out = df.copy()
+    windows_parsed = _parse_int_list(windows, default=[5, 10, 30])
+    stats_parsed = _parse_str_list(stats, default=["mean", "std", "min", "max"])
+    supported = {"mean", "std", "min", "max", "median", "range", "skew", "kurtosis", "rms", "zcr"}
+    stats_parsed = [s for s in stats_parsed if s in supported]
+    if not stats_parsed:
+        stats_parsed = ["mean", "std", "min", "max"]
+
+    usable_cols = [
+        c for c in feature_cols if c in out.columns and pd.api.types.is_numeric_dtype(out[c])
+    ]
+    if not usable_cols:
+        return out, []
+
+    if segment_col in out.columns and time_col in out.columns:
+        original_index = out.index
+        out = out.sort_values([segment_col, time_col])
+    else:
+        original_index = None
+
+    added: list[str] = []
+    grouped = out.groupby(segment_col, sort=False) if segment_col in out.columns else None
+    for col in usable_cols:
+        base_series = out[col]
+        for w in windows_parsed:
+            rolling_obj = (
+                grouped[col].rolling(window=w, min_periods=1)
+                if grouped is not None
+                else base_series.rolling(window=w, min_periods=1)
+            )
+
+            stats_data: dict[str, pd.Series] = {}
+            if "mean" in stats_parsed:
+                stats_data["mean"] = rolling_obj.mean()
+            if "std" in stats_parsed:
+                stats_data["std"] = rolling_obj.std(ddof=0).fillna(0.0)
+            if "min" in stats_parsed:
+                stats_data["min"] = rolling_obj.min()
+            if "max" in stats_parsed:
+                stats_data["max"] = rolling_obj.max()
+            if "median" in stats_parsed:
+                stats_data["median"] = rolling_obj.median()
+            if "range" in stats_parsed:
+                max_s = stats_data["max"] if "max" in stats_data else rolling_obj.max()
+                min_s = stats_data["min"] if "min" in stats_data else rolling_obj.min()
+                stats_data["range"] = max_s - min_s
+            if "skew" in stats_parsed:
+                stats_data["skew"] = rolling_obj.skew().fillna(0.0)
+            if "kurtosis" in stats_parsed:
+                stats_data["kurtosis"] = rolling_obj.kurt().fillna(0.0)
+            if "rms" in stats_parsed:
+                rms_vals = rolling_obj.apply(lambda x: float(np.sqrt(np.mean(x**2))), raw=True)
+                stats_data["rms"] = rms_vals.fillna(0.0)
+            if "zcr" in stats_parsed:
+                zcr_obj = (
+                    grouped[col].rolling(window=w, min_periods=2)
+                    if grouped is not None
+                    else base_series.rolling(window=w, min_periods=2)
+                )
+                zcr_vals = zcr_obj.apply(
+                    lambda x: float(np.sum(np.diff(np.sign(x)) != 0)) / max(len(x) - 1, 1),
+                    raw=True,
+                )
+                stats_data["zcr"] = zcr_vals.fillna(0.0)
+
+            for stat_name, values in stats_data.items():
+                col_name = f"{col}_roll{w}_{stat_name}"
+                if grouped is not None:
+                    out[col_name] = values.reset_index(level=0, drop=True)
+                else:
+                    out[col_name] = values
+                out[col_name] = out[col_name].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                added.append(col_name)
+
+    if original_index is not None:
+        out = out.loc[original_index]
+
+    return out, added
+
+
 def _safe_groupby_diff_per_second(
     df: pd.DataFrame,
     value_col: str,
@@ -84,12 +205,7 @@ def _safe_groupby_diff_per_second(
     if time_col not in df.columns or segment_col not in df.columns:
         return df[value_col].diff().fillna(0.0)
 
-    dt_seconds = (
-        df.groupby(segment_col)[time_col]
-        .diff()
-        .dt.total_seconds()
-        .replace(0, np.nan)
-    )
+    dt_seconds = df.groupby(segment_col)[time_col].diff().dt.total_seconds().replace(0, np.nan)
 
     median_dt = dt_seconds[dt_seconds > 0].median()
     if pd.isna(median_dt) or median_dt <= 0:
@@ -98,6 +214,12 @@ def _safe_groupby_diff_per_second(
     dt_seconds = dt_seconds.fillna(median_dt)
     dv = df.groupby(segment_col)[value_col].diff().fillna(0.0)
     return dv / dt_seconds
+
+
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series, eps: float = 1e-8) -> pd.Series:
+    denom = denominator.astype(float).abs() + eps
+    ratio = numerator.astype(float) / denom
+    return ratio.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
 def add_physics_features(
@@ -117,6 +239,11 @@ def add_physics_features(
       - enable_dV_dt
       - enable_dI_dt
       - enable_Vg_normalized
+      - enable_power_imbalance
+      - enable_current_imbalance
+      - enable_voltage_imbalance
+      - enable_string_share
+      - enable_temp_power_correction
     """
     out = df.copy()
     flags = flags or {}
@@ -131,14 +258,37 @@ def add_physics_features(
     if flags.get("enable_delta_temp", True) and {"TPV", "TA"}.issubset(out.columns):
         out["delta_temp"] = out["TPV"] - out["TA"]
 
-    if flags.get("enable_dP_dt", True) and "Pg" in out.columns:
-        out["dP_dt"] = _safe_groupby_diff_per_second(out, "Pg", time_col, segment_col)
+    if flags.get("enable_dP_dt", True):
+        if "Pg" in out.columns:
+            out["dP_dt"] = _safe_groupby_diff_per_second(out, "Pg", time_col, segment_col)
+        elif "pdc" in out.columns:
+            out["dP_dt"] = _safe_groupby_diff_per_second(out, "pdc", time_col, segment_col)
+        elif {"pdc1", "pdc2"}.issubset(out.columns):
+            out["_pdc_total_tmp"] = out["pdc1"] + out["pdc2"]
+            out["dP_dt"] = _safe_groupby_diff_per_second(
+                out, "_pdc_total_tmp", time_col, segment_col
+            )
+            out = out.drop(columns=["_pdc_total_tmp"])
 
-    if flags.get("enable_dV_dt", True) and "Vg" in out.columns:
-        out["dV_dt"] = _safe_groupby_diff_per_second(out, "Vg", time_col, segment_col)
+    if flags.get("enable_dV_dt", True):
+        if "Vg" in out.columns:
+            out["dV_dt"] = _safe_groupby_diff_per_second(out, "Vg", time_col, segment_col)
+        elif {"vdc1", "vdc2"}.issubset(out.columns):
+            out["_vdc_mean_tmp"] = 0.5 * (out["vdc1"] + out["vdc2"])
+            out["dV_dt"] = _safe_groupby_diff_per_second(
+                out, "_vdc_mean_tmp", time_col, segment_col
+            )
+            out = out.drop(columns=["_vdc_mean_tmp"])
 
-    if flags.get("enable_dI_dt", True) and "Ig" in out.columns:
-        out["dI_dt"] = _safe_groupby_diff_per_second(out, "Ig", time_col, segment_col)
+    if flags.get("enable_dI_dt", True):
+        if "Ig" in out.columns:
+            out["dI_dt"] = _safe_groupby_diff_per_second(out, "Ig", time_col, segment_col)
+        elif {"idc1", "idc2"}.issubset(out.columns):
+            out["_idc_total_tmp"] = out["idc1"] + out["idc2"]
+            out["dI_dt"] = _safe_groupby_diff_per_second(
+                out, "_idc_total_tmp", time_col, segment_col
+            )
+            out = out.drop(columns=["_idc_total_tmp"])
 
     if flags.get("enable_Vg_normalized", True) and "Vg" in out.columns:
         if segment_col in out.columns:
@@ -149,6 +299,44 @@ def add_physics_features(
             rolling_med = out["Vg"].rolling(window=vg_window, min_periods=1).median()
         out["Vg_normalized"] = out["Vg"] / rolling_med.replace(0, np.nan)
         out["Vg_normalized"] = out["Vg_normalized"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if flags.get("enable_power_imbalance", False) and {"pdc1", "pdc2"}.issubset(out.columns):
+        total_power = out["pdc1"] + out["pdc2"]
+        out["power_imbalance"] = _safe_ratio((out["pdc1"] - out["pdc2"]).abs(), total_power)
+
+    if flags.get("enable_current_imbalance", False) and {"idc1", "idc2"}.issubset(out.columns):
+        total_current = out["idc1"] + out["idc2"]
+        out["current_imbalance"] = _safe_ratio((out["idc1"] - out["idc2"]).abs(), total_current)
+
+    if flags.get("enable_voltage_imbalance", False) and {"vdc1", "vdc2"}.issubset(out.columns):
+        total_voltage = out["vdc1"].abs() + out["vdc2"].abs()
+        out["voltage_imbalance"] = _safe_ratio((out["vdc1"] - out["vdc2"]).abs(), total_voltage)
+
+    if flags.get("enable_string_share", False) and {"pdc1", "pdc2", "idc1", "idc2"}.issubset(
+        out.columns
+    ):
+        out["string1_power_share"] = _safe_ratio(out["pdc1"], out["pdc1"] + out["pdc2"])
+        out["string1_current_share"] = _safe_ratio(out["idc1"], out["idc1"] + out["idc2"])
+
+    if flags.get("enable_temp_power_correction", False) and {"pvt", "pdc", "irr"}.issubset(
+        out.columns
+    ):
+        temp_ref_c = float(flags.get("temp_ref_c", 25.0))
+        gamma_pct_per_c = float(flags.get("gamma_pmax_pct_per_c", -0.40))
+        gamma_frac_per_c = gamma_pct_per_c / 100.0
+        eps = float(flags.get("temp_power_eps", 1e-8))
+        irr_floor = float(flags.get("irr_norm_floor", 1.0))
+
+        out["temp_loss_pmax"] = gamma_frac_per_c * (out["pvt"] - temp_ref_c)
+        correction_factor = (1.0 + out["temp_loss_pmax"]).replace(0, np.nan)
+        out["pdc_temp_corrected"] = (out["pdc"] / correction_factor).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        out["pdc_temp_corrected"] = out["pdc_temp_corrected"].fillna(out["pdc"])
+        irr_denom = out["irr"].clip(lower=irr_floor)
+        out["pdc_temp_corrected_norm_irr"] = _safe_ratio(
+            out["pdc_temp_corrected"], irr_denom, eps=eps
+        )
 
     if original_index is not None:
         out = out.loc[original_index]
@@ -217,7 +405,9 @@ def add_wavelet_feature(
     if segment_col not in out.columns:
         values = out[source_col].to_numpy(dtype=np.float64)
         threshold = _estimate_wavelet_threshold(values, wavelet=wavelet, level=level)
-        out[target_col] = wavelet_denoise_series(values, wavelet=wavelet, level=level, threshold=threshold)
+        out[target_col] = wavelet_denoise_series(
+            values, wavelet=wavelet, level=level, threshold=threshold
+        )
         return out
 
     out[target_col] = 0.0
@@ -323,6 +513,276 @@ def extract_fft_features(x: np.ndarray, n_top_freqs: int = 5) -> np.ndarray:
     return np.concatenate(results, axis=1).astype(np.float32)
 
 
+def add_multiscale_window_features(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    window_sizes: list[int],
+    step: int,
+    label_col: str | None = None,
+    segment_col: str = "segment_id",
+    fs: float = 1.0,
+    # per-method spectral flags
+    enable_fft: bool = False,
+    n_top_freqs: int = 5,
+    enable_psd: bool = False,
+    psd_n_bands: int = 5,
+    enable_wpd: bool = False,
+    wpd_level: int = 3,
+    wpd_wavelet: str = "db4",
+    enable_ceemdan: bool = False,
+    ceemdan_n_imfs: int = 3,
+    ceemdan_n_ensemble: int = 20,
+    spectral_min_fs: float = 0.5,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Collapse a row-aligned DataFrame into fixed-size windows with multi-scale statistics
+    and optional spectral features (PSD, WPD, CEEMDAN — Path B only).
+
+    The largest value in window_sizes is the primary window (determines row count and stride).
+    Each smaller scale takes the last `w` samples of the primary window — nested sub-windows.
+    Spectral features are always computed on the primary window only.
+
+    Spectral methods requiring a minimum sampling rate are skipped when fs < spectral_min_fs.
+    Returns a new DataFrame with one row per window and the list of feature column names.
+    """
+    window_sizes_sorted = sorted(set(window_sizes), reverse=True)
+    primary = window_sizes_sorted[0]
+
+    usable_cols = [
+        c for c in feature_cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    if not usable_cols:
+        return pd.DataFrame(), []
+
+    _spectral_ok = fs >= spectral_min_fs
+    if not _spectral_ok and any([enable_fft, enable_psd, enable_wpd, enable_ceemdan]):
+        logger.warning(
+            f"Sampling rate {fs} Hz < spectral_min_fs {spectral_min_fs} Hz — "
+            "skipping all spectral features for this dataset."
+        )
+        enable_fft = enable_psd = enable_wpd = enable_ceemdan = False
+
+    # PSD subsumes raw FFT top-N — disable FFT if PSD is active
+    if enable_psd and enable_fft:
+        logger.info("PSD enabled: auto-disabling raw FFT top-N (PSD subsumes it).")
+        enable_fft = False
+
+    groups: list[tuple] = (
+        list(df.groupby(segment_col, sort=False)) if segment_col in df.columns else [(None, df)]
+    )
+
+    scale_buffers: dict[int, list[np.ndarray]] = {w: [] for w in window_sizes_sorted}
+    primary_buffer: list[np.ndarray] = []
+    label_buffer: list = []
+
+    for _, seg in groups:
+        values = seg[usable_cols].to_numpy(dtype=np.float32)
+        labels = seg[label_col].to_numpy() if label_col and label_col in seg.columns else None
+        n = len(values)
+
+        if n < primary:
+            continue
+
+        starts = range(0, n - primary + 1, step)
+        primary_windows = np.stack([values[s : s + primary] for s in starts])
+
+        for w in window_sizes_sorted:
+            scale_buffers[w].append(primary_windows[:, primary - w :, :])
+
+        if any([enable_fft, enable_psd, enable_wpd, enable_ceemdan]):
+            primary_buffer.append(primary_windows)
+
+        if labels is not None:
+            for s in starts:
+                label_buffer.append(pd.Series(labels[s : s + primary]).mode().iloc[0])
+
+    total_windows = sum(len(b) for b in scale_buffers[primary])
+    if total_windows == 0:
+        logger.warning("No windows produced — check window_size vs segment lengths.")
+        return pd.DataFrame(), []
+
+    _STAT_NAMES = ["mean", "std", "min", "max", "skew", "kurtosis", "rms", "zcr"]
+    parts: list[np.ndarray] = []
+    col_names: list[str] = []
+
+    for w in window_sizes_sorted:
+        x_w = np.concatenate(scale_buffers[w], axis=0)
+        stats_w = extract_window_statistics(x_w)
+        parts.append(stats_w)
+        for feat in usable_cols:
+            for stat in _STAT_NAMES:
+                col_names.append(f"{feat}_w{w}_{stat}")
+
+    if primary_buffer:
+        x_primary = np.concatenate(primary_buffer, axis=0)
+
+        if enable_fft:
+            fft_feats = extract_fft_features(x_primary, n_top_freqs)
+            parts.append(fft_feats)
+            for feat in usable_cols:
+                for k in range(1, n_top_freqs + 1):
+                    col_names.append(f"{feat}_fft_top{k}")
+
+        if enable_psd:
+            psd_feats = extract_psd_features(x_primary, fs=fs, n_bands=psd_n_bands)
+            parts.append(psd_feats)
+            for feat in usable_cols:
+                for b in range(psd_n_bands):
+                    col_names.append(f"{feat}_psd_band{b}")
+
+        if enable_wpd:
+            wpd_feats = extract_wpd_features(x_primary, wavelet=wpd_wavelet, level=wpd_level)
+            parts.append(wpd_feats)
+            n_bands = 2**wpd_level
+            for feat in usable_cols:
+                for b in range(n_bands):
+                    col_names.append(f"{feat}_wpd_band{b}")
+
+        if enable_ceemdan:
+            logger.info(
+                f"CEEMDAN: {total_windows} windows × {len(usable_cols)} features "
+                f"× {ceemdan_n_ensemble} ensembles — this may be slow."
+            )
+            ceemdan_feats = extract_ceemdan_features(
+                x_primary, n_imfs=ceemdan_n_imfs, n_ensemble=ceemdan_n_ensemble
+            )
+            parts.append(ceemdan_feats)
+            for feat in usable_cols:
+                for k in range(ceemdan_n_imfs):
+                    col_names.append(f"{feat}_ceemdan_imf{k}")
+
+    result_arr = np.hstack(parts).astype(np.float32)
+    result_df = pd.DataFrame(result_arr, columns=col_names)
+
+    if label_col and label_buffer:
+        result_df[label_col] = label_buffer
+
+    return result_df, col_names
+
+
+# ============================================================================
+# SPECTRAL FEATURES (Path B only)
+# ============================================================================
+
+
+def extract_psd_features(
+    x: np.ndarray,
+    fs: float = 1.0,
+    n_bands: int = 5,
+) -> np.ndarray:
+    """
+    Welch PSD band energies per window and channel.
+
+    Input:  (n_windows, window_size, n_features)
+    Output: (n_windows, n_features * n_bands)
+
+    Each channel's PSD is divided into n_bands equal-width bins across [0, Nyquist].
+    The feature per band is the integral (sum) of PSD in that bin.
+    """
+    n_wins, win_size, n_feats = x.shape
+    nperseg = min(win_size, max(8, win_size // 4))
+    results = []
+    for i in range(n_feats):
+        ch = x[:, :, i]  # (n_wins, win_size)
+        freqs, psd_all = welch(ch, fs=fs, nperseg=nperseg, axis=-1)  # psd_all: (n_wins, n_freqs)
+        bin_edges = np.linspace(0, len(freqs), n_bands + 1, dtype=int)
+        band_energies = np.zeros((n_wins, n_bands), dtype=np.float32)
+        for b in range(n_bands):
+            band_energies[:, b] = psd_all[:, bin_edges[b] : bin_edges[b + 1]].sum(axis=1)
+        results.append(band_energies)
+    return np.hstack(results).astype(np.float32)
+
+
+def extract_wpd_features(
+    x: np.ndarray,
+    wavelet: str = "db4",
+    level: int = 3,
+) -> np.ndarray:
+    """
+    Wavelet Packet Decomposition subband energies per window and channel.
+
+    Input:  (n_windows, window_size, n_features)
+    Output: (n_windows, n_features * 2**level)
+
+    Each subband's feature is its energy fraction: sum(coeff²) / sum(signal²).
+    Requires PyWavelets (pywt).
+    """
+    try:
+        import pywt
+    except ImportError:
+        logger.error(
+            "PyWavelets not installed — skipping WPD features. Install with: pip install PyWavelets"
+        )
+        n_wins, _, n_feats = x.shape
+        return np.zeros((n_wins, n_feats * (2**level)), dtype=np.float32)
+
+    n_wins, _, n_feats = x.shape
+    n_bands = 2**level
+    results = []
+    for i in range(n_feats):
+        ch = x[:, :, i]
+        band_energies = np.zeros((n_wins, n_bands), dtype=np.float32)
+        for w in range(n_wins):
+            signal = ch[w].astype(np.float64)
+            total_energy = float(np.sum(signal**2)) + 1e-10
+            wp = pywt.WaveletPacket(data=signal, wavelet=wavelet, mode="symmetric", maxlevel=level)
+            nodes = [node.path for node in wp.get_level(level, "freq")]
+            for b, path in enumerate(nodes):
+                coeffs = wp[path].data
+                band_energies[w, b] = float(np.sum(coeffs**2)) / total_energy
+        results.append(band_energies)
+    return np.hstack(results).astype(np.float32)
+
+
+def extract_ceemdan_features(
+    x: np.ndarray,
+    n_imfs: int = 3,
+    n_ensemble: int = 20,
+) -> np.ndarray:
+    """
+    CEEMDAN IMF energy ratios per window and channel.
+
+    Input:  (n_windows, window_size, n_features)
+    Output: (n_windows, n_features * n_imfs)
+
+    For each window and channel, CEEMDAN decomposes the signal into IMFs.
+    Feature = energy ratio of each IMF (IMF energy / total signal energy).
+    If fewer than n_imfs IMFs are produced, remaining slots are zero-padded.
+    Requires emd-signal package (already in project deps).
+    """
+    try:
+        import emd as _emd
+
+        _complete_ensemble_sift = _emd.sift.complete_ensemble_sift
+    except (ImportError, AttributeError):
+        logger.error(
+            "emd-signal not available or missing complete_ensemble_sift — skipping CEEMDAN features."
+        )
+        n_wins, _, n_feats = x.shape
+        return np.zeros((n_wins, n_feats * n_imfs), dtype=np.float32)
+
+    n_wins, _, n_feats = x.shape
+    results = []
+    for i in range(n_feats):
+        ch = x[:, :, i]
+        imf_energies = np.zeros((n_wins, n_imfs), dtype=np.float32)
+        for w in range(n_wins):
+            signal = ch[w].astype(np.float64)
+            total_energy = float(np.sum(signal**2)) + 1e-10
+            try:
+                imfs, _ = _complete_ensemble_sift(
+                    signal,
+                    nensembles=n_ensemble,
+                    nprocesses=1,
+                )
+                for k in range(min(n_imfs, imfs.shape[1])):
+                    imf_energies[w, k] = float(np.sum(imfs[:, k] ** 2)) / total_energy
+            except Exception as e:
+                logger.debug(f"CEEMDAN failed for window {w}, feature {i}: {e}")
+        results.append(imf_energies)
+    return np.hstack(results).astype(np.float32)
+
+
 # ============================================================================
 # CORRELATION / COLLINEARITY PRUNING
 # ============================================================================
@@ -330,6 +790,173 @@ def extract_fft_features(x: np.ndarray, n_top_freqs: int = 5) -> np.ndarray:
 
 def _numeric_existing_columns(df: pd.DataFrame, cols: list[str]) -> list[str]:
     return [c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+
+
+def apply_hygiene_pruning(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: list[str],
+    near_constant_std: float = 1e-10,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], list[dict]]:
+    """Light pre-selection hygiene: constants, exact duplicates, deterministic aliases."""
+    cols = _numeric_existing_columns(train_df, feature_cols)
+    if not cols:
+        return train_df, val_df, test_df, cols, []
+
+    dropped_log: list[dict] = []
+    keep: list[str] = []
+
+    x = train_df[cols].replace([np.inf, -np.inf], np.nan)
+
+    # 1) Near-constant columns.
+    near_constant = [
+        c
+        for c in cols
+        if np.isclose(float(x[c].std(skipna=True) or 0.0), 0.0, atol=near_constant_std)
+    ]
+    for c in near_constant:
+        dropped_log.append({"dropped": c, "reason": "near_constant"})
+
+    candidate = [c for c in cols if c not in set(near_constant)]
+    if not candidate:
+        keep_extra = [c for c in train_df.columns if c not in feature_cols]
+        keep_cols = keep_extra
+        return (
+            train_df[keep_cols].copy(),
+            val_df[keep_cols].copy(),
+            test_df[keep_cols].copy(),
+            [],
+            dropped_log,
+        )
+
+    # 2) Exact duplicate columns by hash fingerprint.
+    seen_hash: dict[int, str] = {}
+    for c in candidate:
+        sig = pd.util.hash_pandas_object(x[c].fillna(-999999.123456), index=False).sum()
+        if sig in seen_hash:
+            dropped_log.append(
+                {
+                    "dropped": c,
+                    "paired_with": seen_hash[sig],
+                    "reason": "exact_duplicate_column",
+                }
+            )
+            continue
+        seen_hash[sig] = c
+        keep.append(c)
+
+    # 3) Deterministic Costa alias: pdc == pdc1+pdc2 (if exact).
+    keep_set = set(keep)
+    if {"pdc", "pdc1", "pdc2"}.issubset(keep_set):
+        lhs = train_df["pdc"].to_numpy(dtype=np.float64)
+        rhs = (train_df["pdc1"] + train_df["pdc2"]).to_numpy(dtype=np.float64)
+        if np.allclose(lhs, rhs, equal_nan=True, atol=1e-9, rtol=1e-9):
+            keep = [c for c in keep if c != "pdc"]
+            dropped_log.append(
+                {
+                    "dropped": "pdc",
+                    "paired_with": "pdc1+pdc2",
+                    "reason": "deterministic_alias",
+                }
+            )
+
+    keep_extra = [c for c in train_df.columns if c not in feature_cols]
+    keep_cols = keep_extra + keep
+    logger.info(
+        f"Hygiene pruning: kept {len(keep)}/{len(cols)} features (dropped={len(dropped_log)})"
+    )
+    return (
+        train_df[keep_cols].copy(),
+        val_df[keep_cols].copy(),
+        test_df[keep_cols].copy(),
+        keep,
+        dropped_log,
+    )
+
+
+def apply_mrmr_selection(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: list[str],
+    label_col: str,
+    k: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], list[dict]]:
+    """Greedy mRMR (MID criterion): maximize relevance - redundancy."""
+    from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+
+    cols = _numeric_existing_columns(train_df, feature_cols)
+    if not cols:
+        return train_df, val_df, test_df, cols, []
+    if label_col not in train_df.columns:
+        logger.warning("mRMR skipped: missing label column")
+        return train_df, val_df, test_df, cols, []
+
+    if k <= 0 or k >= len(cols):
+        return train_df, val_df, test_df, cols, []
+
+    x_df = train_df[cols].replace([np.inf, -np.inf], np.nan)
+    x_df = x_df.fillna(x_df.median(numeric_only=True))
+    x = x_df.to_numpy(dtype=np.float64)
+
+    y_raw = train_df[label_col]
+    y_codes, _ = pd.factorize(y_raw, sort=True)
+    if len(np.unique(y_codes)) <= 1:
+        logger.warning("mRMR skipped: single-class train target")
+        return train_df, val_df, test_df, cols, []
+
+    relevance_arr = mutual_info_classif(x, y_codes, random_state=42)
+    relevance = {c: float(relevance_arr[i]) for i, c in enumerate(cols)}
+
+    selected: list[str] = [max(cols, key=lambda c: relevance.get(c, -np.inf))]
+    remaining = [c for c in cols if c not in selected]
+    redundancy_cache: dict[tuple[str, str], float] = {}
+
+    def _feature_vector(col: str) -> np.ndarray:
+        return x_df[col].to_numpy(dtype=np.float64).reshape(-1, 1)
+
+    def _pair_redundancy(a: str, b: str) -> float:
+        key = tuple(sorted((a, b)))
+        if key in redundancy_cache:
+            return redundancy_cache[key]
+        xb = x_df[b].to_numpy(dtype=np.float64)
+        val = float(mutual_info_regression(_feature_vector(a), xb, random_state=42)[0])
+        if not np.isfinite(val):
+            val = 0.0
+        redundancy_cache[key] = val
+        return val
+
+    while remaining and len(selected) < k:
+        best_col = None
+        best_score = -np.inf
+        for c in remaining:
+            red = np.mean([_pair_redundancy(c, s) for s in selected]) if selected else 0.0
+            score = relevance.get(c, 0.0) - red
+            if score > best_score:
+                best_score = score
+                best_col = c
+        if best_col is None:
+            break
+        selected.append(best_col)
+        remaining.remove(best_col)
+
+    dropped_log = [
+        {"dropped": c, "reason": "mrmr_not_selected", "relevance": relevance.get(c, 0.0)}
+        for c in cols
+        if c not in selected
+    ]
+
+    keep_extra = [c for c in train_df.columns if c not in feature_cols]
+    keep_cols = keep_extra + selected
+    logger.info(f"mRMR: kept {len(selected)}/{len(cols)} features (k={k})")
+    return (
+        train_df[keep_cols].copy(),
+        val_df[keep_cols].copy(),
+        test_df[keep_cols].copy(),
+        selected,
+        dropped_log,
+    )
 
 
 def apply_correlation_pruning(
@@ -375,14 +1002,29 @@ def apply_correlation_pruning(
                 reason = "drop_higher_mean_abs_corr"
 
             dropped.add(drop_col)
-            dropped_log.append({"dropped": drop_col, "paired_with": b if drop_col == a else a, "rho": float(rho), "reason": reason})
+            dropped_log.append(
+                {
+                    "dropped": drop_col,
+                    "paired_with": b if drop_col == a else a,
+                    "rho": float(rho),
+                    "reason": reason,
+                }
+            )
 
     selected_cols = [c for c in cols if c not in dropped]
     keep_extra = [c for c in train_df.columns if c not in feature_cols]
     keep_cols = keep_extra + selected_cols
 
-    logger.info(f"Correlation pruning: kept {len(selected_cols)}/{len(cols)} features (threshold={threshold})")
-    return train_df[keep_cols].copy(), val_df[keep_cols].copy(), test_df[keep_cols].copy(), selected_cols, dropped_log
+    logger.info(
+        f"Correlation pruning: kept {len(selected_cols)}/{len(cols)} features (threshold={threshold})"
+    )
+    return (
+        train_df[keep_cols].copy(),
+        val_df[keep_cols].copy(),
+        test_df[keep_cols].copy(),
+        selected_cols,
+        dropped_log,
+    )
 
 
 def apply_vif_pruning(
@@ -447,8 +1089,16 @@ def apply_vif_pruning(
 
     keep_extra = [c for c in train_df.columns if c not in feature_cols]
     keep_cols = keep_extra + selected
-    logger.info(f"VIF pruning: kept {len(selected)}/{len(feature_cols)} features (threshold={threshold})")
-    return train_df[keep_cols].copy(), val_df[keep_cols].copy(), test_df[keep_cols].copy(), selected, dropped_log
+    logger.info(
+        f"VIF pruning: kept {len(selected)}/{len(feature_cols)} features (threshold={threshold})"
+    )
+    return (
+        train_df[keep_cols].copy(),
+        val_df[keep_cols].copy(),
+        test_df[keep_cols].copy(),
+        selected,
+        dropped_log,
+    )
 
 
 # ============================================================================
@@ -508,7 +1158,13 @@ def extract_tsfresh_segment_features(
 
     if segment_col not in train_df.columns or time_col not in train_df.columns:
         logger.warning("tsfresh skipped: missing segment or timestamp column")
-        return train_df, val_df, test_df, [], {"mode": mode, "selected": 0, "skipped": "missing_columns"}
+        return (
+            train_df,
+            val_df,
+            test_df,
+            [],
+            {"mode": mode, "selected": 0, "skipped": "missing_columns"},
+        )
 
     from tsfresh import extract_features
     from tsfresh.feature_extraction import ComprehensiveFCParameters, MinimalFCParameters
@@ -522,10 +1178,18 @@ def extract_tsfresh_segment_features(
 
     sampled_segments = train_df[segment_col].drop_duplicates().head(n_segments_sample)
     train_sample = train_df[train_df[segment_col].isin(sampled_segments)].copy()
-    long_train = _prepare_tsfresh_long(train_sample, feature_cols, segment_col, time_col, max_rows_per_segment)
+    long_train = _prepare_tsfresh_long(
+        train_sample, feature_cols, segment_col, time_col, max_rows_per_segment
+    )
     if long_train.empty:
         logger.warning("tsfresh skipped: no valid train long-format rows")
-        return train_df, val_df, test_df, [], {"mode": mode, "selected": 0, "skipped": "empty_long_train"}
+        return (
+            train_df,
+            val_df,
+            test_df,
+            [],
+            {"mode": mode, "selected": 0, "skipped": "empty_long_train"},
+        )
 
     train_feat = extract_features(
         long_train,
@@ -540,13 +1204,17 @@ def extract_tsfresh_segment_features(
     )
 
     if label_strategy == "any_fault":
-        segment_y = train_sample.groupby(segment_col)[label_col].apply(lambda s: int((s != 0).any()))
+        segment_y = train_sample.groupby(segment_col)[label_col].apply(
+            lambda s: int((s != 0).any())
+        )
     elif label_strategy == "majority_label":
         segment_y = train_sample.groupby(segment_col)[label_col].apply(
             lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[-1]
         )
     elif label_strategy == "fault_fraction":
-        segment_y = train_sample.groupby(segment_col)[label_col].apply(lambda s: float((s != 0).mean()))
+        segment_y = train_sample.groupby(segment_col)[label_col].apply(
+            lambda s: float((s != 0).mean())
+        )
     else:
         raise ValueError(f"Unsupported tsfresh label_strategy: {label_strategy}")
 
@@ -567,7 +1235,9 @@ def extract_tsfresh_segment_features(
     chosen_prefixed = [f"tsfresh__{c}" for c in chosen]
 
     def _transform_subset(df: pd.DataFrame) -> pd.DataFrame:
-        long_df = _prepare_tsfresh_long(df, feature_cols, segment_col, time_col, max_rows_per_segment)
+        long_df = _prepare_tsfresh_long(
+            df, feature_cols, segment_col, time_col, max_rows_per_segment
+        )
         if long_df.empty:
             out = df.copy()
             for col in chosen_prefixed:
@@ -603,4 +1273,3 @@ def extract_tsfresh_segment_features(
     }
     logger.info(f"tsfresh {mode}: selected {len(chosen_prefixed)} features")
     return train_out, val_out, test_out, chosen_prefixed, meta
-

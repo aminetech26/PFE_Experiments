@@ -61,17 +61,18 @@ paths:
 
       preprocessing:
         stationarity:
-          # Irradiance normalization: Power/GTI ≈ efficiency (diurnal-invariant)
+          # Power and current / GTI ≈ efficiency and yield coefficients (diurnal-invariant)
           irradiance_normalize:
             features:    [Pg, Ig, Eg, Fg, Ia]
             denominator: GTI
             suffix:      _norm
-          # Polynomial detrend: removes curved thermal drift per segment
-          polynomial_detrend:
+          # Temperature residualization: TA/TPV - (β·GTI + α), OLS on normal train.
+          # Removes irradiance-driven thermal loading; residual captures anomalous
+          # deviations from the physics-predicted temperature baseline.
+          irr_residualize:
             features: [TA, TPV]
-            degree:   2
-            scope:    per_segment
-            suffix:   _detrend
+            irr_col:  GTI
+            suffix:   _irr_residual
 
       feature_engineering:
         sensor_columns: [Pg, Vg, Ig, Eg, Fg, Ia, GTI, TA, TPV]
@@ -94,7 +95,7 @@ paths:
     # Faults 1-3: artificially induced ~10-min blocks, daytime only.
     # Ingestion trims Costa to irr >= 100 W/m² to retain meaningful operating
     # conditions and match the paper-scale daytime subset (~516k rows).
-    # Timestamp: synthetic 1 Hz, epoch 2020-01-01T03:38:00Z.
+    # Timestamp: synthetic 1 Hz, epoch 2020-04-06T03:38:00Z.
     #   Raw .mat files do not expose trustworthy wall-clock timestamps.
     #   This epoch is a solar-aligned synthetic anchor chosen so irradiance peaks
     #   land near plausible local solar noon for Curitiba (lat -25.438686,
@@ -115,33 +116,42 @@ paths:
         evaluable_classes:  [1, 2, 3, 4]   # all four fault types — integer labels
         train_only_classes: []
         segmentation_gap_seconds: 300
+        atomic_group_col: episode_id
+        continuity_group_col: continuity_segment_id
+        comparison_paths:
+          path_b:
+            enabled: true
+            atomic_group_col: operating_day_id
+            purge_days: 0
+            forward_boundary_purge_fraction: 0.5
 
       preprocessing:
-        stationarity:
-          # Power / irradiance ≈ efficiency (removes irradiance-driven diurnal trend)
-          irradiance_normalize:
-            features:    [pdc, pdc1, pdc2]
-            denominator: irr
-            suffix:      _norm
-          # PV module temperature: mild thermal drift, linear detrend sufficient
-          polynomial_detrend:
-            features: [pvt]
-            degree:   1       # linear — Costa shows less curvature than La Réunion
-            scope:    per_segment
-            suffix:   _detrend
+        missing_values:
+          enabled: false
+        physics_normalization: null
 
       feature_engineering:
         sensor_columns: [vdc1, vdc2, idc1, idc2, pdc1, pdc2, pdc, irr, pvt]
         flags:
-          enable_hour_cyclic:        true   # corrected epoch → time-of-day meaningful
+          enable_hour_cyclic:        false  # Path A default off; Path B optional only
           enable_delta_temp:         false  # no ambient temp sensor (only pvt)
           enable_dP_dt:              true
           enable_dV_dt:              true
           enable_dI_dt:              true
           enable_Vg_normalized:      false  # no grid voltage sensor in Costa
+          enable_power_imbalance:    true
+          enable_current_imbalance:  true
+          enable_voltage_imbalance:  true
+          enable_string_share:       false
+          enable_temp_power_correction: true
+          temp_ref_c:                25.0
+          gamma_pmax_pct_per_c:      -0.40  # CS6U-330P datasheet (Pmax temp coeff)
+          temp_power_eps:            1e-8
+          irr_norm_floor:            1.0
           enable_differential_signal: false  # single-inverter dataset
         selection:
-          anchor_features: [dP_dt, dV_dt, dI_dt]
+          anchor_features:
+            [dP_dt, dV_dt, dI_dt, power_imbalance, current_imbalance, voltage_imbalance, pdc_temp_corrected_norm_irr]
 
     # -------------------------------------------------------------------------
     # MENDELEY / GPVS-FAULTS — Lab experiments, ~10 kHz → 1 kHz, grid-connected
@@ -231,10 +241,10 @@ preprocessing:
     upper_percentile: 0.95
     scope:            normal_only
 
-  # --- Stationarity Correction (global fallback — override per dataset) ---
+  # --- Physics Normalization (global fallback — override per dataset) ---
   stationarity:
     irradiance_normalize: null
-    polynomial_detrend:   null
+    irr_residualize:      null
 
 
 # =============================================================================
@@ -253,12 +263,40 @@ feature_engineering:
     enable_dV_dt:              true
     enable_dI_dt:              true
     enable_Vg_normalized:      true
+    enable_power_imbalance:    false
+    enable_current_imbalance:  false
+    enable_voltage_imbalance:  false
+    enable_string_share:       false
+    enable_temp_power_correction: false
+    temp_ref_c:                25.0
+    gamma_pmax_pct_per_c:      -0.40
+    temp_power_eps:            1e-8
+    irr_norm_floor:            1.0
     enable_corr_pruning:       true
     enable_vif_pruning:        true
     enable_wavelet:            false
     wavelet_threshold_strategy: per_segment   # per_segment | global
-    include_preprocessed_stationarity_features: true
-    preprocessed_stationarity_suffixes: ["_norm", "_detrend"]
+    enable_rolling_stats:      false
+    rolling_windows:           [5, 10, 30]
+    rolling_stats:             [mean, std, min, max]   # available: mean std min max median range skew kurtosis rms zcr
+
+    enable_explicit_windowing: false
+    window_size:               60
+    window_step:               30
+    enable_multiscale:         false
+    multiscale_window_sizes:   [60, 30, 10]
+    enable_spectral:           false         # FFT top-N; Path B only; auto-disabled if enable_psd is on
+    spectral_n_top_freqs:      5
+    enable_psd:                false         # Welch PSD band energies; Path B only
+    psd_n_bands:               5
+    enable_wpd:                false         # Wavelet Packet Decomp subband energies; Path B only
+    wpd_level:                 3             # 2^level subbands (level 3 → 8 bands)
+    wpd_wavelet:               db4
+    enable_ceemdan:            false         # CEEMDAN IMF energy ratios; Path B only; slow
+    ceemdan_n_imfs:            3
+    ceemdan_n_ensemble:        20
+    spectral_min_fs:           0.5           # Hz — spectral methods auto-skip below this rate
+
     enable_differential_signal: false
 
   selection:
@@ -323,7 +361,10 @@ feature_engineering:
   # ABLATION PROFILES
   # Named feature sets for systematic ablation experiments.
   # Additive layers: baseline_raw < plus_physics < plus_temporal
-  #                  < plus_tsfresh_* / plus_wavelet / plus_differential < plus_all
+  #   row-aligned track:  < plus_rolling < plus_wavelet / plus_differential < plus_all
+  #   windowed track:     < plus_windowed < plus_multiscale
+  #                       < plus_spectral_fast (PSD+WPD, Path B only)
+  #                       < plus_spectral_full (PSD+WPD+CEEMDAN, Path B only, slow)
   # Run: uv run python -m src.data.featurize_pipeline --profile <name> --task <task>
   # ---------------------------------------------------------------------------
   profiles:
@@ -348,6 +389,15 @@ feature_engineering:
       enable_dV_dt:               true
       enable_dI_dt:               true
       enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_string_share:        false
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
       enable_corr_pruning:        true
       enable_vif_pruning:         true
       enable_wavelet:             false
@@ -368,34 +418,6 @@ feature_engineering:
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode:               "off"
-
-    plus_tsfresh_minimal:
-      enable_hour_cyclic:         true
-      enable_delta_temp:          true
-      enable_dP_dt:               true
-      enable_dV_dt:               true
-      enable_dI_dt:               true
-      enable_Vg_normalized:       true
-      enable_corr_pruning:        true
-      enable_vif_pruning:         true
-      enable_wavelet:             false
-      wavelet_threshold_strategy: per_segment
-      enable_differential_signal: false
-      tsfresh_mode:               "minimal"
-
-    plus_tsfresh_extensive:
-      enable_hour_cyclic:         true
-      enable_delta_temp:          true
-      enable_dP_dt:               true
-      enable_dV_dt:               true
-      enable_dI_dt:               true
-      enable_Vg_normalized:       true
-      enable_corr_pruning:        true
-      enable_vif_pruning:         true
-      enable_wavelet:             false
-      wavelet_threshold_strategy: per_segment
-      enable_differential_signal: false
-      tsfresh_mode:               "extensive"
 
     plus_wavelet:
       enable_hour_cyclic:         true
@@ -425,6 +447,159 @@ feature_engineering:
       enable_differential_signal: true
       tsfresh_mode:               "off"
 
+    plus_rolling:
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
+      wavelet_threshold_strategy: per_segment
+      enable_differential_signal: false
+      enable_rolling_stats:       true
+      rolling_windows:            [5, 10, 30]
+      rolling_stats:              [mean, std, min, max, skew, kurtosis, rms, zcr]
+      tsfresh_mode:               "off"
+
+    plus_windowed:
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
+      wavelet_threshold_strategy: per_segment
+      enable_differential_signal: false
+      enable_rolling_stats:       false   # auto-disabled by windowing policy anyway
+      enable_explicit_windowing:  true
+      window_size:                60
+      window_step:                30
+      enable_multiscale:          false
+      enable_spectral:            false
+      tsfresh_mode:               "off"
+
+    plus_multiscale:
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
+      wavelet_threshold_strategy: per_segment
+      enable_differential_signal: false
+      enable_rolling_stats:       false
+      enable_explicit_windowing:  true
+      window_step:                30
+      enable_multiscale:          true
+      multiscale_window_sizes:    [60, 30, 10]
+      enable_spectral:            false
+      tsfresh_mode:               "off"
+
+    plus_spectral_fast:
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
+      wavelet_threshold_strategy: per_segment
+      enable_differential_signal: false
+      enable_rolling_stats:       false
+      enable_explicit_windowing:  true
+      window_step:                30
+      enable_multiscale:          true
+      multiscale_window_sizes:    [60, 30, 10]
+      enable_spectral:            false   # FFT top-N disabled; PSD subsumes it
+      enable_psd:                 true    # Path B only — Welch band energies
+      psd_n_bands:                5
+      enable_wpd:                 true    # Path B only — WPD subband energies
+      wpd_level:                  3
+      wpd_wavelet:                db4
+      enable_ceemdan:             false
+      spectral_min_fs:            0.5
+      tsfresh_mode:               "off"
+
+    plus_spectral_full:
+      enable_hour_cyclic:         true
+      enable_delta_temp:          true
+      enable_dP_dt:               true
+      enable_dV_dt:               true
+      enable_dI_dt:               true
+      enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
+      enable_corr_pruning:        true
+      enable_vif_pruning:         true
+      enable_wavelet:             false
+      wavelet_threshold_strategy: per_segment
+      enable_differential_signal: false
+      enable_rolling_stats:       false
+      enable_explicit_windowing:  true
+      window_step:                30
+      enable_multiscale:          true
+      multiscale_window_sizes:    [60, 30, 10]
+      enable_spectral:            false
+      enable_psd:                 true    # Path B only
+      psd_n_bands:                5
+      enable_wpd:                 true    # Path B only
+      wpd_level:                  3
+      wpd_wavelet:                db4
+      enable_ceemdan:             true    # Path B only — slow, profile before full run
+      ceemdan_n_imfs:             3
+      ceemdan_n_ensemble:         20
+      spectral_min_fs:            0.5
+      tsfresh_mode:               "off"
+
     plus_all:
       enable_hour_cyclic:         true
       enable_delta_temp:          true
@@ -432,9 +607,21 @@ feature_engineering:
       enable_dV_dt:               true
       enable_dI_dt:               true
       enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
       enable_corr_pruning:        true
       enable_vif_pruning:         true
       enable_wavelet:             true
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: true
-      tsfresh_mode:               "extensive"
+      enable_rolling_stats:       true
+      rolling_windows:            [5, 10, 30]
+      rolling_stats:              [mean, std, min, max, skew, kurtosis, rms, zcr]
+      enable_explicit_windowing:  false   # rolling stats and windowing are exclusive
+      tsfresh_mode:               "off"

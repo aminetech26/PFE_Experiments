@@ -4,9 +4,9 @@ Preprocessing module for PV Fault Detection.
 This module implements data preprocessing steps:
 1. Missing value handling (tiered strategy)
 2. Outlier treatment (IQR-based clipping)
-3. Stationarity correction (irradiance normalization + linear detrending)
-
-All decisions are documented in PREPROCESSING_DECISIONS.md.
+3. Physics normalization:
+   - Irradiance normalization: power/current ÷ irr ≈ efficiency/yield coefficients
+   - Irradiance-conditioned residualization: temp − (β·irr + α), OLS on normal train
 """
 
 from __future__ import annotations
@@ -51,11 +51,12 @@ class OutlierStats:
 
 
 @dataclass
-class StationarityStats:
-    """Statistics from stationarity transforms."""
+class PhysicsNormStats:
+    """Statistics from physics normalization transforms."""
 
     features_normalized: list[str]
-    features_detrended: list[str]
+    features_residualized: list[str]
+    irr_residual_params: dict[str, tuple[float, float]]  # feat -> (beta, alpha)
 
 
 # =============================================================================
@@ -174,9 +175,7 @@ def handle_missing_values(
                 # Rule: DROP any nulls on fault data
                 indices_to_drop.extend(indices)
                 rows_dropped_fault += len(indices)
-                logger.debug(
-                    f"Segment {seg_id}: Dropping {len(indices)} null rows (fault overlap)"
-                )
+                logger.debug(f"Segment {seg_id}: Dropping {len(indices)} null rows (fault overlap)")
 
             elif duration > interp_max_gap_seconds:
                 # Rule: DROP gaps > interp_max_gap_seconds
@@ -254,13 +253,14 @@ def winsorize_outliers(
     lower_percentile: float = 0.05,
     upper_percentile: float = 0.95,
     scope: Literal["normal_only", "all"] = "normal_only",
+    reference_bounds: dict[str, tuple[float, float]] | None = None,
 ) -> tuple[pd.DataFrame, OutlierStats]:
     """
     Two-step outlier handling: IQR detection + percentile winsorizing.
-    
+
     Step 1: Detect outliers using IQR bounds (Q1 - k×IQR, Q3 + k×IQR)
     Step 2: Replace detected outliers with percentile values (5th, 95th)
-    
+
     This approach:
     - Uses conservative IQR bounds to flag extreme values
     - Replaces them with less extreme percentile values
@@ -287,17 +287,23 @@ def winsorize_outliers(
     for col in feature_cols:
         # Compute on normal data only
         col_data = df.loc[normal_mask, col].dropna()
-        if col_data.empty:
+        if col_data.empty and not (reference_bounds and col in reference_bounds):
             continue
 
         # Step 1: Compute IQR bounds for outlier DETECTION
-        iqr_lower, iqr_upper = compute_iqr_bounds(col_data, iqr_multiplier)
-        
-        # Step 2: Compute percentile values for REPLACEMENT
-        percentile_lower = col_data.quantile(lower_percentile)
-        percentile_upper = col_data.quantile(upper_percentile)
-        
-        bounds[col] = (percentile_lower, percentile_upper)
+        if col_data.empty:
+            iqr_lower, iqr_upper = -np.inf, np.inf
+        else:
+            iqr_lower, iqr_upper = compute_iqr_bounds(col_data, iqr_multiplier)
+
+        # Step 2: Compute percentile values for REPLACEMENT or reuse train-fit values
+        if reference_bounds and col in reference_bounds:
+            percentile_lower, percentile_upper = reference_bounds[col]
+        else:
+            percentile_lower = col_data.quantile(lower_percentile)
+            percentile_upper = col_data.quantile(upper_percentile)
+
+        bounds[col] = (float(percentile_lower), float(percentile_upper))
 
         # Apply based on scope
         if scope == "normal_only":
@@ -320,14 +326,16 @@ def winsorize_outliers(
             )
 
     total_clipped = sum(clipped_counts.values())
-    logger.info(f"Outlier winsorizing: {total_clipped} values winsorized across {len(feature_cols)} features")
+    logger.info(
+        f"Outlier winsorizing: {total_clipped} values winsorized across {len(feature_cols)} features"
+    )
 
     stats = OutlierStats(clipped_counts=clipped_counts, bounds=bounds)
     return df, stats
 
 
 # =============================================================================
-# STATIONARITY CORRECTION
+# PHYSICS NORMALIZATION
 # =============================================================================
 
 
@@ -339,140 +347,142 @@ def apply_irradiance_normalization(
     min_denominator: float = 5.0,
 ) -> pd.DataFrame:
     """
-    Normalize features by irradiance to remove diurnal non-stationarity.
-    
-    ⚠️ IMPORTANT: Since GTI filtering was removed, low GTI values (dawn/dusk/cloudy)
-    are present in the data. Division by very low GTI produces unreliable values.
-    
-    Strategy: Floor GTI to min_denominator before division. When GTI < 5 W/m², 
-    use 5 W/m² for division. This avoids division by near-zero while keeping 
-    data complete (no new NaNs created).
+    Normalize power/current features by irradiance: feature ÷ irr ≈ efficiency/yield.
 
-    Args:
-        df: Input DataFrame (will be copied)
-        features: Features to normalize (e.g., ["Pg", "Ig"])
-        denominator: Irradiance column to divide by
-        suffix: Suffix for new column names
-        min_denominator: Minimum denominator value for safe division (default: 5 W/m²)
-
-    Returns:
-        DataFrame with new normalized columns
+    Removes the irradiance-driven diurnal swing from power and current channels,
+    making the normal manifold approximately time-invariant for anomaly detectors.
+    Floors the denominator at min_denominator to avoid division by near-zero at dawn/dusk.
     """
     df = df.copy()
 
-    # Count low GTI rows (expected: dawn/dusk/cloudy)
-    low_gti_mask = df[denominator] < min_denominator
-    low_gti_count = low_gti_mask.sum()
-    
-    if low_gti_count > 0:
+    low_irr_count = (df[denominator] < min_denominator).sum()
+    if low_irr_count > 0:
         logger.info(
-            f"Found {low_gti_count} rows ({low_gti_count/len(df)*100:.1f}%) with {denominator} < {min_denominator} W/m². "
-            f"Using floor value {min_denominator} W/m² for division (dawn/dusk/cloudy)."
+            f"Found {low_irr_count} rows with {denominator} < {min_denominator} W/m²; "
+            f"flooring denominator for safe division."
         )
 
-    # Safe division: floor GTI to min_denominator
-    safe_gti = df[denominator].clip(lower=min_denominator)
-    
+    safe_irr = df[denominator].clip(lower=min_denominator)
     for feat in features:
-        new_col = f"{feat}{suffix}"
-        df[new_col] = df[feat] / safe_gti
-        logger.debug(f"  Created {new_col} = {feat} / max({denominator}, {min_denominator})")
+        df[f"{feat}{suffix}"] = df[feat] / safe_irr
+        logger.debug(f"  {feat}{suffix} = {feat} / max({denominator}, {min_denominator})")
 
-    logger.info(f"Irradiance normalization: created {len(features)} new features")
+    logger.info(f"Irradiance normalization: created {len(features)} features ({suffix})")
     return df
 
 
-def polynomial_detrend_per_segment(
+def apply_irr_conditioned_residualization(
     df: pd.DataFrame,
     features: list[str],
-    segment_col: str = "segment_id",
-    suffix: str = "_detrend",
-    degree: int = 2,
-) -> pd.DataFrame:
+    irr_col: str,
+    label_col: str = "Fault",
+    suffix: str = "_irr_residual",
+    reference_params: dict[str, tuple[float, float]] | None = None,
+) -> tuple[pd.DataFrame, dict[str, tuple[float, float]]]:
     """
-    Remove polynomial trend within each segment.
+    Irradiance-conditioned residualization for temperature features.
 
-    For each segment, fits y = a*t^n + ... + b*t + c and subtracts the trend.
-    
-    Why polynomial instead of linear?
-    - Temperature follows curved patterns (sunrise → peak → sunset)
-    - Degree 2 (parabola) or 3 (cubic) captures this better than straight line
-    - More accurate detrending = better stationarity
+    Fits feature = β·irr + α via OLS on normal-class rows, then subtracts the
+    irradiance-predicted baseline: residual = feature − (β·irr + α).
+
+    The residual is stationary where raw temperature was not: it captures thermal
+    deviation from what the irradiance level would predict, which is near-zero
+    for healthy operation and anomalous during fault-induced thermal events.
 
     Args:
         df: Input DataFrame (will be copied)
-        features: Features to detrend (e.g., ["TA", "TPV"])
-        segment_col: Segment ID column
-        suffix: Suffix for new column names
-        degree: Polynomial degree (2=quadratic, 3=cubic)
+        features: Temperature columns to residualize (e.g., ["pvt"])
+        irr_col: Irradiance column used as the conditioning variable
+        label_col: Label column; OLS is fit on label==0 rows only
+        suffix: Suffix for new residual columns
+        reference_params: Pre-fitted (beta, alpha) per feature for val/test splits.
+                          If None, fits from df (train mode).
 
     Returns:
-        DataFrame with new detrended columns
+        (DataFrame with residual columns, fitted_params dict feat->(beta, alpha))
     """
     df = df.copy()
+    fitted_params: dict[str, tuple[float, float]] = {}
+
+    normal_mask = df[label_col] == 0
+    irr_all = df[irr_col].values
 
     for feat in features:
-        new_col = f"{feat}{suffix}"
+        if reference_params and feat in reference_params:
+            beta, alpha = reference_params[feat]
+        else:
+            irr_train = irr_all[normal_mask]
+            y_train = df.loc[normal_mask, feat].values
 
-        def detrend_segment(x: pd.Series) -> pd.Series:
-            if len(x) <= degree:
-                # Not enough points to fit polynomial, just center
-                return x - x.mean()
-            t = np.arange(len(x))
-            coeffs = np.polyfit(t, x.values, degree)
-            trend = np.polyval(coeffs, t)
-            return pd.Series(x.values - trend, index=x.index)
+            irr_mean = irr_train.mean()
+            y_mean = y_train.mean()
+            denom = float(np.dot(irr_train - irr_mean, irr_train - irr_mean))
+            if denom == 0:
+                beta, alpha = 0.0, float(y_mean)
+            else:
+                beta = float(np.dot(irr_train - irr_mean, y_train - y_mean) / denom)
+                alpha = float(y_mean - beta * irr_mean)
 
-        df[new_col] = df.groupby(segment_col)[feat].transform(detrend_segment)
-        logger.debug(f"  Created {new_col} = {feat} (polynomial deg={degree} detrended per segment)")
+        fitted_params[feat] = (beta, alpha)
+        df[f"{feat}{suffix}"] = df[feat] - (beta * irr_all + alpha)
+        logger.debug(f"  {feat}{suffix} = {feat} - ({beta:.4f}·{irr_col} + {alpha:.4f})")
 
-    logger.info(f"Polynomial detrending: created {len(features)} new features (degree={degree})")
-    return df
+    logger.info(
+        f"Irradiance-conditioned residualization: created {len(features)} features ({suffix})"
+    )
+    return df, fitted_params
 
 
-def apply_stationarity_transforms(
+def apply_physics_normalization(
     df: pd.DataFrame,
     irradiance_config: dict | None = None,
-    detrend_config: dict | None = None,
-    segment_col: str = "segment_id",
-) -> tuple[pd.DataFrame, StationarityStats]:
+    irr_residualize_config: dict | None = None,
+    label_col: str = "Fault",
+    reference_irr_residual_params: dict[str, tuple[float, float]] | None = None,
+) -> tuple[pd.DataFrame, PhysicsNormStats]:
     """
-    Apply all stationarity transforms.
+    Apply all physics normalization transforms.
 
     Args:
         df: Input DataFrame
         irradiance_config: Dict with keys: features, denominator, suffix
-        detrend_config: Dict with keys: features, suffix
-        segment_col: Segment ID column
+        irr_residualize_config: Dict with keys: features, irr_col, suffix
+        label_col: Label column (used for OLS fit scope)
+        reference_irr_residual_params: Pre-fitted OLS params for val/test splits
 
     Returns:
-        Tuple of (processed DataFrame, statistics)
+        (processed DataFrame, PhysicsNormStats)
     """
-    features_normalized = []
-    features_detrended = []
+    features_normalized: list[str] = []
+    features_residualized: list[str] = []
+    irr_residual_params: dict[str, tuple[float, float]] = {}
 
     if irradiance_config:
         features = irradiance_config.get("features", [])
         denominator = irradiance_config.get("denominator", "GTI")
         suffix = irradiance_config.get("suffix", "_norm")
-
         df = apply_irradiance_normalization(df, features, denominator, suffix)
         features_normalized = [f"{f}{suffix}" for f in features]
 
-    if detrend_config:
-        features = detrend_config.get("features", [])
-        suffix = detrend_config.get("suffix", "_detrend")
-        degree = detrend_config.get("degree", 2)  # Default: quadratic
+    if irr_residualize_config:
+        features = irr_residualize_config.get("features", [])
+        irr_col = irr_residualize_config.get("irr_col", "irr")
+        suffix = irr_residualize_config.get("suffix", "_irr_residual")
+        df, irr_residual_params = apply_irr_conditioned_residualization(
+            df,
+            features=features,
+            irr_col=irr_col,
+            label_col=label_col,
+            suffix=suffix,
+            reference_params=reference_irr_residual_params,
+        )
+        features_residualized = [f"{f}{suffix}" for f in features]
 
-        df = polynomial_detrend_per_segment(df, features, segment_col, suffix, degree)
-        features_detrended = [f"{f}{suffix}" for f in features]
-
-    stats = StationarityStats(
+    return df, PhysicsNormStats(
         features_normalized=features_normalized,
-        features_detrended=features_detrended,
+        features_residualized=features_residualized,
+        irr_residual_params=irr_residual_params,
     )
-
-    return df, stats
 
 
 # =============================================================================
@@ -487,6 +497,8 @@ def preprocess(
     timestamp_col: str = "timestamp",
     segment_col: str = "segment_id",
     label_col: str = "Fault",
+    outlier_reference_bounds: dict[str, tuple[float, float]] | None = None,
+    irr_residual_reference_params: dict[str, tuple[float, float]] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Run full preprocessing pipeline.
@@ -498,23 +510,37 @@ def preprocess(
         timestamp_col: Timestamp column name
         segment_col: Segment ID column name
         label_col: Label column name
+        outlier_reference_bounds: Train-fit outlier bounds for val/test
+        irr_residual_reference_params: Train-fit OLS params for val/test (feat->(beta,alpha))
 
     Returns:
         Tuple of (preprocessed DataFrame, statistics dict)
+        Statistics include irr_residual_params for the caller to store and forward to val/test.
     """
     logger.info(f"Starting preprocessing pipeline on {len(df)} rows...")
 
     # 1. Missing value handling
     mv_config = config.get("missing_values", {})
-    df, mv_stats = handle_missing_values(
-        df,
-        feature_cols=feature_cols,
-        ffill_max_gap_seconds=mv_config.get("ffill_max_gap_seconds", 60),
-        interp_max_gap_seconds=mv_config.get("interp_max_gap_seconds", 300),
-        timestamp_col=timestamp_col,
-        segment_col=segment_col,
-        label_col=label_col,
-    )
+    if mv_config.get("enabled", True):
+        df, mv_stats = handle_missing_values(
+            df,
+            feature_cols=feature_cols,
+            ffill_max_gap_seconds=mv_config.get("ffill_max_gap_seconds", 60),
+            interp_max_gap_seconds=mv_config.get("interp_max_gap_seconds", 300),
+            timestamp_col=timestamp_col,
+            segment_col=segment_col,
+            label_col=label_col,
+        )
+    else:
+        mv_stats = MissingValueStats(
+            input_rows=len(df),
+            output_rows=len(df),
+            rows_dropped_fault_overlap=0,
+            rows_dropped_long_gap=0,
+            episodes_ffilled=0,
+            episodes_interpolated=0,
+        )
+        logger.info("Missing value handling disabled by config; skipping imputation stage")
 
     # 2. Outlier treatment
     outlier_config = config.get("outliers", {})
@@ -526,18 +552,19 @@ def preprocess(
         lower_percentile=outlier_config.get("lower_percentile", 0.05),
         upper_percentile=outlier_config.get("upper_percentile", 0.95),
         scope=outlier_config.get("scope", "normal_only"),
+        reference_bounds=outlier_reference_bounds,
     )
 
-    # 3. Stationarity correction
-    stat_config = config.get("stationarity", {})
-    df, stat_stats = apply_stationarity_transforms(
+    # 3. Physics normalization
+    stat_config = config.get("physics_normalization") or {}
+    df, stat_stats = apply_physics_normalization(
         df,
         irradiance_config=stat_config.get("irradiance_normalize"),
-        detrend_config=stat_config.get("polynomial_detrend", stat_config.get("linear_detrend")),
-        segment_col=segment_col,
+        irr_residualize_config=stat_config.get("irr_residualize"),
+        label_col=label_col,
+        reference_irr_residual_params=irr_residual_reference_params,
     )
 
-    # Compile statistics
     stats = {
         "missing_values": {
             "input_rows": mv_stats.input_rows,
@@ -551,9 +578,10 @@ def preprocess(
             "clipped_counts": outlier_stats.clipped_counts,
             "bounds": {k: list(v) for k, v in outlier_stats.bounds.items()},
         },
-        "stationarity": {
+        "physics_normalization": {
             "features_normalized": stat_stats.features_normalized,
-            "features_detrended": stat_stats.features_detrended,
+            "features_residualized": stat_stats.features_residualized,
+            "irr_residual_params": {k: list(v) for k, v in stat_stats.irr_residual_params.items()},
         },
     }
 

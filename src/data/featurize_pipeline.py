@@ -20,9 +20,13 @@ import yaml
 from loguru import logger
 
 from src.data.features import (
+    add_multiscale_window_features,
     add_physics_features,
+    add_rolling_statistics_features,
     add_time_cyclic_features,
     add_wavelet_feature,
+    apply_hygiene_pruning,
+    apply_mrmr_selection,
     apply_correlation_pruning,
     apply_vif_pruning,
     extract_tsfresh_segment_features,
@@ -37,8 +41,23 @@ TASK_CHOICES = ("anomaly_semisup", "anomaly_supervised", "classification")
 
 PROFILE_FLAG_KEYS = {
     "wavelet_threshold_strategy",
-    "include_preprocessed_stationarity_features",
-    "preprocessed_stationarity_suffixes",
+    "rolling_windows",
+    "rolling_stats",
+    "window_size",
+    "window_step",
+    "multiscale_window_sizes",
+    "spectral_min_fs",
+    "spectral_n_top_freqs",
+    "psd_n_bands",
+    "wpd_level",
+    "wpd_wavelet",
+    "ceemdan_n_imfs",
+    "ceemdan_n_ensemble",
+    "temp_ref_c",
+    "gamma_pmax_pct_per_c",
+    "temp_power_eps",
+    "irr_norm_floor",
+    "mrmr_k",
 }
 
 DERIVED_FEATURE_ENABLE_FLAGS = {
@@ -47,8 +66,33 @@ DERIVED_FEATURE_ENABLE_FLAGS = {
     "dV_dt": "enable_dV_dt",
     "dI_dt": "enable_dI_dt",
     "Vg_normalized": "enable_Vg_normalized",
+    "power_imbalance": "enable_power_imbalance",
+    "current_imbalance": "enable_current_imbalance",
+    "voltage_imbalance": "enable_voltage_imbalance",
+    "string1_power_share": "enable_string_share",
+    "string1_current_share": "enable_string_share",
+    "temp_loss_pmax": "enable_temp_power_correction",
+    "pdc_temp_corrected": "enable_temp_power_correction",
+    "pdc_temp_corrected_norm_irr": "enable_temp_power_correction",
     "Pg_wavelet": "enable_wavelet",
     "delta_p": "enable_differential_signal",
+}
+
+DERIVED_SOURCE_COLUMNS = {
+    "delta_temp": {"TPV", "TA"},
+    "dP_dt": {"Pg"},
+    "dV_dt": {"Vg"},
+    "dI_dt": {"Ig"},
+    "Vg_normalized": {"Vg"},
+    "power_imbalance": {"pdc1", "pdc2"},
+    "current_imbalance": {"idc1", "idc2"},
+    "voltage_imbalance": {"vdc1", "vdc2"},
+    "string1_power_share": {"pdc1", "pdc2"},
+    "string1_current_share": {"idc1", "idc2"},
+    "temp_loss_pmax": {"pvt"},
+    "pdc_temp_corrected": {"pdc", "pvt"},
+    "pdc_temp_corrected_norm_irr": {"pdc", "pvt", "irr"},
+    "Pg_wavelet": {"Pg"},
 }
 
 
@@ -85,6 +129,16 @@ def get_base_feature_columns(df: pd.DataFrame) -> list[str]:
     return infer_base_feature_columns(df)
 
 
+def get_dataset_base_feature_columns(config: dict, dataset: str, df: pd.DataFrame) -> list[str]:
+    ds_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
+    ds_sensor_cols = ds_cfg.get("feature_engineering", {}).get("sensor_columns", [])
+    if ds_sensor_cols:
+        resolved = [c for c in ds_sensor_cols if c in df.columns]
+        if resolved:
+            return resolved
+    return get_base_feature_columns(df)
+
+
 def to_json_safe(value):
     """Recursively convert NaN/Inf into JSON-safe values."""
     if isinstance(value, dict):
@@ -100,20 +154,33 @@ def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in value)
 
 
-def _resolve_output_root(config: dict, dataset: str) -> tuple[Path, str]:
+def _resolve_output_root(config: dict, dataset: str, split_path: str) -> tuple[Path, str]:
     fe_cfg = config.get("feature_engineering", {})
     out_cfg = fe_cfg.get("outputs", {})
     root_dir = out_cfg.get("root_dir", "data/processed/features")
     runs_subdir = out_cfg.get("runs_subdir", "runs")
-    return PROJECT_ROOT / root_dir / dataset, str(runs_subdir)
+    output_root = PROJECT_ROOT / root_dir / dataset
+    if split_path == "path_b":
+        output_root = output_root / "path_b"
+    return output_root, str(runs_subdir)
 
 
 def _apply_dataset_overrides(
-    config: dict, dataset: str, flags: dict, selection: dict
+    config: dict,
+    dataset: str,
+    split_path: str,
+    flags: dict,
+    selection: dict,
 ) -> tuple[dict, dict]:
     """Merge dataset-specific feature_engineering flags and selection into global defaults."""
     ds_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
     ds_fe = ds_cfg.get("feature_engineering", {})
+    path_fe = (
+        ds_cfg.get("splits", {})
+        .get("comparison_paths", {})
+        .get(split_path, {})
+        .get("feature_engineering", {})
+    )
 
     # Dataset flag overrides (only keys explicitly set in dataset config)
     for key, value in ds_fe.get("flags", {}).items():
@@ -121,6 +188,12 @@ def _apply_dataset_overrides(
 
     # Dataset selection overrides (anchor_features etc.)
     for key, value in ds_fe.get("selection", {}).items():
+        selection[key] = value
+
+    # Split-path specific overrides (Path A vs Path B)
+    for key, value in path_fe.get("flags", {}).items():
+        flags[key] = value
+    for key, value in path_fe.get("selection", {}).items():
         selection[key] = value
 
     # Inject dataset-specific eda_findings_path into selection so _load_eda_findings picks it up
@@ -131,8 +204,11 @@ def _apply_dataset_overrides(
     return flags, selection
 
 
-def _resolve_input_dir(dataset: str, task: str) -> Path:
-    return PROJECT_ROOT / "data" / "processed" / "preprocessed" / dataset / task
+def _resolve_input_dir(dataset: str, task: str, split_path: str) -> Path:
+    input_root = PROJECT_ROOT / "data" / "processed" / "preprocessed" / dataset
+    if split_path == "path_b":
+        input_root = input_root / "path_b"
+    return input_root / task
 
 
 def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -283,23 +359,6 @@ def _resolve_run_dir(base_run_dir: Path) -> Path:
     return base_run_dir.with_name(f"{base_run_dir.name}__{stamp}")
 
 
-def _detect_preprocessed_stationarity_columns(
-    split_frames: dict[str, pd.DataFrame],
-    suffixes: list[str],
-) -> list[str]:
-    """Detect stationarity columns already created during preprocessing.
-
-    A column is included if it ends with one of the configured suffixes and
-    exists across train/val/test, so downstream column selection remains safe.
-    """
-    if not suffixes:
-        return []
-
-    train_cols = list(split_frames["train"].columns)
-    matched = [c for c in train_cols if any(c.endswith(suffix) for suffix in suffixes)]
-    return [c for c in matched if all(c in split_frames[s].columns for s in ("val", "test"))]
-
-
 def _apply_eda_predrop_before_feature_generation(
     split_frames: dict[str, pd.DataFrame],
     pre_drop_cols: list[str],
@@ -346,14 +405,7 @@ def _apply_predrop_derived_blocking(
             }
         )
 
-    for feature_name, source_cols in {
-        "delta_temp": {"TPV", "TA"},
-        "dP_dt": {"Pg"},
-        "dV_dt": {"Vg"},
-        "dI_dt": {"Ig"},
-        "Vg_normalized": {"Vg"},
-        "Pg_wavelet": {"Pg"},
-    }.items():
+    for feature_name, source_cols in DERIVED_SOURCE_COLUMNS.items():
         overlap = sorted(source_cols.intersection(predropped))
         if overlap:
             _block(feature_name, overlap)
@@ -370,6 +422,20 @@ def _apply_predrop_derived_blocking(
             _block("delta_p", blocked_sources)
 
     return effective, blocked
+
+
+def _protect_predrop_sources_for_enabled_derived(
+    pre_drop_cols: list[str], flags: dict
+) -> tuple[list[str], list[str]]:
+    """Avoid pre-dropping source channels required by currently enabled derived features."""
+    protected_sources: set[str] = set()
+    for feature_name, enable_key in DERIVED_FEATURE_ENABLE_FLAGS.items():
+        if flags.get(enable_key, False):
+            protected_sources.update(DERIVED_SOURCE_COLUMNS.get(feature_name, set()))
+
+    kept = [c for c in pre_drop_cols if c not in protected_sources]
+    removed = [c for c in pre_drop_cols if c in protected_sources]
+    return kept, removed
 
 
 def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, list[str]]:
@@ -390,10 +456,32 @@ def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, 
         "dV_dt",
         "dI_dt",
         "Vg_normalized",
+        "power_imbalance",
+        "current_imbalance",
+        "voltage_imbalance",
+        "string1_power_share",
+        "string1_current_share",
+        "temp_loss_pmax",
+        "pdc_temp_corrected",
+        "pdc_temp_corrected_norm_irr",
     ]
     for c in physics_cols:
         if c in out.columns and c not in added:
             added.append(c)
+
+    if flags.get("enable_rolling_stats", False):
+        rolling_source_cols = infer_base_feature_columns(out)
+        out, rolling_added = add_rolling_statistics_features(
+            out,
+            feature_cols=rolling_source_cols,
+            segment_col="segment_id",
+            time_col="timestamp",
+            windows=flags.get("rolling_windows", [5, 10, 30]),
+            stats=flags.get("rolling_stats", ["mean", "std", "min", "max"]),
+        )
+        for c in rolling_added:
+            if c not in added:
+                added.append(c)
 
     if flags.get("enable_wavelet", False):
         out = add_wavelet_feature(
@@ -441,6 +529,12 @@ def main() -> None:
         default=None,
         help="Optional feature-engineering profile from data_config.yaml",
     )
+    parser.add_argument(
+        "--split-path",
+        default="path_a",
+        choices=["path_a", "path_b"],
+        help="Which preprocessed split path to featurize. Default: path_a",
+    )
     args = parser.parse_args()
 
     # Validate dataset
@@ -455,7 +549,11 @@ def main() -> None:
         config, args.profile
     )
     base_flags, base_selection_cfg = _apply_dataset_overrides(
-        config, args.dataset, base_flags, base_selection_cfg
+        config,
+        args.dataset,
+        args.split_path,
+        base_flags,
+        base_selection_cfg,
     )
     flags, selection_cfg, tsfresh_cfg = _apply_task_overrides(
         base_flags,
@@ -464,10 +562,30 @@ def main() -> None:
         task_directives,
     )
 
-    input_dir = _resolve_input_dir(args.dataset, task)
+    # Path-level admissibility guards.
+    if args.split_path == "path_a":
+        if flags.get("enable_hour_cyclic", False):
+            logger.info("Path A policy: disabling hour-cyclic temporal context by default")
+            flags["enable_hour_cyclic"] = False
+        if flags.get("enable_wavelet", False):
+            logger.info("Path A policy: disabling wavelet/spectral features (Path B only)")
+            flags["enable_wavelet"] = False
+        for _spectral_flag in ("enable_spectral", "enable_psd", "enable_wpd", "enable_ceemdan"):
+            if flags.get(_spectral_flag, False):
+                logger.info(f"Path A policy: disabling {_spectral_flag} (Path B only)")
+                flags[_spectral_flag] = False
+
+    # Windowing takes precedence: rolling stats encode the same temporal structure redundantly.
+    if flags.get("enable_explicit_windowing", False) and flags.get("enable_rolling_stats", False):
+        logger.info(
+            "Windowing policy: auto-disabling rolling stats (redundant when windowing is active)"
+        )
+        flags["enable_rolling_stats"] = False
+
+    input_dir = _resolve_input_dir(args.dataset, task, args.split_path)
     profile_key = _safe_name(profile_name or "default")
     task_key = _safe_name(task)
-    output_root, runs_subdir = _resolve_output_root(config, args.dataset)
+    output_root, runs_subdir = _resolve_output_root(config, args.dataset, args.split_path)
     output_root.mkdir(parents=True, exist_ok=True)
     task_output_root = output_root / task_key
     runs_root = task_output_root / runs_subdir
@@ -486,22 +604,15 @@ def main() -> None:
     block_derived_from_predrop = bool(
         selection_effective.get("eda_block_derived_from_predropped_sources", True)
     )
-    include_preprocessed_stationarity = bool(
-        flags.get("include_preprocessed_stationarity_features", False)
-    )
 
-    raw_stationarity_suffixes = flags.get(
-        "preprocessed_stationarity_suffixes", ["_norm", "_detrend"]
+    eda_pre_drop_original = list(eda_pre_drop)
+    eda_pre_drop, eda_predrop_protected_sources = _protect_predrop_sources_for_enabled_derived(
+        eda_pre_drop,
+        flags,
     )
-    if isinstance(raw_stationarity_suffixes, str):
-        stationarity_suffixes = [raw_stationarity_suffixes]
-    elif isinstance(raw_stationarity_suffixes, list):
-        stationarity_suffixes = [str(s) for s in raw_stationarity_suffixes if str(s)]
-    else:
-        stationarity_suffixes = ["_norm", "_detrend"]
-
     resolved_for_fingerprint = {
         "task": task,
+        "split_path": args.split_path,
         "profile": profile_key,
         "flags": flags,
         "task_directives": task_directives,
@@ -518,6 +629,9 @@ def main() -> None:
             "eda_pre_drop_candidates": bool(
                 selection_effective.get("eda_pre_drop_candidates", True)
             ),
+            "eda_pre_drop_original": eda_pre_drop_original,
+            "eda_pre_drop_after_source_protection": eda_pre_drop,
+            "eda_pre_drop_removed_due_to_derived_sources": eda_predrop_protected_sources,
             "eda_override_thresholds": bool(
                 selection_effective.get("eda_override_thresholds", False)
             ),
@@ -572,26 +686,83 @@ def main() -> None:
         )
 
     label_col = infer_label_column(split_frames["train"])
-    base_cols = get_base_feature_columns(split_frames["train"])
-    stationarity_cols = (
-        _detect_preprocessed_stationarity_columns(split_frames, stationarity_suffixes)
-        if include_preprocessed_stationarity
-        else []
-    )
+    base_cols = get_dataset_base_feature_columns(config, args.dataset, split_frames["train"])
 
     generated_cols: dict[str, list[str]] = {}
     for subset in ("train", "val", "test"):
         split_frames[subset], added = add_optional_features(split_frames[subset], generation_flags)
         generated_cols[subset] = added
 
-    candidate_features = sorted(
-        set(
-            base_cols
-            + stationarity_cols
-            + generated_cols["train"]
-            + generated_cols["val"]
-            + generated_cols["test"]
+    windowing_meta: dict = {"enabled": False}
+    if flags.get("enable_explicit_windowing", False):
+        _window_sizes: list[int] = (
+            [int(w) for w in flags.get("multiscale_window_sizes", [flags.get("window_size", 60)])]
+            if flags.get("enable_multiscale", False)
+            else [int(flags.get("window_size", 60))]
         )
+        _window_step = int(flags.get("window_step", 30))
+        _fs = float(
+            config.get("paths", {})
+            .get("datasets", {})
+            .get(args.dataset, {})
+            .get("sampling_hz", 1.0)
+        )
+
+        _window_input_cols = sorted(
+            set(base_cols + generated_cols["train"]) & set(split_frames["train"].columns)
+        )
+
+        _windowed_counts: dict[str, int] = {}
+        _windowed_col_names: list[str] = []
+        for subset in ("train", "val", "test"):
+            windowed_df, windowed_cols = add_multiscale_window_features(
+                split_frames[subset],
+                feature_cols=_window_input_cols,
+                window_sizes=_window_sizes,
+                step=_window_step,
+                label_col=label_col,
+                segment_col="segment_id",
+                fs=_fs,
+                enable_fft=bool(flags.get("enable_spectral", False)),
+                n_top_freqs=int(flags.get("spectral_n_top_freqs", 5)),
+                enable_psd=bool(flags.get("enable_psd", False)),
+                psd_n_bands=int(flags.get("psd_n_bands", 5)),
+                enable_wpd=bool(flags.get("enable_wpd", False)),
+                wpd_level=int(flags.get("wpd_level", 3)),
+                wpd_wavelet=str(flags.get("wpd_wavelet", "db4")),
+                enable_ceemdan=bool(flags.get("enable_ceemdan", False)),
+                ceemdan_n_imfs=int(flags.get("ceemdan_n_imfs", 3)),
+                ceemdan_n_ensemble=int(flags.get("ceemdan_n_ensemble", 20)),
+                spectral_min_fs=float(flags.get("spectral_min_fs", 0.5)),
+            )
+            split_frames[subset] = windowed_df
+            _windowed_counts[subset] = len(windowed_df)
+            if subset == "train":
+                _windowed_col_names = windowed_cols
+            logger.info(f"Windowed {subset}: {_windowed_counts[subset]:,} windows")
+
+        windowing_meta = {
+            "enabled": True,
+            "window_sizes": _window_sizes,
+            "window_step": _window_step,
+            "primary_window": max(_window_sizes),
+            "multiscale": bool(flags.get("enable_multiscale", False)),
+            "sampling_hz": _fs,
+            "spectral": {
+                "fft_top_n": bool(flags.get("enable_spectral", False)),
+                "psd": bool(flags.get("enable_psd", False)),
+                "wpd": bool(flags.get("enable_wpd", False)),
+                "ceemdan": bool(flags.get("enable_ceemdan", False)),
+            },
+            "n_windows_per_split": _windowed_counts,
+        }
+
+        # Rebuild candidate pool from windowed output; original base_cols no longer exist.
+        base_cols = []
+        generated_cols = {s: _windowed_col_names for s in ("train", "val", "test")}
+
+    candidate_features = sorted(
+        set(base_cols + generated_cols["train"] + generated_cols["val"] + generated_cols["test"])
     )
     candidate_features = [c for c in candidate_features if c in split_frames["train"].columns]
     candidate_predrop_applied = [c for c in eda_pre_drop if c in set(candidate_features)]
@@ -690,24 +861,21 @@ def main() -> None:
         "config_fingerprint": config_fingerprint,
         "output_directory": str(run_dir),
         "source_task": task,
+        "split_path": args.split_path,
         "source_preprocessed_dir": str(input_dir),
         "label_column": label_col,
         "active_flags": flags,
         "effective_generation_flags": generation_flags,
         "task_directives_effective": task_directives,
-        "preprocessed_stationarity": {
-            "enabled": include_preprocessed_stationarity,
-            "suffixes": stationarity_suffixes,
-            "included_columns": stationarity_cols,
-            "count": len(stationarity_cols),
-        },
         "selection": {
             "corr_threshold": float(selection_effective.get("corr_threshold", 0.95)),
             "vif_threshold": float(selection_effective.get("vif_threshold", 10.0)),
             "anchor_features": selection_effective.get("anchor_features", []),
             "use_eda_findings": bool(selection_effective.get("use_eda_findings", False)),
             "eda_policy": eda_policy,
+            "eda_pre_drop_original": eda_pre_drop_original,
             "eda_pre_drop_candidates": eda_pre_drop,
+            "eda_pre_drop_removed_due_to_derived_sources": eda_predrop_protected_sources,
             "eda_predrop_before_featurization_enabled": predrop_before_featurization,
             "eda_pre_drop_applied_before_featurization": eda_predrop_applied_before_fe,
             "eda_pre_drop_unavailable_before_featurization": eda_predrop_unavailable_before_fe,
@@ -721,6 +889,7 @@ def main() -> None:
         },
         "eda_findings": eda_meta,
         "tsfresh": tsfresh_meta,
+        "explicit_windowing": windowing_meta,
         "base_feature_count": len(base_cols),
         "final_feature_count": len(final_feature_cols),
         "final_features": final_feature_cols,

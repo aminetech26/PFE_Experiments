@@ -18,8 +18,8 @@ Classes:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 import numpy as np
 import pandas as pd
@@ -65,8 +65,291 @@ def _segment_summary(
 
 def _get_primary_fault(labels: list) -> float | None:
     """Get the primary fault class from a list of labels (first non-zero)."""
-    faults = [l for l in labels if l != 0.0]
+    faults = [v for v in labels if v != 0.0]
     return faults[0] if faults else None
+
+
+def _ratio_error(actual: float, target: float) -> float:
+    """Absolute deviation between achieved and target ratio."""
+    return abs(actual - target)
+
+
+def _choose_temporal_boundaries(
+    ordered_ids: list,
+    ordered_rows: list[int],
+    train_ratio: float,
+    val_ratio: float,
+    allow_empty_train: bool = False,
+) -> tuple[list, list, list, dict]:
+    """Choose chronology-preserving boundaries using both episode and row ratios."""
+    n = len(ordered_ids)
+    min_train_units = 0 if allow_empty_train else 1
+    if n == 0:
+        return [], [], [], {"n_units": 0, "status": "empty"}
+    if n == 1:
+        if min_train_units == 0:
+            return [], ordered_ids, [], {"n_units": 1, "status": "single_unit_empty_train"}
+        return ordered_ids, [], [], {"n_units": 1, "status": "single_unit"}
+    if n == 2:
+        if min_train_units == 0:
+            return (
+                [],
+                [ordered_ids[0]],
+                [ordered_ids[1]],
+                {"n_units": 2, "status": "two_units_empty_train"},
+            )
+        return [ordered_ids[0]], [], [ordered_ids[1]], {"n_units": 2, "status": "two_units"}
+
+    total_rows = int(sum(ordered_rows))
+    cumulative_rows = np.cumsum(ordered_rows)
+    target_test_ratio = max(0.0, 1.0 - train_ratio - val_ratio)
+    best: tuple[float, int, int] | None = None
+
+    if allow_empty_train and train_ratio == 0.0:
+        train_end_values = [0]
+    else:
+        train_end_values = range(min_train_units, n - 1)
+
+    for train_end in train_end_values:
+        for val_end in range(train_end + 1, n):
+            train_count = train_end
+            val_count = val_end - train_end
+            test_count = n - val_end
+            if val_count <= 0 or test_count <= 0:
+                continue
+
+            train_rows = int(cumulative_rows[train_end - 1])
+            val_rows = int(cumulative_rows[val_end - 1] - cumulative_rows[train_end - 1])
+            test_rows = int(total_rows - cumulative_rows[val_end - 1])
+
+            # Rows carry more learning signal than episode counts, so row errors get 2x
+            # weight. The 1x episode term still penalises extreme episode imbalance (e.g.
+            # 1 val episode vs 10 test episodes) without overriding honest row coverage.
+            score = (
+                2.0 * _ratio_error(train_rows / total_rows, train_ratio)
+                + 2.0 * _ratio_error(val_rows / total_rows, val_ratio)
+                + 2.0 * _ratio_error(test_rows / total_rows, target_test_ratio)
+                + 1.0 * _ratio_error(train_count / n, train_ratio)
+                + 1.0 * _ratio_error(val_count / n, val_ratio)
+                + 1.0 * _ratio_error(test_count / n, target_test_ratio)
+            )
+
+            candidate = (score, train_end, val_end)
+            if best is None or candidate < best:
+                best = candidate
+
+    if best is None:
+        train_end = max(min_train_units, int(n * train_ratio))
+        val_end = min(n - 1, train_end + max(1, int(n * val_ratio)))
+    else:
+        _, train_end, val_end = best
+
+    train_ids = ordered_ids[:train_end]
+    val_ids = ordered_ids[train_end:val_end]
+    test_ids = ordered_ids[val_end:]
+
+    train_rows = int(sum(ordered_rows[:train_end]))
+    val_rows = int(sum(ordered_rows[train_end:val_end]))
+    test_rows = int(sum(ordered_rows[val_end:]))
+
+    diagnostics = {
+        "n_units": n,
+        "total_rows": total_rows,
+        "target_ratios": {
+            "train": train_ratio,
+            "val": val_ratio,
+            "test": target_test_ratio,
+        },
+        "achieved_episode_ratios": {
+            "train": len(train_ids) / n,
+            "val": len(val_ids) / n,
+            "test": len(test_ids) / n,
+        },
+        "achieved_row_ratios": {
+            "train": train_rows / total_rows if total_rows else None,
+            "val": val_rows / total_rows if total_rows else None,
+            "test": test_rows / total_rows if total_rows else None,
+        },
+        "episode_counts": {
+            "train": len(train_ids),
+            "val": len(val_ids),
+            "test": len(test_ids),
+        },
+        "row_counts": {
+            "train": train_rows,
+            "val": val_rows,
+            "test": test_rows,
+        },
+        "status": "optimized_jointly_for_episode_and_row_ratios",
+    }
+    return train_ids, val_ids, test_ids, diagnostics
+
+
+def _build_split_support_report(
+    df: pd.DataFrame,
+    segment_col: str,
+    label_col: str,
+    split_frames: dict[str, pd.DataFrame],
+) -> dict:
+    """Report achieved support by class in both episode and row space."""
+    episode_labels = (
+        df.groupby(segment_col, observed=True)[label_col].first().reset_index(drop=False)
+    )
+    all_labels = sorted(df[label_col].dropna().unique().tolist())
+    report: dict[str, dict] = {}
+
+    for label in all_labels:
+        total_rows = int((df[label_col] == label).sum())
+        total_episodes = int((episode_labels[label_col] == label).sum())
+        per_split = {}
+        for split_name, split_df in split_frames.items():
+            split_episode_labels = (
+                split_df.groupby(segment_col, observed=True)[label_col]
+                .first()
+                .reset_index(drop=False)
+            )
+            split_rows = int((split_df[label_col] == label).sum())
+            split_episodes = int((split_episode_labels[label_col] == label).sum())
+            per_split[split_name] = {
+                "rows": split_rows,
+                "row_ratio_within_class": split_rows / total_rows if total_rows else None,
+                "episodes": split_episodes,
+                "episode_ratio_within_class": (
+                    split_episodes / total_episodes if total_episodes else None
+                ),
+            }
+        report[str(label)] = {
+            "total_rows": total_rows,
+            "total_episodes": total_episodes,
+            "splits": per_split,
+        }
+    return report
+
+
+def _build_multilabel_unit_support_report(
+    df: pd.DataFrame,
+    segment_col: str,
+    label_col: str,
+    split_frames: dict[str, pd.DataFrame],
+) -> dict:
+    """Report row support plus unit-presence support for mixed-label grouped units."""
+    unit_labels = df.groupby(segment_col, observed=True)[label_col].apply(
+        lambda x: set(pd.Series(x).dropna().tolist())
+    )
+    all_labels = sorted(df[label_col].dropna().unique().tolist())
+    report: dict[str, dict] = {}
+
+    for label in all_labels:
+        total_rows = int((df[label_col] == label).sum())
+        total_units = int(sum(label in labels for labels in unit_labels))
+        per_split = {}
+        for split_name, split_df in split_frames.items():
+            split_unit_labels = split_df.groupby(segment_col, observed=True)[label_col].apply(
+                lambda x: set(pd.Series(x).dropna().tolist())
+            )
+            split_rows = int((split_df[label_col] == label).sum())
+            split_units = int(sum(label in labels for labels in split_unit_labels))
+            per_split[split_name] = {
+                "rows": split_rows,
+                "row_ratio_within_class": split_rows / total_rows if total_rows else None,
+                "units": split_units,
+                "unit_ratio_within_class": split_units / total_units if total_units else None,
+            }
+        report[str(label)] = {
+            "total_rows": total_rows,
+            "total_units": total_units,
+            "splits": per_split,
+        }
+    return report
+
+
+def _apply_forward_purge(
+    train_ids: list,
+    val_ids: list,
+    test_ids: list,
+    purge_units: int,
+) -> tuple[list, list, list, list]:
+    """Drop the earliest units of downstream partitions to create explicit boundary gaps."""
+    if purge_units <= 0:
+        return train_ids, val_ids, test_ids, []
+
+    drop_val = val_ids[: min(purge_units, len(val_ids))]
+    drop_test = test_ids[: min(purge_units, len(test_ids))]
+    kept_val = val_ids[len(drop_val) :]
+    kept_test = test_ids[len(drop_test) :]
+    dropped_ids = [*drop_val, *drop_test]
+    return train_ids, kept_val, kept_test, dropped_ids
+
+
+def _forward_fractional_boundary_purge(
+    frame: pd.DataFrame,
+    segment_col: str,
+    time_col: str,
+    purge_fraction: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Drop the earliest fraction of elapsed time from the first grouped unit in a partition."""
+    if frame.empty or purge_fraction <= 0:
+        return (
+            frame,
+            pd.DataFrame(columns=frame.columns),
+            {
+                "applied": False,
+                "purged_rows": 0,
+                "purged_group": None,
+                "purge_fraction": purge_fraction,
+                "purge_basis": "elapsed_time_within_group",
+                "cutoff_timestamp": None,
+            },
+        )
+
+    first_group = frame.sort_values([segment_col, time_col])[segment_col].iloc[0]
+    first_group_df = frame[frame[segment_col] == first_group].sort_values(time_col)
+    start_ts = first_group_df[time_col].iloc[0]
+    end_ts = first_group_df[time_col].iloc[-1]
+    elapsed_seconds = (end_ts - start_ts).total_seconds()
+
+    if elapsed_seconds <= 0:
+        n_drop = int(np.floor(len(first_group_df) * purge_fraction))
+        if n_drop <= 0 and len(first_group_df) > 1:
+            n_drop = 1
+        drop_index = first_group_df.index[:n_drop] if n_drop > 0 else first_group_df.index[:0]
+        cutoff_ts = first_group_df[time_col].iloc[n_drop - 1] if n_drop > 0 else None
+    else:
+        cutoff_ts = start_ts + pd.to_timedelta(elapsed_seconds * purge_fraction, unit="s")
+        drop_index = first_group_df.index[first_group_df[time_col] <= cutoff_ts]
+
+    if len(drop_index) <= 0:
+        return (
+            frame,
+            pd.DataFrame(columns=frame.columns),
+            {
+                "applied": False,
+                "purged_rows": 0,
+                "purged_group": int(first_group)
+                if isinstance(first_group, (int, np.integer))
+                else first_group,
+                "purge_fraction": purge_fraction,
+                "purge_basis": "elapsed_time_within_group",
+                "cutoff_timestamp": cutoff_ts.isoformat() if cutoff_ts is not None else None,
+            },
+        )
+
+    purged = frame.loc[drop_index].copy()
+    kept = frame.drop(index=drop_index).copy()
+    return (
+        kept,
+        purged,
+        {
+            "applied": True,
+            "purged_rows": int(len(purged)),
+            "purged_group": int(first_group)
+            if isinstance(first_group, (int, np.integer))
+            else first_group,
+            "purge_fraction": float(purge_fraction),
+            "purge_basis": "elapsed_time_within_group",
+            "cutoff_timestamp": cutoff_ts.isoformat() if cutoff_ts is not None else None,
+        },
+    )
 
 
 # =============================================================================
@@ -135,38 +418,29 @@ def temporal_stratified_split(
             "start"
         )
         class_segs = class_seg_df[segment_col].tolist()
+        class_rows = class_seg_df["n_rows"].astype(int).tolist()
 
-        n = len(class_segs)
-        n_train = max(1, int(n * train_ratio))
-        n_val = max(0, int(n * val_ratio))
+        train_class, val_class, test_class, split_diag = _choose_temporal_boundaries(
+            class_segs,
+            class_rows,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+        )
 
-        if n <= 2:
-            # Too few segments: all go to train
-            train_segs.extend(class_segs)
-            class_temporal_info[fault_class] = {
-                "n_segments": n,
-                "train": class_segs,
-                "val": [],
-                "test": [],
-                "note": "Too few segments for val/test",
-            }
-        else:
-            train_class = class_segs[:n_train]
-            val_class = class_segs[n_train : n_train + n_val]
-            test_class = class_segs[n_train + n_val :]
+        train_segs.extend(train_class)
+        val_segs.extend(val_class)
+        test_segs.extend(test_class)
 
-            train_segs.extend(train_class)
-            val_segs.extend(val_class)
-            test_segs.extend(test_class)
-
-            class_temporal_info[fault_class] = {
-                "n_segments": n,
-                "train": train_class,
-                "val": val_class,
-                "test": test_class,
-            }
+        class_temporal_info[fault_class] = {
+            "n_segments": len(class_segs),
+            "train": train_class,
+            "val": val_class,
+            "test": test_class,
+            "support_diagnostics": split_diag,
+        }
 
     # Distribute normal segments (temporal order)
+    # Normal class: large-n naive slicing adequate; evaluability concern is on fault classes.
     normal_seg_df = normal_segments.sort_values("start")
     normal_seg_ids = normal_seg_df[segment_col].tolist()
 
@@ -186,6 +460,13 @@ def temporal_stratified_split(
     # For segment-stratified splits, segment boundaries provide isolation
     # No global embargo needed (would drop valid data due to interleaved classes)
     dropped = pd.DataFrame()
+
+    support_report = _build_multilabel_unit_support_report(
+        df,
+        segment_col,
+        label_col,
+        {"train": train_df, "val": val_df, "test": test_df},
+    )
 
     manifest = {
         "split_type": "temporal_stratified",
@@ -207,6 +488,7 @@ def temporal_stratified_split(
         .count()
         .to_dict(),
         "class_temporal_info": {str(k): v for k, v in class_temporal_info.items()},
+        "support_report": support_report,
         "note": "Segment boundaries (>300s gaps) provide temporal isolation. No global embargo applied.",
     }
 
@@ -235,13 +517,14 @@ def hybrid_semisup_split(
     """
     seg_summary = _segment_summary(df, segment_col, label_col, time_col)
 
-    seg_summary["has_fault"] = seg_summary["labels"].apply(lambda x: any(l != 0.0 for l in x))
+    seg_summary["has_fault"] = seg_summary["labels"].apply(lambda x: any(v != 0.0 for v in x))
     seg_summary["primary_fault"] = seg_summary["labels"].apply(_get_primary_fault)
 
     fault_segments = seg_summary[seg_summary["has_fault"]].copy()
     normal_segments = seg_summary[~seg_summary["has_fault"]].copy()
 
     # Train: normal-only (temporal order)
+    # Normal class: large-n naive slicing adequate; evaluability concern is on fault classes.
     normal_seg_df = normal_segments.sort_values("start")
     normal_seg_ids = normal_seg_df[segment_col].tolist()
 
@@ -256,20 +539,31 @@ def hybrid_semisup_split(
     # Val/Test: add fault segments (temporal order, 50/50 split)
     val_fault, test_fault = [], []
 
+    fault_support_info = {}
     for fault_class in sorted(fault_segments["primary_fault"].unique()):
         class_seg_df = fault_segments[fault_segments["primary_fault"] == fault_class].sort_values(
             "start"
         )
         class_segs = class_seg_df[segment_col].tolist()
+        class_rows = class_seg_df["n_rows"].astype(int).tolist()
 
-        n = len(class_segs)
-        n_val_fault = max(1, n // 2)
+        _, val_class, test_class, split_diag = _choose_temporal_boundaries(
+            class_segs,
+            class_rows,
+            train_ratio=0.0,
+            val_ratio=0.5,
+            allow_empty_train=True,
+        )
+        if not val_class and test_class:
+            val_class = test_class[:1]
+            test_class = test_class[1:]
+        elif not test_class and val_class:
+            test_class = val_class[-1:]
+            val_class = val_class[:-1]
 
-        if n == 1:
-            test_fault.extend(class_segs)
-        else:
-            val_fault.extend(class_segs[:n_val_fault])
-            test_fault.extend(class_segs[n_val_fault:])
+        val_fault.extend(val_class)
+        test_fault.extend(test_class)
+        fault_support_info[str(fault_class)] = split_diag
 
     train_segs = train_normal
     val_segs = val_normal + val_fault
@@ -281,6 +575,13 @@ def hybrid_semisup_split(
 
     # Segment boundaries provide isolation - no global embargo needed
     dropped = pd.DataFrame()
+
+    support_report = _build_multilabel_unit_support_report(
+        df,
+        segment_col,
+        label_col,
+        {"train": train_df, "val": val_df, "test": test_df},
+    )
 
     manifest = {
         "split_type": "hybrid_semisup_temporal",
@@ -298,12 +599,193 @@ def hybrid_semisup_split(
         "train_fault_segments": 0,
         "val_fault_segments": len(val_fault),
         "test_fault_segments": len(test_fault),
+        "fault_support_diagnostics": fault_support_info,
         "train_class_counts": train_df[label_col].value_counts().sort_index().to_dict(),
         "val_class_counts": val_df[label_col].value_counts().sort_index().to_dict(),
         "test_class_counts": test_df[label_col].value_counts().sort_index().to_dict(),
+        "support_report": support_report,
         "note": "Train=normal-only (temporal). Val/Test=normal+faults. Segment boundaries provide isolation.",
     }
 
+    return SplitArtifacts(train_df, val_df, test_df, dropped, manifest)
+
+
+def blocked_temporal_split(
+    df: pd.DataFrame,
+    segment_col: str = "segment_id",
+    label_col: str = "label",
+    time_col: str = "timestamp",
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    purge_units: int = 1,
+    boundary_purge_fraction: float = 0.0,
+    unit_name: str = "days",
+) -> SplitArtifacts:
+    """Chronological blocked split with forward purge between partitions."""
+    seg_summary = _segment_summary(df, segment_col, label_col, time_col)
+    ordered_ids = seg_summary[segment_col].tolist()
+    ordered_rows = seg_summary["n_rows"].astype(int).tolist()
+
+    train_ids, val_ids, test_ids, split_diag = _choose_temporal_boundaries(
+        ordered_ids,
+        ordered_rows,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+    train_ids, val_ids, test_ids, purged_ids = _apply_forward_purge(
+        train_ids,
+        val_ids,
+        test_ids,
+        purge_units=purge_units,
+    )
+
+    train_df = df[df[segment_col].isin(train_ids)].copy()
+    val_df = df[df[segment_col].isin(val_ids)].copy()
+    test_df = df[df[segment_col].isin(test_ids)].copy()
+    dropped = df[df[segment_col].isin(purged_ids)].copy()
+
+    val_df, purged_val_rows, val_boundary_purge = _forward_fractional_boundary_purge(
+        val_df,
+        segment_col=segment_col,
+        time_col=time_col,
+        purge_fraction=boundary_purge_fraction,
+    )
+    test_df, purged_test_rows, test_boundary_purge = _forward_fractional_boundary_purge(
+        test_df,
+        segment_col=segment_col,
+        time_col=time_col,
+        purge_fraction=boundary_purge_fraction,
+    )
+    dropped = pd.concat(
+        [dropped, purged_val_rows, purged_test_rows], ignore_index=False
+    ).sort_index()
+
+    support_report = _build_multilabel_unit_support_report(
+        df,
+        segment_col,
+        label_col,
+        {"train": train_df, "val": val_df, "test": test_df},
+    )
+
+    manifest = {
+        "split_type": "blocked_temporal_purged",
+        "unit_name": unit_name,
+        "n_rows": len(df),
+        "n_segments": len(seg_summary),
+        "train_rows": len(train_df),
+        "val_rows": len(val_df),
+        "test_rows": len(test_df),
+        "dropped_rows": len(dropped),
+        "train_segments": len(train_ids),
+        "val_segments": len(val_ids),
+        "test_segments": len(test_ids),
+        "purged_segments": len(purged_ids),
+        "purge_units": purge_units,
+        "boundary_purge_fraction": boundary_purge_fraction,
+        "boundary_purge": {
+            "val": val_boundary_purge,
+            "test": test_boundary_purge,
+        },
+        "global_temporal_diagnostics": split_diag,
+        "train_class_counts": train_df[label_col].value_counts().sort_index().to_dict(),
+        "val_class_counts": val_df[label_col].value_counts().sort_index().to_dict(),
+        "test_class_counts": test_df[label_col].value_counts().sort_index().to_dict(),
+        "support_report": support_report,
+        "note": f"Pure chronological blocked split over {unit_name} with forward purge.",
+    }
+    return SplitArtifacts(train_df, val_df, test_df, dropped, manifest)
+
+
+def blocked_semisup_split(
+    df: pd.DataFrame,
+    segment_col: str = "segment_id",
+    label_col: str = "label",
+    time_col: str = "timestamp",
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    purge_units: int = 1,
+    boundary_purge_fraction: float = 0.0,
+    unit_name: str = "days",
+) -> SplitArtifacts:
+    """Blocked chronological split for semi-supervised learning with normal-only train rows."""
+    seg_summary = _segment_summary(df, segment_col, label_col, time_col)
+    ordered_ids = seg_summary[segment_col].tolist()
+    ordered_rows = seg_summary["n_rows"].astype(int).tolist()
+
+    train_ids, val_ids, test_ids, split_diag = _choose_temporal_boundaries(
+        ordered_ids,
+        ordered_rows,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+    train_ids, val_ids, test_ids, purged_ids = _apply_forward_purge(
+        train_ids,
+        val_ids,
+        test_ids,
+        purge_units=purge_units,
+    )
+
+    train_all = df[df[segment_col].isin(train_ids)].copy()
+    train_df = train_all[train_all[label_col] == 0.0].copy()
+    train_fault_rows = train_all[train_all[label_col] != 0.0].copy()
+    val_df = df[df[segment_col].isin(val_ids)].copy()
+    test_df = df[df[segment_col].isin(test_ids)].copy()
+    purged_df = df[df[segment_col].isin(purged_ids)].copy()
+
+    val_df, purged_val_rows, val_boundary_purge = _forward_fractional_boundary_purge(
+        val_df,
+        segment_col=segment_col,
+        time_col=time_col,
+        purge_fraction=boundary_purge_fraction,
+    )
+    test_df, purged_test_rows, test_boundary_purge = _forward_fractional_boundary_purge(
+        test_df,
+        segment_col=segment_col,
+        time_col=time_col,
+        purge_fraction=boundary_purge_fraction,
+    )
+    dropped = pd.concat([purged_df, train_fault_rows], ignore_index=False).sort_index()
+    dropped = pd.concat(
+        [dropped, purged_val_rows, purged_test_rows], ignore_index=False
+    ).sort_index()
+
+    support_report = _build_multilabel_unit_support_report(
+        df,
+        segment_col,
+        label_col,
+        {"train": train_df, "val": val_df, "test": test_df},
+    )
+
+    manifest = {
+        "split_type": "blocked_semisup_purged",
+        "unit_name": unit_name,
+        "n_rows": len(df),
+        "n_segments": len(seg_summary),
+        "train_rows": len(train_df),
+        "val_rows": len(val_df),
+        "test_rows": len(test_df),
+        "dropped_rows": len(dropped),
+        "train_segments": len(train_ids),
+        "val_segments": len(val_ids),
+        "test_segments": len(test_ids),
+        "purged_segments": len(purged_ids),
+        "purge_units": purge_units,
+        "boundary_purge_fraction": boundary_purge_fraction,
+        "boundary_purge": {
+            "val": val_boundary_purge,
+            "test": test_boundary_purge,
+        },
+        "train_fault_rows_removed": len(train_fault_rows),
+        "global_temporal_diagnostics": split_diag,
+        "train_class_counts": train_df[label_col].value_counts().sort_index().to_dict(),
+        "val_class_counts": val_df[label_col].value_counts().sort_index().to_dict(),
+        "test_class_counts": test_df[label_col].value_counts().sort_index().to_dict(),
+        "support_report": support_report,
+        "note": (
+            f"Pure chronological blocked split over {unit_name}; train retains only normal rows, "
+            "and boundary-adjacent downstream units are purged."
+        ),
+    }
     return SplitArtifacts(train_df, val_df, test_df, dropped, manifest)
 
 
@@ -355,7 +837,7 @@ class SegmentTimeSeriesCV:
 
     def split(
         self,
-        X,
+        x,
         y=None,
         groups=None,
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
@@ -399,7 +881,7 @@ class SegmentTimeSeriesCV:
 
             yield np.array(train_idx), np.array(val_idx)
 
-    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+    def get_n_splits(self, x=None, y=None, groups=None) -> int:
         return self.n_splits
 
 
@@ -417,7 +899,7 @@ class PerClassSegmentTimeSeriesCV:
 
     def split(
         self,
-        X,
+        x,
         y,
         groups,
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
@@ -460,5 +942,5 @@ class PerClassSegmentTimeSeriesCV:
             if val_idx_all:
                 yield np.array(train_idx_all), np.array(val_idx_all)
 
-    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+    def get_n_splits(self, x=None, y=None, groups=None) -> int:
         return self.n_splits
