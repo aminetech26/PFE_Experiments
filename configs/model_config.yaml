@@ -11,67 +11,93 @@ experiment:
 # TASK A — Anomaly Detection
 # ============================================================================
 anomaly_detection:
+  # Runtime decomposition: ml and dl (no baseline namespace)
+  ml:
+    active_model: isolation_forest
+    models:
+      isolation_forest:
+        n_estimators: [100, 200]
+        contamination: [0.03, 0.05, 0.10]
+      one_class_svm:
+        kernel: [rbf]
+        nu: [0.03, 0.05, 0.10]
+      matrix_profile:
+        window_size: [30, 60, 120]
+      bocd:
+        hazard_lambda: [100, 500]
+      switching_kalman:
+        n_states: [2, 4]
+        transition_stickiness: [0.90, 0.99]
+
+  dl:
+    active_model: lstm_autoencoder
+    models:
+      lstm_autoencoder:
+        hidden_dim: [32, 64, 128]
+        num_layers: [2, 3]
+      seq2seq_autoencoder:
+        hidden_dim: [64, 128]
+        num_layers: [2, 3]
+      ssm:
+        d_model: [64, 128]
+        n_layers: [2, 4]
+
   primary_metric: pr_auc   # PR-AUC (not ROC) due to 97% normal class
-
-  r1_models:               # Round 1: fast ML baselines
-    isolation_forest:
-      n_estimators: [100, 200]
-      contamination: [0.03, 0.05, 0.10]
-    one_class_svm:
-      kernel: [rbf]
-      nu: [0.03, 0.05, 0.10]
-
-  r2_models:               # Round 2: DL
-    lstm_autoencoder:
-      hidden_dim: [32, 64, 128]
-      num_layers: [2, 3]
-      latency_budget_ms: 50  # Jetson Nano constraint
-
   threshold_calibration: pr_curve  # use precision-recall to set alarm threshold
 
 # ============================================================================
 # TASK B — Fault Classification
 # ============================================================================
 classification:
-  active_model: lightgbm
+  # Runtime decomposition: ml and dl (no baseline namespace)
+  ml:
+    active_model: lightgbm
+    models:
+      lightgbm:
+        n_estimators: [200, 500]
+        learning_rate: [0.05, 0.1]
+        num_leaves: [31, 63]
+        subsample: [0.8, 1.0]
+        colsample_bytree: [0.7, 1.0]
+        reg_alpha: [1.0e-8, 10.0]
+        reg_lambda: [1.0e-8, 10.0]
+        min_child_samples: [10, 100]
+      xgboost:
+        n_estimators: [200, 500]
+        learning_rate: [0.03, 0.1]
+        max_depth: [4, 8]
+      catboost:
+        iterations: [300, 500]
+        depth: [6, 8]
+        learning_rate: [0.05, 0.1]
+      extra_trees:
+        n_estimators: [200, 500]
+        max_features: [sqrt, log2]
+    hpo:
+      sampler: tpe
+      direction: maximize
+      n_trials_phase1: 50
+      timeout_seconds: null
+
+  dl:
+    active_model: tcn
+    models:
+      cnn_1d:
+        filters: [32, 64, 128]
+        kernel_sizes: [3, 5]
+        n_blocks: [2, 3, 4]
+      gru:
+        hidden_dim: [64, 128, 256]
+        num_layers: [2, 3]
+      lstm:
+        hidden_dim: [64, 128, 256]
+        num_layers: [2, 3]
+      tcn:
+        n_filters: [64, 128]
+        kernel_size: [3, 5]
+        n_levels: [4, 6]
+
   primary_metric: f1_weighted
-
-  r1_models:
-    lightgbm:
-      n_estimators: [200, 500]
-      learning_rate: [0.05, 0.1]
-      num_leaves: [31, 63]
-      subsample: [0.8, 1.0]
-      colsample_bytree: [0.7, 1.0]
-      reg_alpha: [1.0e-8, 10.0]
-      reg_lambda: [1.0e-8, 10.0]
-      min_child_samples: [10, 100]
-    catboost:
-      iterations: [300, 500]
-      depth: [6, 8]
-      learning_rate: [0.05, 0.1]
-    extra_trees:
-      n_estimators: [200, 500]
-      max_features: [sqrt, log2]
-
-  r2_models:
-    cnn_1d:
-      filters: [32, 64, 128]
-      kernel_sizes: [3, 5]
-      n_blocks: [2, 3, 4]
-    gru:
-      hidden_dim: [64, 128, 256]
-      num_layers: [2, 3]
-    tcn:
-      n_filters: [64, 128]
-      kernel_size: [3, 5]
-      n_levels: [4, 6]
-
-  hpo:
-    sampler: tpe
-    direction: maximize
-    n_trials_phase1: 50
-    timeout_seconds: null
 
 # ============================================================================
 # TASK C — Dropped (April 2026)

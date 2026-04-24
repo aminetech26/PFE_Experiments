@@ -25,9 +25,9 @@ from src.data.features import (
     add_rolling_statistics_features,
     add_time_cyclic_features,
     add_wavelet_feature,
+    apply_correlation_pruning,
     apply_hygiene_pruning,
     apply_mrmr_selection,
-    apply_correlation_pruning,
     apply_vif_pruning,
     extract_tsfresh_segment_features,
     infer_base_feature_columns,
@@ -617,6 +617,10 @@ def main() -> None:
         "flags": flags,
         "task_directives": task_directives,
         "selection": {
+            "enable_hygiene_pruning": bool(flags.get("enable_hygiene_pruning", False)),
+            "enable_mrmr_selection": bool(flags.get("enable_mrmr_selection", False)),
+            "mrmr_k": int(flags.get("mrmr_k", 64)),
+            "near_constant_std": float(selection_effective.get("near_constant_std", 1e-10)),
             "corr_threshold": float(selection_effective.get("corr_threshold", 0.95)),
             "vif_threshold": float(selection_effective.get("vif_threshold", 10.0)),
             "max_vif_rows": int(selection_effective.get("max_vif_rows", 50000)),
@@ -771,7 +775,40 @@ def main() -> None:
 
     corr_dropped: list[dict] = []
     vif_dropped: list[dict] = []
+    hygiene_dropped: list[dict] = []
+    mrmr_dropped: list[dict] = []
     selected_features = candidate_features.copy()
+
+    if flags.get("enable_hygiene_pruning", False) and selected_features:
+        (
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            hygiene_dropped,
+        ) = apply_hygiene_pruning(
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            near_constant_std=float(selection_effective.get("near_constant_std", 1e-10)),
+        )
+
+    if flags.get("enable_mrmr_selection", False) and selected_features:
+        (
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            mrmr_dropped,
+        ) = apply_mrmr_selection(
+            split_frames["train"],
+            split_frames["val"],
+            split_frames["test"],
+            selected_features,
+            label_col=label_col,
+            k=int(flags.get("mrmr_k", 64)),
+        )
 
     if flags.get("enable_corr_pruning", False) and selected_features:
         (
@@ -868,6 +905,10 @@ def main() -> None:
         "effective_generation_flags": generation_flags,
         "task_directives_effective": task_directives,
         "selection": {
+            "enable_hygiene_pruning": bool(flags.get("enable_hygiene_pruning", False)),
+            "enable_mrmr_selection": bool(flags.get("enable_mrmr_selection", False)),
+            "mrmr_k": int(flags.get("mrmr_k", 64)),
+            "near_constant_std": float(selection_effective.get("near_constant_std", 1e-10)),
             "corr_threshold": float(selection_effective.get("corr_threshold", 0.95)),
             "vif_threshold": float(selection_effective.get("vif_threshold", 10.0)),
             "anchor_features": selection_effective.get("anchor_features", []),
@@ -884,6 +925,8 @@ def main() -> None:
                 "enabled": block_derived_from_predrop,
                 "blocked_features": derived_blocked_by_predrop,
             },
+            "hygiene_dropped": hygiene_dropped,
+            "mrmr_dropped": mrmr_dropped,
             "corr_dropped": corr_dropped,
             "vif_dropped": vif_dropped,
         },

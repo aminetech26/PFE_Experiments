@@ -601,7 +601,7 @@ def add_multiscale_window_features(
         logger.warning("No windows produced — check window_size vs segment lengths.")
         return pd.DataFrame(), []
 
-    _STAT_NAMES = ["mean", "std", "min", "max", "skew", "kurtosis", "rms", "zcr"]
+    stat_names = ["mean", "std", "min", "max", "skew", "kurtosis", "rms", "zcr"]
     parts: list[np.ndarray] = []
     col_names: list[str] = []
 
@@ -610,7 +610,7 @@ def add_multiscale_window_features(
         stats_w = extract_window_statistics(x_w)
         parts.append(stats_w)
         for feat in usable_cols:
-            for stat in _STAT_NAMES:
+            for stat in stat_names:
                 col_names.append(f"{feat}_w{w}_{stat}")
 
     if primary_buffer:

@@ -67,8 +67,16 @@ def midpoint_params_from_space(search_space: dict) -> dict:
                 raise ValueError(f"Unsupported HPO spec type for '{name}': {spec_type}")
             continue
 
-        if isinstance(spec, (list, tuple)) and len(spec) == 2 and all(isinstance(v, Number) for v in spec):
-            params[name] = int((spec[0] + spec[1]) / 2) if _is_int_range(list(spec)) else float((spec[0] + spec[1]) / 2)
+        if (
+            isinstance(spec, (list, tuple))
+            and len(spec) == 2
+            and all(isinstance(v, Number) for v in spec)
+        ):
+            params[name] = (
+                int((spec[0] + spec[1]) / 2)
+                if _is_int_range(list(spec))
+                else float((spec[0] + spec[1]) / 2)
+            )
             continue
 
         if isinstance(spec, (list, tuple)) and len(spec) > 0:
@@ -100,5 +108,7 @@ def run_optuna(
         callbacks=[on_trial_complete] if on_trial_complete else None,
     )
 
-    best_params = suggest_params_from_space(optuna.trial.FixedTrial(study.best_params), search_space)
+    best_params = suggest_params_from_space(
+        optuna.trial.FixedTrial(study.best_params), search_space
+    )
     return best_params, study

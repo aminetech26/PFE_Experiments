@@ -35,7 +35,7 @@ stages:
 
   # Stage 2: active dataset feature engineering
   featurize:
-    cmd: uv run python -m src.data.featurize_pipeline --dataset ${active_dataset} --profile plus_tsfresh_minimal --task classification
+    cmd: uv run python -m src.data.featurize_pipeline --dataset ${active_dataset} --profile plus_physics --task classification
     deps:
       - src/data/features.py
       - src/data/featurize_pipeline.py
@@ -46,11 +46,17 @@ stages:
 
   # Stage 3: active dataset Task B classification baseline
   train_classification:
-    cmd: uv run python -m src.models.train_classification
+    cmd: uv run python -m src.modeling.classification.ml.run
     deps:
-      - src/models/train_classification.py
-      - src/training/feature_loader.py
-      - src/training/hyperparameter_optimizer.py
+      - src/modeling/classification/ml/run.py
+      - src/modeling/classification/ml/lightgbm_trainer.py
+      - src/modeling/classification/ml/lightgbm_model.py
+      - src/modeling/classification/ml/xgboost_model.py
+      - src/modeling/classification/ml/catboost_model.py
+      - src/modeling/classification/ml/extra_trees_model.py
+      - src/modeling/common/feature_loader.py
+      - src/modeling/common/hyperparameter_optimizer.py
+      - src/modeling/common/system_resources.py
       - configs/model_config.yaml
       - data/processed/features/latest_runs.json
     metrics:

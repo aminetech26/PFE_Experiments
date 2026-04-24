@@ -1,19 +1,19 @@
 {
   "label_shuffle": {
-    "real_f1": 0.9729288975864319,
-    "mean_shuffle_f1": 0.9112246127856615,
+    "real_f1": 1.0,
+    "mean_shuffle_f1": 0.8839774621015394,
     "is_leaking": "True"
   },
   "duplicate_check": {
-    "train_samples": 48716,
-    "val_samples": 6295,
+    "train_samples": 48731,
+    "val_samples": 6298,
     "overlapping_samples": 0,
     "overlap_pct": 0.0,
     "is_leaking": false
   },
   "feature_importance": {
-    "top_feature": "Eg",
-    "top_importance": 0.16279700880472753,
+    "top_feature": "tsfresh__Eg__sum_values",
+    "top_importance": 0.47934918648304387,
     "flagged_features": {},
     "is_suspicious": "False"
   },

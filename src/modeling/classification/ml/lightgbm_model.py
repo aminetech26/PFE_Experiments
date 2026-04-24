@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import joblib
@@ -18,17 +18,26 @@ from sklearn.preprocessing import LabelEncoder, label_binarize
 from src.data.splitting import PerClassSegmentTimeSeriesCV
 from src.evaluation.leakage_checks import run_leakage_report
 from src.mlflow_setup import init_tracking
-from src.training.feature_loader import load_features_for_task
-from src.training.hyperparameter_optimizer import midpoint_params_from_space, run_optuna, suggest_params_from_space
-from src.training.system_resources import compute_thread_budget, detect_cpu_resources
+from src.modeling.common.feature_loader import load_features_for_task
+from src.modeling.common.hyperparameter_optimizer import (
+    midpoint_params_from_space,
+    run_optuna,
+    suggest_params_from_space,
+)
+from src.modeling.common.system_resources import compute_thread_budget, detect_cpu_resources
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
 DEFAULT_METRICS_PATH = PROJECT_ROOT / "experiments" / "metrics" / "classification_results.json"
-DEFAULT_LEAKAGE_REPORT_PATH = PROJECT_ROOT / "experiments" / "metrics" / "classification_leakage_report.json"
-DEFAULT_COMPARISON_RECORDS_PATH = PROJECT_ROOT / "experiments" / "metrics" / "classification_comparison_records.jsonl"
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "experiments" / "checkpoints" / "classification" / "lightgbm_model.pkl"
+DEFAULT_LEAKAGE_REPORT_PATH = (
+    PROJECT_ROOT / "experiments" / "metrics" / "classification_leakage_report.json"
+)
+DEFAULT_COMPARISON_RECORDS_PATH = (
+    PROJECT_ROOT / "experiments" / "metrics" / "classification_comparison_records.jsonl"
+)
+DEFAULT_MODEL_PATH = (
+    PROJECT_ROOT / "experiments" / "checkpoints" / "classification" / "lightgbm_model.pkl"
+)
 
 
 def _load_model_config() -> dict:
@@ -36,19 +45,49 @@ def _load_model_config() -> dict:
         return yaml.safe_load(fh)
 
 
-def _prepare_xy(df, features: list[str], label_column: str):
+def _resolve_classification_ml_config(config: dict) -> tuple[dict, dict, dict]:
+    classification_cfg = config.get("classification")
+    if not isinstance(classification_cfg, dict):
+        raise KeyError("Missing 'classification' section in model_config.yaml")
+
+    ml_cfg = classification_cfg.get("ml")
+    if not isinstance(ml_cfg, dict):
+        raise KeyError("Missing 'classification.ml' section in model_config.yaml")
+
+    active_model = ml_cfg.get("active_model")
+    if not isinstance(active_model, str) or not active_model:
+        raise KeyError("Missing non-empty 'classification.ml.active_model' in model_config.yaml")
+
+    model_spaces = ml_cfg.get("models")
+    if not isinstance(model_spaces, dict):
+        raise KeyError("Missing 'classification.ml.models' section in model_config.yaml")
+
+    hpo_cfg = ml_cfg.get("hpo")
+    if not isinstance(hpo_cfg, dict):
+        raise KeyError("Missing 'classification.ml.hpo' section in model_config.yaml")
+
+    return {"active_model": active_model, "model_spaces": model_spaces}, classification_cfg, hpo_cfg
+
+
+def _prepare_xy(
+    df: pd.DataFrame, features: list[str], label_column: str
+) -> tuple[pd.DataFrame, pd.Series]:
     missing_features = [col for col in features if col not in df.columns]
     if missing_features:
         raise KeyError(f"Missing features in dataframe: {missing_features}")
     if label_column not in df.columns:
         raise KeyError(f"Label column '{label_column}' not found in dataframe")
 
-    X = df[features]
-    y = df[label_column]
-    return X, y
+    x_data = df[features]
+    y_data = df[label_column]
+    return x_data, y_data
 
 
-def _compute_pr_auc_multiclass(y_true_encoded: np.ndarray, y_proba: np.ndarray, classes: np.ndarray) -> float:
+def _compute_pr_auc_multiclass(
+    y_true_encoded: np.ndarray,
+    y_proba: np.ndarray,
+    classes: np.ndarray,
+) -> float:
     if len(classes) <= 1:
         return float("nan")
     y_true_bin = label_binarize(y_true_encoded, classes=np.arange(len(classes)))
@@ -56,32 +95,22 @@ def _compute_pr_auc_multiclass(y_true_encoded: np.ndarray, y_proba: np.ndarray, 
 
 
 def _train_lightgbm(
-    X_train,
-    y_train,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
     params: dict,
     eval_sets: list | None = None,
-) -> tuple:
-    """Train a LightGBM classifier and optionally capture per-tree eval curves.
-
-    Args:
-        eval_sets: list of (X, y) tuples passed to eval_set. First entry is typically
-                   (X_train, y_train), second is (X_test, y_test). If None, no curves.
-
-    Returns:
-        (model, evals_result) where evals_result is a dict of {split_name: {metric: [values]}}
-        or an empty dict if eval_sets is None.
-    """
+) -> tuple[lgb.LGBMClassifier, dict]:
     evals_result: dict = {}
     model = lgb.LGBMClassifier(**params)
     if eval_sets:
         model.fit(
-            X_train,
+            x_train,
             y_train,
             eval_set=eval_sets,
             callbacks=[lgb.record_evaluation(evals_result)],
         )
     else:
-        model.fit(X_train, y_train)
+        model.fit(x_train, y_train)
     return model, evals_result
 
 
@@ -99,7 +128,7 @@ def _build_lightgbm_params(base: dict, seed: int, n_classes: int) -> dict:
     return params
 
 
-def _resolve_threading(config: dict, args) -> dict:
+def _resolve_threading(config: dict, args: argparse.Namespace) -> dict:
     threading_cfg = config.get("training", {}).get("threading", {})
     cpu = detect_cpu_resources()
 
@@ -134,42 +163,93 @@ def _resolve_threading(config: dict, args) -> dict:
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Task B classification model (LightGBM + Optuna + MLflow)")
-    parser.add_argument("--task", default="classification", choices=["classification"], help="Task name")
-    parser.add_argument("--profile", default="plus_tsfresh_minimal", help="Feature profile used by featurize stage")
+def run_lightgbm(config: dict | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Train Task B classification model (LightGBM + Optuna + MLflow)"
+    )
+    parser.add_argument(
+        "--task", default="classification", choices=["classification"], help="Task name"
+    )
+    parser.add_argument("--dataset", default="costa", help="Dataset namespace under features root")
+    parser.add_argument(
+        "--split-path",
+        default="path_a",
+        choices=["path_a", "path_b"],
+        help="Feature split path namespace",
+    )
+    parser.add_argument(
+        "--profile", default="plus_physics", help="Feature profile used by featurize stage"
+    )
     parser.add_argument("--run-dir", default=None, help="Optional explicit feature run directory")
-    parser.add_argument("--run-id", default=None, help="Optional exact feature run id under data/processed/features/<task>/runs/")
-    parser.add_argument("--metrics-path", default=str(DEFAULT_METRICS_PATH), help="Where to write metrics json")
-    parser.add_argument("--leakage-report-path", default=str(DEFAULT_LEAKAGE_REPORT_PATH), help="Where to write leakage report json")
-    parser.add_argument("--comparison-records-path", default=str(DEFAULT_COMPARISON_RECORDS_PATH), help="Where to append comparison record jsonl")
-    parser.add_argument("--model-path", default=str(DEFAULT_MODEL_PATH), help="Where to persist trained model")
-    parser.add_argument("--no-optuna", action="store_true", help="Disable Optuna and use midpoint baseline params")
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Optional exact feature run id under data/processed/features/<task>/runs/",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        default=str(DEFAULT_METRICS_PATH),
+        help="Where to write metrics json",
+    )
+    parser.add_argument(
+        "--leakage-report-path",
+        default=str(DEFAULT_LEAKAGE_REPORT_PATH),
+        help="Where to write leakage report json",
+    )
+    parser.add_argument(
+        "--comparison-records-path",
+        default=str(DEFAULT_COMPARISON_RECORDS_PATH),
+        help="Where to append comparison record jsonl",
+    )
+    parser.add_argument(
+        "--model-path", default=str(DEFAULT_MODEL_PATH), help="Where to persist trained model"
+    )
+    parser.add_argument(
+        "--no-optuna", action="store_true", help="Disable Optuna and use midpoint baseline params"
+    )
     parser.add_argument("--n-trials", type=int, default=None, help="Override Optuna trial count")
-    parser.add_argument("--threads", type=int, default=None, help="Override max model training threads")
-    parser.add_argument("--optuna-jobs", type=int, default=None, help="Override parallel Optuna trials")
-    parser.add_argument("--show-thread-plan", action="store_true", help="Print computed threading plan and exit")
+    parser.add_argument(
+        "--threads", type=int, default=None, help="Override max model training threads"
+    )
+    parser.add_argument(
+        "--optuna-jobs",
+        type=int,
+        default=None,
+        help="Override parallel Optuna trials",
+    )
+    parser.add_argument(
+        "--show-thread-plan", action="store_true", help="Print computed threading plan and exit"
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose debug logs")
-    parser.add_argument("--skip-leakage-checks", action="store_true", help="Skip leakage validation suite")
+    parser.add_argument(
+        "--skip-leakage-checks", action="store_true", help="Skip leakage validation suite"
+    )
     args = parser.parse_args()
 
     if args.verbose:
         logger.remove()
         logger.add(lambda msg: print(msg, end=""), level="DEBUG")
 
-    config = _load_model_config()
-    cls_cfg = config["classification"]
-    active_model = cls_cfg.get("active_model", "lightgbm")
+    runtime_config = config or _load_model_config()
+    runtime_cfg, _, hpo_cfg = _resolve_classification_ml_config(runtime_config)
+    active_model = str(runtime_cfg.get("active_model", "lightgbm"))
     if active_model != "lightgbm":
-        raise NotImplementedError(f"Model '{active_model}' is configured but not yet implemented in trainer")
+        raise NotImplementedError(
+            f"Model '{active_model}' is configured but this entrypoint only runs LightGBM."
+        )
 
-    lgb_space = cls_cfg["r1_models"][active_model]
-    hpo_cfg = cls_cfg.get("hpo", {})
+    model_spaces = runtime_cfg.get("model_spaces", {})
+    lgb_space = model_spaces.get("lightgbm")
+    if not lgb_space:
+        raise KeyError(
+            "Missing classification.ml.models.lightgbm search space in model_config.yaml"
+        )
+
     n_trials = args.n_trials or int(hpo_cfg.get("n_trials_phase1", 50))
-    hpo_direction = hpo_cfg.get("direction", "maximize")
-    hpo_seed = int(config.get("experiment", {}).get("seed", 42))
+    hpo_direction = str(hpo_cfg.get("direction", "maximize"))
+    hpo_seed = int(runtime_config.get("experiment", {}).get("seed", 42))
     hpo_timeout = hpo_cfg.get("timeout_seconds", None)
-    threading_plan = _resolve_threading(config, args)
+    threading_plan = _resolve_threading(runtime_config, args)
 
     if args.show_thread_plan:
         print(json.dumps(threading_plan, indent=2))
@@ -189,10 +269,12 @@ def main() -> None:
         profile=args.profile,
         run_dir=args.run_dir,
         run_id=args.run_id,
+        dataset=args.dataset,
+        split_path=args.split_path,
     )
 
     features = manifest.get("final_features", [])
-    label_column = manifest.get("label_column", "label")
+    label_column = str(manifest.get("label_column", "label"))
     effective_profile = str(manifest.get("profile") or args.profile)
     requested_profile = args.profile
     effective_run_id = resolved_run_dir.name
@@ -211,9 +293,9 @@ def main() -> None:
         len(features),
     )
 
-    X_train, y_train_raw = _prepare_xy(train_df, features, label_column)
-    X_val, y_val_raw = _prepare_xy(val_df, features, label_column)
-    X_test, y_test_raw = _prepare_xy(test_df, features, label_column)
+    x_train, y_train_raw = _prepare_xy(train_df, features, label_column)
+    x_val, y_val_raw = _prepare_xy(val_df, features, label_column)
+    x_test, y_test_raw = _prepare_xy(test_df, features, label_column)
 
     encoder = LabelEncoder()
     y_train = encoder.fit_transform(y_train_raw)
@@ -222,16 +304,15 @@ def main() -> None:
 
     logger.info(
         "Data loaded | train={} val={} test={} classes={}",
-        X_train.shape,
-        X_val.shape,
-        X_test.shape,
+        x_train.shape,
+        x_val.shape,
+        x_test.shape,
         list(encoder.classes_),
     )
 
-    # Prepare combined train+val arrays for segment-aware CV during HPO
-    X_cv = pd.concat([X_train, X_val], axis=0, ignore_index=True)
+    x_cv = pd.concat([x_train, x_val], axis=0, ignore_index=True)
     y_cv = np.concatenate([y_train, y_val])
-    n_cv_folds = int(config.get("experiment", {}).get("n_cv_folds", 3))
+    n_cv_folds = int(runtime_config.get("experiment", {}).get("n_cv_folds", 3))
     if "segment_id" in train_df.columns:
         segments_cv = pd.concat(
             [train_df["segment_id"], val_df["segment_id"]], ignore_index=True
@@ -239,21 +320,22 @@ def main() -> None:
         logger.info(
             "Segment-aware CV enabled | n_splits={} combined_samples={}",
             n_cv_folds,
-            len(X_cv),
+            len(x_cv),
         )
     else:
         segments_cv = None
-        logger.warning("segment_id column not found — falling back to fixed holdout for HPO")
+        logger.warning("segment_id column not found - falling back to fixed holdout for HPO")
 
     init_tracking("classification")
-    run_name = f"classification_lightgbm_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"classification_lightgbm_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
 
     with mlflow.start_run(run_name=run_name):
         logger.info("MLflow run started | run_name={}", run_name)
         mlflow.set_tags(
             {
                 "task": args.task,
-                "model_family": "lightgbm",
+                "model_family": "classification_ml",
+                "model_name": "lightgbm",
                 "feature_profile": effective_profile,
                 "feature_profile_requested": requested_profile,
                 "feature_run_id": effective_run_id,
@@ -265,6 +347,8 @@ def main() -> None:
         mlflow.log_params(
             {
                 "task": args.task,
+                "dataset": args.dataset,
+                "split_path": args.split_path,
                 "feature_profile": effective_profile,
                 "feature_profile_requested": requested_profile,
                 "feature_run_id": effective_run_id,
@@ -275,18 +359,20 @@ def main() -> None:
                 "optuna_n_trials_requested": int(n_trials),
                 "optuna_n_trials_executed": 0 if args.no_optuna else int(n_trials),
                 "cpu_logical_cores": int(threading_plan["cpu_logical_cores"]),
-                "cpu_physical_cores": int(threading_plan["cpu_physical_cores"]) if threading_plan["cpu_physical_cores"] else -1,
+                "cpu_physical_cores": int(threading_plan["cpu_physical_cores"])
+                if threading_plan["cpu_physical_cores"]
+                else -1,
                 "thread_budget": int(threading_plan["thread_budget"]),
                 "optuna_parallel_trials": int(threading_plan["optuna_parallel_trials"]),
                 "threads_per_trial": int(threading_plan["threads_per_trial"]),
-                "cv_strategy": "segment_aware_per_class" if segments_cv is not None else "fixed_holdout",
+                "cv_strategy": "segment_aware_per_class"
+                if segments_cv is not None
+                else "fixed_holdout",
                 "cv_n_splits": n_cv_folds if segments_cv is not None else 1,
             }
         )
 
-        best_params: dict
         study = None
-
         if args.no_optuna:
             best_params = _build_lightgbm_params(
                 midpoint_params_from_space(lgb_space),
@@ -297,37 +383,47 @@ def main() -> None:
             best_params["num_threads"] = int(threading_plan["thread_budget"])
             logger.info("Optuna disabled | using midpoint params")
         else:
+
             def objective(trial):
                 trial_params = suggest_params_from_space(trial, lgb_space)
-                model_params = _build_lightgbm_params(trial_params, seed=hpo_seed, n_classes=len(encoder.classes_))
+                model_params = _build_lightgbm_params(
+                    trial_params,
+                    seed=hpo_seed,
+                    n_classes=len(encoder.classes_),
+                )
                 model_params["n_jobs"] = int(threading_plan["threads_per_trial"])
                 model_params["num_threads"] = int(threading_plan["threads_per_trial"])
 
                 if segments_cv is not None:
-                    # Segment-aware temporal CV: respects segment boundaries and class balance
                     cv = PerClassSegmentTimeSeriesCV(n_splits=n_cv_folds, min_train_segments=1)
                     fold_scores = []
-                    for fold_train_idx, fold_val_idx in cv.split(X_cv, y_cv, groups=segments_cv):
-                        m = lgb.LGBMClassifier(**model_params)
-                        m.fit(X_cv.iloc[fold_train_idx], y_cv[fold_train_idx])
-                        fold_pred = m.predict(X_cv.iloc[fold_val_idx])
+                    for fold_train_idx, fold_val_idx in cv.split(x_cv, y_cv, groups=segments_cv):
+                        model = lgb.LGBMClassifier(**model_params)
+                        model.fit(x_cv.iloc[fold_train_idx], y_cv[fold_train_idx])
+                        fold_pred = model.predict(x_cv.iloc[fold_val_idx])
                         fold_scores.append(
-                            float(f1_score(y_cv[fold_val_idx], fold_pred, average="weighted", zero_division=0))
+                            float(
+                                f1_score(
+                                    y_cv[fold_val_idx],
+                                    fold_pred,
+                                    average="weighted",
+                                    zero_division=0,
+                                )
+                            )
                         )
                     return float(np.mean(fold_scores)) if fold_scores else 0.0
-                else:
-                    # Fallback: fixed holdout (no segment_id available)
-                    model = lgb.LGBMClassifier(**model_params)
-                    model.fit(X_train, y_train)
-                    val_pred = model.predict(X_val)
-                    return float(f1_score(y_val, val_pred, average="weighted"))
 
-            def on_trial_complete(study, trial):
+                model = lgb.LGBMClassifier(**model_params)
+                model.fit(x_train, y_train)
+                val_pred = model.predict(x_val)
+                return float(f1_score(y_val, val_pred, average="weighted"))
+
+            def on_trial_complete(study_obj, trial_obj):
                 logger.info(
                     "Optuna trial complete | number={} value={:.6f} best={:.6f}",
-                    trial.number,
-                    float(trial.value) if trial.value is not None else float("nan"),
-                    float(study.best_value),
+                    trial_obj.number,
+                    float(trial_obj.value) if trial_obj.value is not None else float("nan"),
+                    float(study_obj.best_value),
                 )
 
             best_base_params, study = run_optuna(
@@ -340,6 +436,7 @@ def main() -> None:
                 timeout_seconds=int(hpo_timeout) if hpo_timeout is not None else None,
                 on_trial_complete=on_trial_complete,
             )
+
             best_params = _build_lightgbm_params(
                 best_base_params,
                 seed=hpo_seed,
@@ -348,27 +445,35 @@ def main() -> None:
             best_params["n_jobs"] = int(threading_plan["thread_budget"])
             best_params["num_threads"] = int(threading_plan["thread_budget"])
             mlflow.log_metric("optuna_best_val_f1_weighted", float(study.best_value))
-            mlflow.log_params({f"best_{k}": v for k, v in best_params.items() if isinstance(v, (str, int, float, bool))})
+            mlflow.log_params(
+                {
+                    f"best_{k}": v
+                    for k, v in best_params.items()
+                    if isinstance(v, (str, int, float, bool))
+                }
+            )
             logger.info("Optuna complete | best_val_f1_weighted={:.6f}", float(study.best_value))
 
-            trials_artifact = PROJECT_ROOT / "experiments" / "metrics" / "classification_optuna_trials.csv"
+            trials_artifact = (
+                PROJECT_ROOT / "experiments" / "metrics" / "classification_optuna_trials.csv"
+            )
             trials_artifact.parent.mkdir(parents=True, exist_ok=True)
             study.trials_dataframe().to_csv(trials_artifact, index=False)
             mlflow.log_artifact(str(trials_artifact))
 
-        X_train_final = pd.concat([X_train, X_val], axis=0, ignore_index=True)
+        x_train_final = pd.concat([x_train, x_val], axis=0, ignore_index=True)
         y_train_final = np.concatenate([y_train, y_val])
 
         logger.info("Training final model | params={}", best_params)
         final_model, evals_result = _train_lightgbm(
-            X_train_final,
+            x_train_final,
             y_train_final,
             params=best_params,
-            eval_sets=[(X_train_final, y_train_final), (X_test, y_test)],
+            eval_sets=[(x_train_final, y_train_final), (x_test, y_test)],
         )
 
-        test_pred = final_model.predict(X_test)
-        test_pred_proba = final_model.predict_proba(X_test)
+        test_pred = final_model.predict(x_test)
+        test_pred_proba = final_model.predict_proba(x_test)
 
         accuracy = float(accuracy_score(y_test, test_pred))
         f1_weighted = float(f1_score(y_test, test_pred, average="weighted"))
@@ -385,9 +490,11 @@ def main() -> None:
 
         metrics_payload = {
             "task": args.task,
+            "dataset": args.dataset,
+            "split_path": args.split_path,
             "model": "lightgbm",
             "run_name": run_name,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": datetime.now(UTC).isoformat(),
             "feature_profile": effective_profile,
             "feature_profile_requested": requested_profile,
             "feature_run_id": effective_run_id,
@@ -414,9 +521,9 @@ def main() -> None:
         if not args.skip_leakage_checks:
             leakage_payload = run_leakage_report(
                 model=final_model,
-                X_train=X_train,
+                X_train=x_train,
                 y_train=y_train,
-                X_val=X_val,
+                X_val=x_val,
                 y_val=y_val,
                 feature_names=features,
                 df_train=train_df,
@@ -429,7 +536,10 @@ def main() -> None:
 
         leakage_report_path = Path(args.leakage_report_path)
         leakage_report_path.parent.mkdir(parents=True, exist_ok=True)
-        leakage_report_path.write_text(json.dumps(leakage_payload, indent=2, default=str), encoding="utf-8")
+        leakage_report_path.write_text(
+            json.dumps(leakage_payload, indent=2, default=str),
+            encoding="utf-8",
+        )
 
         model_path = Path(args.model_path)
         model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -454,46 +564,49 @@ def main() -> None:
         if not np.isnan(pr_auc_weighted):
             mlflow.log_metric("test_pr_auc_weighted", pr_auc_weighted)
 
-        # Log per-tree training curves as step metrics and JSON artifact
         if evals_result:
-            split_names = list(evals_result.keys())  # e.g. ["valid_0", "valid_1"]
+            split_names = list(evals_result.keys())
             first_split_metrics = evals_result.get(split_names[0], {})
-            curve_metric = next(iter(first_split_metrics.keys()), None)  # e.g. "multi_logloss"
+            curve_metric = next(iter(first_split_metrics.keys()), None)
             if curve_metric:
                 split_labels = ["train", "test"][: len(split_names)]
                 all_curves: dict[str, list] = {
-                    label: evals_result[sn].get(curve_metric, [])
-                    for label, sn in zip(split_labels, split_names)
+                    label: evals_result[split_name].get(curve_metric, [])
+                    for label, split_name in zip(split_labels, split_names)
                 }
                 n_steps = max(len(v) for v in all_curves.values()) if all_curves else 0
-                log_interval = max(1, n_steps // 100)  # at most 100 logged points per metric
+                log_interval = max(1, n_steps // 100)
                 for step in range(0, n_steps, log_interval):
                     for label, vals in all_curves.items():
                         if step < len(vals):
-                            mlflow.log_metric(f"final_{label}_{curve_metric}", vals[step], step=step)
-                curves_artifact_path = PROJECT_ROOT / "experiments" / "metrics" / "classification_training_curves.json"
-                curves_artifact_path.parent.mkdir(parents=True, exist_ok=True)
-                curves_artifact_path.write_text(json.dumps(evals_result, default=str), encoding="utf-8")
-                mlflow.log_artifact(str(curves_artifact_path))
-                logger.info(
-                    "Training curves logged | metric={} n_trees={} splits={}",
-                    curve_metric,
-                    n_steps,
-                    split_labels,
+                            mlflow.log_metric(
+                                f"final_{label}_{curve_metric}", vals[step], step=step
+                            )
+                curves_artifact_path = (
+                    PROJECT_ROOT / "experiments" / "metrics" / "classification_training_curves.json"
                 )
+                curves_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                curves_artifact_path.write_text(
+                    json.dumps(evals_result, default=str), encoding="utf-8"
+                )
+                mlflow.log_artifact(str(curves_artifact_path))
 
         mlflow.log_artifact(str(metrics_path))
         mlflow.log_artifact(str(leakage_report_path))
         mlflow.log_artifact(str(model_path))
         mlflow.log_dict(manifest, "features_manifest.json")
         mlflow.log_dict(threading_plan, "threading_plan.json")
-        mlflow.log_metric("leakage_flag_count", float(len(leakage_payload.get("leakage_flags", []))))
+        mlflow.log_metric(
+            "leakage_flag_count", float(len(leakage_payload.get("leakage_flags", [])))
+        )
         mlflow.log_param("leakage_checks_enabled", not bool(args.skip_leakage_checks))
 
         comparison_record = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": datetime.now(UTC).isoformat(),
             "run_name": run_name,
             "task": args.task,
+            "dataset": args.dataset,
+            "split_path": args.split_path,
             "model": "lightgbm",
             "feature_profile": effective_profile,
             "feature_profile_requested": requested_profile,
@@ -526,7 +639,3 @@ def main() -> None:
             metrics_path,
             model_path,
         )
-
-
-if __name__ == "__main__":
-    main()

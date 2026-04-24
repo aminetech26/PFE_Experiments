@@ -1,11 +1,14 @@
 {
   "task": "classification",
   "model": "lightgbm",
-  "run_name": "classification_lightgbm_20260408_233517",
-  "timestamp_utc": "2026-04-08T23:35:20.564687+00:00",
+  "run_name": "classification_lightgbm_20260423_233854",
+  "timestamp_utc": "2026-04-23T23:38:59.139126+00:00",
   "feature_profile": "plus_tsfresh_minimal",
-  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\classification\\runs\\plus_tsfresh_minimal__630d00adb1bb",
-  "feature_count": 31,
+  "feature_profile_requested": "plus_physics",
+  "feature_run_id": "plus_tsfresh_minimal__b1aea965f90c",
+  "feature_run_selection_mode": "profile_latest",
+  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\classification\\runs\\plus_tsfresh_minimal__b1aea965f90c",
+  "feature_count": 32,
   "n_classes": 3,
   "classes": [
     "3.1",

@@ -1,33 +1,17 @@
-"""
-Shared MLflow initialisation.
-Call once at the top of any script or notebook before logging anything.
+"""Shared MLflow initialization for active thesis tasks."""
 
-Usage (local or Colab):
-    from src.mlflow_setup import init_tracking
-    init_tracking()  # sets up all 3 experiments; returns the experiment names
-"""
 from __future__ import annotations
 
-from src.training.experiment_tracker import setup_mlflow
+from src.modeling.common.experiment_tracker import setup_mlflow
 
 EXPERIMENTS = {
     "anomaly": "Task_A_Anomaly",
     "classification": "Task_B_Classification",
-    "forecasting": "Task_C_Forecasting",
 }
 
 
 def init_tracking(task: str | None = None) -> str:
-    """
-    Initialise MLflow → DagsHub and set the active experiment.
-
-    Args:
-        task: one of 'anomaly', 'classification', 'forecasting'.
-              If None, defaults to 'classification'.
-
-    Returns:
-        The MLflow experiment name that was set.
-    """
+    """Initialize MLflow -> DagsHub and set the active experiment."""
     if task is None:
         task = "classification"
 

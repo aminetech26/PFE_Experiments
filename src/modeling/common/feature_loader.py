@@ -5,24 +5,36 @@ from pathlib import Path
 
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-FEATURES_ROOT = PROJECT_ROOT / "data" / "processed" / "features"
+
+def _features_root(dataset: str, split_path: str) -> Path:
+    root = PROJECT_ROOT / "data" / "processed" / "features" / dataset
+    if split_path == "path_b":
+        root = root / "path_b"
+    return root
 
 
 def _normalize_relative_path(relative_path: str) -> Path:
-    # latest_runs.json may contain Windows-style separators; normalize cross-platform.
     return Path(relative_path.replace("\\", "/"))
 
 
-def resolve_run_dir(task: str, profile: str | None = None, run_dir: str | None = None) -> Path:
+def resolve_run_dir(
+    task: str,
+    profile: str | None = None,
+    run_dir: str | None = None,
+    dataset: str = "costa",
+    split_path: str = "path_a",
+) -> Path:
+    features_root = _features_root(dataset=dataset, split_path=split_path)
+
     if run_dir:
         path = Path(run_dir)
         if not path.is_absolute():
             path = PROJECT_ROOT / path
         return path
 
-    latest_runs_path = FEATURES_ROOT / "latest_runs.json"
+    latest_runs_path = features_root / "latest_runs.json"
     if not latest_runs_path.exists():
         raise FileNotFoundError(f"Missing latest runs file: {latest_runs_path}")
 
@@ -32,7 +44,7 @@ def resolve_run_dir(task: str, profile: str | None = None, run_dir: str | None =
         by_task_profile = latest_payload.get("latest_by_task_profile", {})
         rel = by_task_profile.get(task, {}).get(profile)
         if rel:
-            return FEATURES_ROOT / _normalize_relative_path(rel)
+            return features_root / _normalize_relative_path(rel)
 
     by_task = latest_payload.get("latest_by_task", {})
     rel = by_task.get(task)
@@ -43,11 +55,17 @@ def resolve_run_dir(task: str, profile: str | None = None, run_dir: str | None =
             + f" in {latest_runs_path}"
         )
 
-    return FEATURES_ROOT / _normalize_relative_path(rel)
+    return features_root / _normalize_relative_path(rel)
 
 
-def resolve_run_dir_by_id(task: str, run_id: str) -> Path:
-    run_path = FEATURES_ROOT / task / "runs" / run_id
+def resolve_run_dir_by_id(
+    task: str,
+    run_id: str,
+    dataset: str = "costa",
+    split_path: str = "path_a",
+) -> Path:
+    features_root = _features_root(dataset=dataset, split_path=split_path)
+    run_path = features_root / task / "runs" / run_id
     if not run_path.exists():
         raise FileNotFoundError(f"Feature run id not found: {run_path}")
     return run_path
@@ -58,11 +76,24 @@ def load_features_for_task(
     profile: str | None = None,
     run_dir: str | None = None,
     run_id: str | None = None,
+    dataset: str = "costa",
+    split_path: str = "path_a",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict, Path]:
     if run_id:
-        resolved_run_dir = resolve_run_dir_by_id(task=task, run_id=run_id)
+        resolved_run_dir = resolve_run_dir_by_id(
+            task=task,
+            run_id=run_id,
+            dataset=dataset,
+            split_path=split_path,
+        )
     else:
-        resolved_run_dir = resolve_run_dir(task=task, profile=profile, run_dir=run_dir)
+        resolved_run_dir = resolve_run_dir(
+            task=task,
+            profile=profile,
+            run_dir=run_dir,
+            dataset=dataset,
+            split_path=split_path,
+        )
 
     manifest_path = resolved_run_dir / "features_manifest.json"
     if not manifest_path.exists():
