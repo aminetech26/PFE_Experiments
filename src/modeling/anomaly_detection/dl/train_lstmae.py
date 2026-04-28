@@ -11,6 +11,12 @@ Performs:
 """
 
 import argparse
+import os
+
+# Fix matplotlib backend in headless/Colab environments before any keras imports
+os.environ['MPLBACKEND'] = 'Agg'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 import json
 import numpy as np
 import pandas as pd
