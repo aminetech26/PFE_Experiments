@@ -64,3 +64,16 @@ stages:
           cache: false
     outs:
       - experiments/checkpoints/classification/lightgbm_model.pkl
+
+  # Stage 4: T-GNN Anomaly Detection for Costa
+  train_tgnn:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_tgnn --epochs 50 --batch-size 64
+    deps:
+      - src/modeling/anomaly_detection/dl/tgnn.py
+      - src/modeling/anomaly_detection/dl/train_tgnn.py
+      - data/interim/ingestion/costa/
+    metrics:
+      - experiments/metrics/tgnn_results.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/tgnn/tgnn_best.pt
