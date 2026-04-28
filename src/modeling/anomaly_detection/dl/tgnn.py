@@ -371,8 +371,6 @@ def load_costa_for_tgnn(
     input_nodes: list[str] | None = None,
     target_col: str = COSTA_TARGET_COL,
     daytime_irr_threshold: float = 50.0,
-    source: str = "local",
-    gdrive_target_dir: str = "/content/gdrive_data"
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """
     Load Costa parquet and prepare arrays for T-GNN training.
@@ -389,10 +387,6 @@ def load_costa_for_tgnn(
         Column name for the prediction target.
     daytime_irr_threshold : float
         Minimum irradiance to keep (filters nighttime rows).
-    source : str, optional
-        Data source ("local" or "gdrive").
-    gdrive_target_dir : str, optional
-        Target directory to load data from when source="gdrive".
 
     Returns
     -------
@@ -404,43 +398,13 @@ def load_costa_for_tgnn(
         Contains scaler parameters, column info, label array for anomaly detection.
     """
     import pandas as pd
-    import os
-    import shutil
 
     if input_nodes is None:
         input_nodes = COSTA_INPUT_NODES.copy()
 
-    if source == "gdrive":
-        try:
-            from google.colab import drive
-            drive.mount('/content/drive')
-            print("Google Drive mounted successfully")
-            
-            # Create a target folder
-            os.makedirs(gdrive_target_dir, exist_ok=True)
-            
-            # Try to infer default Google Drive path if none provided
-            if parquet_path is None:
-                # Default location in Drive corresponding to local setup
-                drive_file_path = "/content/drive/MyDrive/GitHub/PFE_Experiments/data/interim/ingestion/costa/costa_merged.parquet"
-            else:
-                drive_file_path = str(parquet_path)
-                
-            local_target = os.path.join(gdrive_target_dir, "costa_merged.parquet")
-            
-            if os.path.exists(drive_file_path):
-                print(f"Copying file from Google Drive to {local_target}...")
-                shutil.copy2(drive_file_path, local_target)
-                parquet_path = Path(local_target)
-            else:
-                raise FileNotFoundError(f"Google Drive file not found: {drive_file_path}")
-        except ImportError:
-            print("Warning: google.colab module is not available. Falling back to local data source.")
-            source = "local"
-
-    if source == "local" and parquet_path is None:
-        project_root = Path(__file__).resolve().parents[3]
-        # Adjusted project_root path to match parents[3] from src/modeling/anomaly_detection/dl/tgnn.py
+    if parquet_path is None:
+        project_root = Path(__file__).resolve().parents[4]
+        # Build path to data/interim/ingestion/costa/costa_merged.parquet based on project root
         parquet_path = project_root / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
 
     parquet_path = Path(parquet_path)
