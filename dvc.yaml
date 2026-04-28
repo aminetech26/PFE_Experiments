@@ -77,3 +77,25 @@ stages:
           cache: false
     outs:
       - experiments/checkpoints/tgnn/tgnn_best.pt
+
+  # Stage 5: LSTM-AE Preprocessing
+  preprocess_lstmae:
+    cmd: uv run python -m src.data.preprocess_lstmae
+    deps:
+      - src/data/preprocess_lstmae.py
+      - data/interim/ingestion/costa/costa_merged.parquet
+    outs:
+      - data/processed/preprocessed/costa/lstmae_preprocessed.parquet
+
+  # Stage 6: LSTM-AE Anomaly Detection
+  train_lstmae:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_lstmae
+    deps:
+      - src/modeling/anomaly_detection/dl/lstm_ae_model.py
+      - src/modeling/anomaly_detection/dl/train_lstmae.py
+      - data/processed/preprocessed/costa/lstmae_preprocessed.parquet
+    metrics:
+      - experiments/metrics/lstmae_results.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/lstmae/lstmae_best.keras
