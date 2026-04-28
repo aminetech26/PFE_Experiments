@@ -12,6 +12,7 @@ dependencies = [
     "xgboost>=2.0",
     "lightgbm>=4.3",
     "catboost>=1.2",
+
     # Data Engineering
     "pandas>=2.2",
     "polars>=0.20",
@@ -19,32 +20,37 @@ dependencies = [
     "pyarrow>=16.0",
     "openpyxl>=3.1",
     "xlrd>=2.0",
+
     # Feature Engineering & Signal Processing
     "tsfresh>=0.20",
     "scipy>=1.13",
     "PyWavelets>=1.6",
     "EMD-signal>=1.6",
     "stumpy>=1.13",
+
     # Experiment Tracking & Reproducibility
     "mlflow>=2.13",
     "dagshub>=0.3",
     "dvc>=3.50",
     "optuna>=3.6",
     "pyyaml>=6.0",
+
     # Statistical Testing
     "statsmodels>=0.14",
     "pingouin>=0.5",
+
     # Online Learning / Drift Detection
     "river>=0.21",
+
     # Visualization
     "matplotlib>=3.9",
     "seaborn>=0.13",
     "plotly>=5.22",
+
     # Utilities
     "tqdm>=4.66",
     "loguru>=0.7",
     "python-dotenv>=1.0",
-    "tensorflow>=2.21.0",
 ]
 
 [project.optional-dependencies]

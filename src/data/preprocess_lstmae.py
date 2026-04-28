@@ -83,7 +83,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output", 
         type=str, 
-        default="data/processed/preprocessed/costa/lstmae_preprocessed.parquet",
+        default="data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet",
         help="Path to output preprocessed parquet"
     )
     args = parser.parse_args()

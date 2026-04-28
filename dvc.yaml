@@ -85,7 +85,7 @@ stages:
       - src/data/preprocess_lstmae.py
       - data/interim/ingestion/costa/costa_merged.parquet
     outs:
-      - data/processed/preprocessed/costa/lstmae_preprocessed.parquet
+      - data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
 
   # Stage 6: LSTM-AE Anomaly Detection
   train_lstmae:
@@ -93,7 +93,7 @@ stages:
     deps:
       - src/modeling/anomaly_detection/dl/lstm_ae_model.py
       - src/modeling/anomaly_detection/dl/train_lstmae.py
-      - data/processed/preprocessed/costa/lstmae_preprocessed.parquet
+      - data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
     metrics:
       - experiments/metrics/lstmae_results.json:
           cache: false

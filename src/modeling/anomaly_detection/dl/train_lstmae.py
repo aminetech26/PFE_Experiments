@@ -54,7 +54,7 @@ def main():
     parser.add_argument(
         "--parquet-path",
         type=str,
-        default=str(PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa" / "lstmae_preprocessed.parquet"),
+        default=str(PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_lstmae" / "lstmae_preprocessed.parquet"),
         help="Path to LSTM-AE preprocessed parquet dataset"
     )
     parser.add_argument("--epochs", type=int, default=20, help="Epochs per grid search trial")
