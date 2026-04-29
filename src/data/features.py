@@ -16,8 +16,6 @@ from collections.abc import Iterable
 import numpy as np
 import pandas as pd
 from loguru import logger
-from scipy.fft import rfft
-from scipy.signal import welch
 
 # ============================================================================
 # BASIC HELPERS
@@ -496,23 +494,6 @@ def extract_window_statistics(x: np.ndarray) -> np.ndarray:
     return np.column_stack(features).astype(np.float32)
 
 
-def extract_fft_features(x: np.ndarray, n_top_freqs: int = 5) -> np.ndarray:
-    """
-    Extract top-N spectral power features from each window and channel.
-    Input: (n_windows, window_size, n_features)
-    Output: (n_windows, n_features * n_top_freqs)
-    """
-    _, _, f = x.shape
-    results = []
-    for i in range(f):
-        ch = x[:, :, i]
-        fft_mag = np.abs(rfft(ch, axis=1))[:, 1:]
-        idx = np.argsort(fft_mag, axis=1)[:, -n_top_freqs:]
-        top_mags = np.take_along_axis(fft_mag, idx, axis=1)
-        results.append(top_mags)
-    return np.concatenate(results, axis=1).astype(np.float32)
-
-
 def add_multiscale_window_features(
     df: pd.DataFrame,
     feature_cols: list[str],
@@ -521,11 +502,6 @@ def add_multiscale_window_features(
     label_col: str | None = None,
     segment_col: str = "segment_id",
     fs: float = 1.0,
-    # per-method spectral flags
-    enable_fft: bool = False,
-    n_top_freqs: int = 5,
-    enable_psd: bool = False,
-    psd_n_bands: int = 5,
     enable_wpd: bool = False,
     wpd_level: int = 3,
     wpd_wavelet: str = "db4",
@@ -536,7 +512,7 @@ def add_multiscale_window_features(
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Collapse a row-aligned DataFrame into fixed-size windows with multi-scale statistics
-    and optional spectral features (PSD, WPD, CEEMDAN — Path B only).
+    and optional spectral features (WPD, CEEMDAN — Path B only).
 
     The largest value in window_sizes is the primary window (determines row count and stride).
     Each smaller scale takes the last `w` samples of the primary window — nested sub-windows.
@@ -555,17 +531,12 @@ def add_multiscale_window_features(
         return pd.DataFrame(), []
 
     _spectral_ok = fs >= spectral_min_fs
-    if not _spectral_ok and any([enable_fft, enable_psd, enable_wpd, enable_ceemdan]):
+    if not _spectral_ok and any([enable_wpd, enable_ceemdan]):
         logger.warning(
             f"Sampling rate {fs} Hz < spectral_min_fs {spectral_min_fs} Hz — "
             "skipping all spectral features for this dataset."
         )
-        enable_fft = enable_psd = enable_wpd = enable_ceemdan = False
-
-    # PSD subsumes raw FFT top-N — disable FFT if PSD is active
-    if enable_psd and enable_fft:
-        logger.info("PSD enabled: auto-disabling raw FFT top-N (PSD subsumes it).")
-        enable_fft = False
+        enable_wpd = enable_ceemdan = False
 
     groups: list[tuple] = (
         list(df.groupby(segment_col, sort=False)) if segment_col in df.columns else [(None, df)]
@@ -589,7 +560,7 @@ def add_multiscale_window_features(
         for w in window_sizes_sorted:
             scale_buffers[w].append(primary_windows[:, primary - w :, :])
 
-        if any([enable_fft, enable_psd, enable_wpd, enable_ceemdan]):
+        if any([enable_wpd, enable_ceemdan]):
             primary_buffer.append(primary_windows)
 
         if labels is not None:
@@ -615,20 +586,6 @@ def add_multiscale_window_features(
 
     if primary_buffer:
         x_primary = np.concatenate(primary_buffer, axis=0)
-
-        if enable_fft:
-            fft_feats = extract_fft_features(x_primary, n_top_freqs)
-            parts.append(fft_feats)
-            for feat in usable_cols:
-                for k in range(1, n_top_freqs + 1):
-                    col_names.append(f"{feat}_fft_top{k}")
-
-        if enable_psd:
-            psd_feats = extract_psd_features(x_primary, fs=fs, n_bands=psd_n_bands)
-            parts.append(psd_feats)
-            for feat in usable_cols:
-                for b in range(psd_n_bands):
-                    col_names.append(f"{feat}_psd_band{b}")
 
         if enable_wpd:
             wpd_feats = extract_wpd_features(x_primary, wavelet=wpd_wavelet, level=wpd_level)
@@ -658,39 +615,6 @@ def add_multiscale_window_features(
         result_df[label_col] = label_buffer
 
     return result_df, col_names
-
-
-# ============================================================================
-# SPECTRAL FEATURES (Path B only)
-# ============================================================================
-
-
-def extract_psd_features(
-    x: np.ndarray,
-    fs: float = 1.0,
-    n_bands: int = 5,
-) -> np.ndarray:
-    """
-    Welch PSD band energies per window and channel.
-
-    Input:  (n_windows, window_size, n_features)
-    Output: (n_windows, n_features * n_bands)
-
-    Each channel's PSD is divided into n_bands equal-width bins across [0, Nyquist].
-    The feature per band is the integral (sum) of PSD in that bin.
-    """
-    n_wins, win_size, n_feats = x.shape
-    nperseg = min(win_size, max(8, win_size // 4))
-    results = []
-    for i in range(n_feats):
-        ch = x[:, :, i]  # (n_wins, win_size)
-        freqs, psd_all = welch(ch, fs=fs, nperseg=nperseg, axis=-1)  # psd_all: (n_wins, n_freqs)
-        bin_edges = np.linspace(0, len(freqs), n_bands + 1, dtype=int)
-        band_energies = np.zeros((n_wins, n_bands), dtype=np.float32)
-        for b in range(n_bands):
-            band_energies[:, b] = psd_all[:, bin_edges[b] : bin_edges[b + 1]].sum(axis=1)
-        results.append(band_energies)
-    return np.hstack(results).astype(np.float32)
 
 
 def extract_wpd_features(

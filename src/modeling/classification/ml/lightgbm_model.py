@@ -249,6 +249,11 @@ def run_lightgbm(config: dict | None = None) -> None:
     hpo_direction = str(hpo_cfg.get("direction", "maximize"))
     hpo_seed = int(runtime_config.get("experiment", {}).get("seed", 42))
     hpo_timeout = hpo_cfg.get("timeout_seconds", None)
+    hpo_sampler = str(hpo_cfg.get("sampler", "tpe"))
+    hpo_pruner = hpo_cfg.get("pruner", "none")
+    hpo_storage = hpo_cfg.get("storage_url", None)
+    hpo_study_prefix = str(hpo_cfg.get("study_name_prefix", "classification_lightgbm"))
+    hpo_validation_mode = str(hpo_cfg.get("validation_mode", "holdout")).lower()
     threading_plan = _resolve_threading(runtime_config, args)
 
     if args.show_thread_plan:
@@ -313,7 +318,8 @@ def run_lightgbm(config: dict | None = None) -> None:
     x_cv = pd.concat([x_train, x_val], axis=0, ignore_index=True)
     y_cv = np.concatenate([y_train, y_val])
     n_cv_folds = int(runtime_config.get("experiment", {}).get("n_cv_folds", 3))
-    if "segment_id" in train_df.columns:
+    use_segment_cv = hpo_validation_mode == "segment_temporal_cv"
+    if use_segment_cv and "segment_id" in train_df.columns:
         segments_cv = pd.concat(
             [train_df["segment_id"], val_df["segment_id"]], ignore_index=True
         ).values
@@ -322,9 +328,13 @@ def run_lightgbm(config: dict | None = None) -> None:
             n_cv_folds,
             len(x_cv),
         )
+    elif use_segment_cv:
+        segments_cv = None
+        logger.warning(
+            "HPO validation_mode=segment_temporal_cv but segment_id is missing; falling back to holdout"
+        )
     else:
         segments_cv = None
-        logger.warning("segment_id column not found - falling back to fixed holdout for HPO")
 
     init_tracking("classification")
     run_name = f"classification_lightgbm_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
@@ -358,6 +368,9 @@ def run_lightgbm(config: dict | None = None) -> None:
                 "optuna_enabled": not args.no_optuna,
                 "optuna_n_trials_requested": int(n_trials),
                 "optuna_n_trials_executed": 0 if args.no_optuna else int(n_trials),
+                "optuna_sampler": hpo_sampler,
+                "optuna_pruner": str(hpo_pruner),
+                "optuna_storage_enabled": bool(hpo_storage),
                 "cpu_logical_cores": int(threading_plan["cpu_logical_cores"]),
                 "cpu_physical_cores": int(threading_plan["cpu_physical_cores"])
                 if threading_plan["cpu_physical_cores"]
@@ -365,9 +378,7 @@ def run_lightgbm(config: dict | None = None) -> None:
                 "thread_budget": int(threading_plan["thread_budget"]),
                 "optuna_parallel_trials": int(threading_plan["optuna_parallel_trials"]),
                 "threads_per_trial": int(threading_plan["threads_per_trial"]),
-                "cv_strategy": "segment_aware_per_class"
-                if segments_cv is not None
-                else "fixed_holdout",
+                "cv_strategy": "segment_aware_per_class" if segments_cv is not None else "fixed_holdout",
                 "cv_n_splits": n_cv_folds if segments_cv is not None else 1,
             }
         )
@@ -434,6 +445,11 @@ def run_lightgbm(config: dict | None = None) -> None:
                 seed=hpo_seed,
                 n_jobs=int(threading_plan["optuna_parallel_trials"]),
                 timeout_seconds=int(hpo_timeout) if hpo_timeout is not None else None,
+                sampler_name=hpo_sampler,
+                pruner_name=str(hpo_pruner) if hpo_pruner is not None else None,
+                storage_url=str(hpo_storage) if hpo_storage else None,
+                study_name=f"{hpo_study_prefix}_{args.dataset}_{args.split_path}_{effective_profile}",
+                load_if_exists=True,
                 on_trial_complete=on_trial_complete,
             )
 

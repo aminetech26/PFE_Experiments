@@ -768,8 +768,7 @@ def analyse_stationarity(
     episode_col: str,
     dataset_cfg: dict,
 ) -> dict:
-    from src.data.preprocessing import apply_physics_normalization
-
+    # Only measure stationarity on raw features, do not apply physics normalization or correction
     if episode_col not in df.columns:
         return {"error": f"{episode_col} not found"}
 
@@ -782,8 +781,20 @@ def analyse_stationarity(
     if normal_episodes.empty:
         return {"error": "no_normal_episode_found"}
 
-    stat_cfg = dataset_cfg.get("preprocessing", {}).get("physics_normalization", {})
-    n_reference_episodes = int(stat_cfg.get("n_reference_episodes", 5))
+    # Explicitly read physics_normalization config only when present and valid.
+    preproc_cfg = dataset_cfg.get("preprocessing") if isinstance(dataset_cfg, dict) else None
+    if isinstance(preproc_cfg, dict) and "physics_normalization" in preproc_cfg:
+        stat_cfg = preproc_cfg.get("physics_normalization")
+        if not isinstance(stat_cfg, dict):
+            stat_cfg = None
+    else:
+        stat_cfg = None
+
+    # Default to 5 reference episodes when no explicit config provided
+    if stat_cfg is None:
+        n_reference_episodes = 5
+    else:
+        n_reference_episodes = int(stat_cfg.get("n_reference_episodes", 5))
     selected_episodes = [int(ep) for ep in normal_episodes.index[:n_reference_episodes].tolist()]
     if not selected_episodes:
         return {"error": "no_reference_episodes_selected"}
@@ -791,37 +802,19 @@ def analyse_stationarity(
     per_episode_tests: dict[str, dict] = {}
     feature_results: dict[str, list[dict]] = {}
     tested_columns: set[str] = set()
-    transformed_cols: list[str] = []
 
     for ref_episode in selected_episodes:
         ref_df = df[df[episode_col] == ref_episode].copy()
         if ref_df.empty:
             continue
 
-        transformed_df = ref_df.copy()
-        current_transformed_cols: list[str] = []
-        if stat_cfg:
-            transformed_df, stat_stats = apply_physics_normalization(
-                transformed_df,
-                irradiance_config=stat_cfg.get("irradiance_normalize"),
-                irr_residualize_config=stat_cfg.get("irr_residualize"),
-                label_col="Fault" if "Fault" in transformed_df.columns else "label",
-            )
-            current_transformed_cols = [
-                *stat_stats.features_normalized,
-                *stat_stats.features_residualized,
-            ]
-            for col in current_transformed_cols:
-                if col not in transformed_cols:
-                    transformed_cols.append(col)
-
         timestamps = ref_df["timestamp"].diff().dt.total_seconds().dropna()
         sampling_seconds = float(timestamps.median()) if not timestamps.empty else 1.0
         episode_tests = {}
-        for col in [*sensor_cols, *current_transformed_cols]:
-            if col not in transformed_df.columns:
+        for col in sensor_cols:
+            if col not in ref_df.columns:
                 continue
-            result = _run_unit_root_tests(transformed_df[col], sampling_seconds)
+            result = _run_unit_root_tests(ref_df[col], sampling_seconds)
             episode_tests[col] = result
             feature_results.setdefault(col, []).append(result)
             tested_columns.add(col)
@@ -845,7 +838,7 @@ def analyse_stationarity(
         "n_reference_episodes_requested": n_reference_episodes,
         "n_reference_episodes_used": len(per_episode_tests),
         "tested_columns": sorted(tested_columns),
-        "transformed_columns": transformed_cols,
+        "transformed_columns": [],
         "per_episode_tests": per_episode_tests,
         "summary_by_feature": summary_by_feature,
         "note": (

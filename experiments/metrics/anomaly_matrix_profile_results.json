@@ -1,27 +1,27 @@
 {
-  "timestamp_utc": "2026-04-24T00:08:48.709842+00:00",
+  "timestamp_utc": "2026-04-29T14:45:04.373361+00:00",
   "task": "anomaly_semisup",
   "dataset": "costa",
   "split_path": "path_b",
   "model": "matrix_profile",
   "feature_profile": "baseline_raw",
-  "feature_run_id": "baseline_raw__494968bdbbe3",
-  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\path_b\\anomaly_semisup\\runs\\baseline_raw__494968bdbbe3",
+  "feature_run_id": "baseline_raw__494968bdbbe3__20260424_001331",
+  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\path_b\\anomaly_semisup\\runs\\baseline_raw__494968bdbbe3__20260424_001331",
   "signal_column": "pdc",
-  "window_size": 60,
-  "threshold": 4.455766830148078,
-  "best_val_f1": 0.19536932394447826,
+  "window_size": 30,
+  "threshold": 3.2336715449000715,
+  "best_val_f1": 0.1982091628270886,
   "metrics": {
     "train": {
       "pr_auc": NaN,
       "f1": 0.0,
       "precision": 0.0,
       "recall": 0.0,
-      "positive_rate": 0.19164337179566548,
+      "positive_rate": 0.1894289700889094,
       "confusion_matrix": [
         [
-          169746,
-          40243
+          170211,
+          39778
         ],
         [
           0,
@@ -30,36 +30,36 @@
       ]
     },
     "val": {
-      "pr_auc": 0.3863009801853568,
-      "f1": 0.19536932394447826,
-      "precision": 0.34095276625872356,
-      "recall": 0.13691008041588823,
+      "pr_auc": 0.3991130938329523,
+      "f1": 0.1982091628270886,
+      "precision": 0.3459087690907252,
+      "recall": 0.13890017057915685,
       "positive_rate": 0.2,
       "confusion_matrix": [
         [
-          18297,
-          6516
+          18346,
+          6467
         ],
         [
-          21251,
-          3371
+          21202,
+          3420
         ]
       ]
     },
     "test": {
-      "pr_auc": 0.3184604769164807,
-      "f1": 0.1768557640321192,
-      "precision": 0.25959673152665924,
-      "recall": 0.13411078717201166,
-      "positive_rate": 0.2138618591435971,
+      "pr_auc": 0.3199420479791888,
+      "f1": 0.16167941497856603,
+      "precision": 0.2624147339699864,
+      "recall": 0.11683066083576288,
+      "positive_rate": 0.18430514696638253,
       "confusion_matrix": [
         [
-          34019,
-          12595
+          35801,
+          10813
         ],
         [
-          28512,
-          4416
+          29081,
+          3847
         ]
       ]
     }

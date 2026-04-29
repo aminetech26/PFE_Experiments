@@ -69,17 +69,20 @@ def resolve_preprocess_config(config: dict, dataset: str) -> dict:
     return deep_merge(base_cfg, dataset_override)
 
 
-def normalize_preprocess_schema(preprocess_cfg: dict) -> dict:
-    """Normalize legacy config keys to the current preprocessing schema."""
-    normalized = dict(preprocess_cfg)
-    if "stationarity" in normalized and "physics_normalization" not in normalized:
-        normalized["physics_normalization"] = normalized.pop("stationarity")
-    return normalized
+# Note: physics_normalization / stationarity handling has been moved out of
+# preprocessing and into feature-engineering. We therefore don't perform any
+# schema promotion here; resolve_preprocess_config already returns the
+# effective preprocessing config for a dataset.
 
 
 def resolve_effective_preprocess_config(config: dict, dataset: str, split_path: str) -> dict:
-    """Resolve dataset and split-path aware preprocessing config."""
-    effective = normalize_preprocess_schema(resolve_preprocess_config(config, dataset))
+    """Resolve dataset and split-path aware preprocessing config.
+
+    This intentionally does not remap legacy `stationarity` keys into
+    `physics_normalization` — physics normalization is now considered
+    part of feature engineering and should be handled elsewhere.
+    """
+    effective = resolve_preprocess_config(config, dataset)
     dataset_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
     path_override = (
         dataset_cfg.get("splits", {})
@@ -88,7 +91,7 @@ def resolve_effective_preprocess_config(config: dict, dataset: str, split_path: 
         .get("preprocessing", {})
     )
     if path_override:
-        effective = deep_merge(effective, normalize_preprocess_schema(path_override))
+        effective = deep_merge(effective, path_override)
     return effective
 
 
@@ -256,7 +259,6 @@ def preprocess_split(
     processed_frames: dict[str, pd.DataFrame] = {}
 
     train_bounds = None
-    train_irr_residual_params = None
     processing_order = ["train", "val", "test"]
 
     for subset in processing_order:
@@ -305,7 +307,6 @@ def preprocess_split(
             segment_col="segment_id",
             label_col=label_col,
             outlier_reference_bounds=train_bounds if subset != "train" else None,
-            irr_residual_reference_params=train_irr_residual_params if subset != "train" else None,
         )
 
         total_output_rows += len(df_processed)
@@ -334,9 +335,6 @@ def preprocess_split(
                 col: tuple(bounds)
                 for col, bounds in stats.get("outliers", {}).get("bounds", {}).items()
             }
-            raw_params = stats.get("physics_normalization", {}).get("irr_residual_params", {})
-            if raw_params:
-                train_irr_residual_params = {feat: tuple(vals) for feat, vals in raw_params.items()}
 
     # Cross-split checks after all subsets processed
     _sanity_check_cross_split(processed_frames, split_name, split_path=split_path)
@@ -360,28 +358,13 @@ def create_manifest(
     manifest = {
         "version": 1,
         "created_at": datetime.now(UTC).isoformat(),
-        "config_used": config.get("preprocessing", {}),
+        # Only include explicit preprocessing config (exclude physics_normalization);
+        # physics_normalization is a feature-engineering concern now.
+        "config_used": (lambda c: {k: v for k, v in (c.get("preprocessing") or {}).items() if k != "physics_normalization"})(config),
         "split_path": config.get("split_path", "path_a"),
         "splits": split_stats,
         "features_created": [],
     }
-
-    stat_config = config.get("preprocessing", {}).get("physics_normalization") or {}
-    if stat_config.get("irradiance_normalize"):
-        features = stat_config["irradiance_normalize"].get("features", [])
-        suffix = stat_config["irradiance_normalize"].get("suffix", "_norm")
-        manifest["features_created"].extend([f"{f}{suffix}" for f in features])
-
-    if stat_config.get("irr_residualize"):
-        features = stat_config["irr_residualize"].get("features", [])
-        suffix = stat_config["irr_residualize"].get("suffix", "_irr_residual")
-        manifest["features_created"].extend([f"{f}{suffix}" for f in features])
-
-    # Embed train-fit OLS params so downstream steps can verify/reproduce
-    train_stats = split_stats.get("train", {}).get("subset_stats", {}).get("train", {})
-    irr_params = train_stats.get("physics_normalization", {}).get("irr_residual_params", {})
-    if irr_params:
-        manifest["irr_residual_params"] = irr_params
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str)

@@ -24,6 +24,11 @@ from sklearn.metrics import (
 
 from src.mlflow_setup import init_tracking
 from src.modeling.common.feature_loader import load_features_for_task
+from src.modeling.common.hyperparameter_optimizer import (
+    midpoint_params_from_space,
+    run_optuna,
+    suggest_params_from_space,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
@@ -52,6 +57,21 @@ def _resolve_matrix_profile_cfg(config: dict) -> dict:
         raise KeyError("Missing 'anomaly_detection.ml.models.matrix_profile' in model_config.yaml")
 
     return model_cfg
+
+
+def _resolve_anomaly_hpo_cfg(config: dict) -> dict:
+    anomaly_cfg = config.get("anomaly_detection")
+    if not isinstance(anomaly_cfg, dict):
+        raise KeyError("Missing 'anomaly_detection' section in model_config.yaml")
+
+    ml_cfg = anomaly_cfg.get("ml")
+    if not isinstance(ml_cfg, dict):
+        raise KeyError("Missing 'anomaly_detection.ml' section in model_config.yaml")
+
+    hpo_cfg = ml_cfg.get("hpo", {})
+    if not isinstance(hpo_cfg, dict):
+        raise KeyError("'anomaly_detection.ml.hpo' must be a mapping when provided")
+    return hpo_cfg
 
 
 def _infer_signal_column(df: pd.DataFrame, feature_cols: list[str]) -> str:
@@ -188,6 +208,10 @@ def run_matrix_profile(config: dict | None = None) -> None:
     parser.add_argument("--run-dir", default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--window-size", type=int, default=None)
+    parser.add_argument(
+        "--no-optuna", action="store_true", help="Disable Optuna and use midpoint baseline params"
+    )
+    parser.add_argument("--n-trials", type=int, default=None, help="Override Optuna trial count")
     parser.add_argument("--signal-col", default=None, help="Optional override signal column")
     parser.add_argument("--metrics-path", default=str(DEFAULT_METRICS_PATH))
     parser.add_argument("--figures-dir", default=str(DEFAULT_FIGURES_DIR))
@@ -195,13 +219,17 @@ def run_matrix_profile(config: dict | None = None) -> None:
 
     runtime_config = config or _load_model_config()
     model_cfg = _resolve_matrix_profile_cfg(runtime_config)
+    hpo_cfg = _resolve_anomaly_hpo_cfg(runtime_config)
 
     configured_windows = model_cfg.get("window_size", [60])
-    if isinstance(configured_windows, list) and configured_windows:
-        default_window = int(configured_windows[0])
-    else:
-        default_window = int(configured_windows)
-    window_size = int(args.window_size or default_window)
+    n_trials = int(args.n_trials or hpo_cfg.get("n_trials_phase1", 20))
+    hpo_direction = str(hpo_cfg.get("direction", "maximize"))
+    hpo_seed = int(runtime_config.get("experiment", {}).get("seed", 42))
+    hpo_timeout = hpo_cfg.get("timeout_seconds", None)
+    hpo_sampler = str(hpo_cfg.get("sampler", "tpe"))
+    hpo_pruner = hpo_cfg.get("pruner", "none")
+    hpo_storage = hpo_cfg.get("storage_url", None)
+    hpo_study_prefix = str(hpo_cfg.get("study_name_prefix", "anomaly_matrix_profile"))
 
     train_df, val_df, test_df, manifest, resolved_run_dir = load_features_for_task(
         task=args.task,
@@ -227,15 +255,25 @@ def run_matrix_profile(config: dict | None = None) -> None:
     val_signal = pd.to_numeric(val_df[signal_col], errors="coerce").ffill().fillna(0.0).to_numpy()
     test_signal = pd.to_numeric(test_df[signal_col], errors="coerce").ffill().fillna(0.0).to_numpy()
 
-    if (
-        len(train_signal) <= window_size
-        or len(val_signal) <= window_size
-        or len(test_signal) <= window_size
-    ):
+    max_allowed_window = min(len(train_signal), len(val_signal), len(test_signal)) - 1
+    if max_allowed_window < 2:
         raise ValueError(
-            f"window_size={window_size} is too large for one split length: "
+            "Split lengths are too short for matrix profile baseline: "
             f"train={len(train_signal)} val={len(val_signal)} test={len(test_signal)}"
         )
+
+    raw_windows = configured_windows if isinstance(configured_windows, list) else [configured_windows]
+    candidate_windows = [int(w) for w in raw_windows]
+    valid_windows = [w for w in candidate_windows if 2 <= w <= max_allowed_window]
+    if not valid_windows:
+        raise ValueError(
+            f"No valid configured matrix-profile window sizes under max_allowed={max_allowed_window}. "
+            f"Configured: {candidate_windows}"
+        )
+
+    search_space = {"window_size": valid_windows}
+    default_window = int(valid_windows[0])
+    window_size = default_window
 
     logger.info(
         "Matrix Profile baseline | dataset={} split_path={} task={} profile={} signal={} window={} run_dir={}",
@@ -248,15 +286,57 @@ def run_matrix_profile(config: dict | None = None) -> None:
         resolved_run_dir,
     )
 
-    train_scores = _matrix_profile_scores(train_signal, window_size)
-    val_scores = _matrix_profile_scores(val_signal, window_size)
-    test_scores = _matrix_profile_scores(test_signal, window_size)
-
     y_train = _binary_labels(train_df, label_col)
     y_val = _binary_labels(val_df, label_col)
     y_test = _binary_labels(test_df, label_col)
 
-    threshold, best_val_f1 = _best_threshold(y_val, val_scores)
+    def _evaluate_window(window: int) -> tuple[float, float]:
+        val_scores_local = _matrix_profile_scores(val_signal, window)
+        thr, val_f1 = _best_threshold(y_val, val_scores_local)
+        return thr, val_f1
+
+    if args.window_size is not None:
+        window_size = int(args.window_size)
+        if not (2 <= window_size <= max_allowed_window):
+            raise ValueError(
+                f"Requested --window-size={window_size} must be within [2, {max_allowed_window}]"
+            )
+        threshold, best_val_f1 = _evaluate_window(window_size)
+        study = None
+    elif args.no_optuna:
+        mid = midpoint_params_from_space(search_space)
+        window_size = int(mid.get("window_size", default_window))
+        threshold, best_val_f1 = _evaluate_window(window_size)
+        study = None
+    else:
+
+        def objective(trial):
+            trial_params = suggest_params_from_space(trial, search_space)
+            candidate_window = int(trial_params["window_size"])
+            _, val_f1 = _evaluate_window(candidate_window)
+            return float(val_f1)
+
+        best_base_params, study = run_optuna(
+            objective,
+            search_space=search_space,
+            n_trials=n_trials,
+            direction=hpo_direction,
+            seed=hpo_seed,
+            n_jobs=1,
+            timeout_seconds=int(hpo_timeout) if hpo_timeout is not None else None,
+            sampler_name=hpo_sampler,
+            pruner_name=str(hpo_pruner) if hpo_pruner is not None else None,
+            storage_url=str(hpo_storage) if hpo_storage else None,
+            study_name=f"{hpo_study_prefix}_{args.dataset}_{args.split_path}_{args.task}",
+            load_if_exists=True,
+        )
+        window_size = int(best_base_params["window_size"])
+        threshold, best_val_f1 = _evaluate_window(window_size)
+
+    train_scores = _matrix_profile_scores(train_signal, window_size)
+    val_scores = _matrix_profile_scores(val_signal, window_size)
+    test_scores = _matrix_profile_scores(test_signal, window_size)
+
     train_metrics = _compute_metrics(y_train, train_scores, threshold)
     val_metrics = _compute_metrics(y_val, val_scores, threshold)
     test_metrics = _compute_metrics(y_test, test_scores, threshold)
@@ -322,8 +402,21 @@ def run_matrix_profile(config: dict | None = None) -> None:
                 "signal_column": signal_col,
                 "window_size": window_size,
                 "threshold": threshold,
+                "optuna_enabled": args.window_size is None and not args.no_optuna,
+                "optuna_sampler": hpo_sampler,
+                "optuna_pruner": str(hpo_pruner),
+                "optuna_storage_enabled": bool(hpo_storage),
             }
         )
+
+        if study is not None:
+            mlflow.log_metric("optuna_best_val_f1", float(study.best_value))
+            trials_artifact = (
+                PROJECT_ROOT / "experiments" / "metrics" / "anomaly_matrix_profile_optuna_trials.csv"
+            )
+            trials_artifact.parent.mkdir(parents=True, exist_ok=True)
+            study.trials_dataframe().to_csv(trials_artifact, index=False)
+            mlflow.log_artifact(str(trials_artifact))
 
         mlflow.log_metrics(
             {

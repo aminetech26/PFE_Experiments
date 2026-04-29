@@ -13,7 +13,16 @@ experiment:
 anomaly_detection:
   # Runtime decomposition: ml and dl (no baseline namespace)
   ml:
-    active_model: isolation_forest
+    active_model: matrix_profile
+    hpo:
+      direction: maximize
+      validation_mode: holdout
+      sampler: tpe
+      pruner: none
+      study_name_prefix: anomaly_matrix_profile
+      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
+      n_trials_phase1: 20
+      timeout_seconds: null
     models:
       isolation_forest:
         n_estimators: [100, 200]
@@ -31,6 +40,19 @@ anomaly_detection:
 
   dl:
     active_model: lstm_autoencoder
+    hpo:
+      mode: auto_two_stage
+      sampler: tpe
+      pruner: hyperband
+      validation_mode: holdout
+      early_stopping: true
+      study_name_prefix: anomaly_dl
+      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_dl.db"
+      run_stage3: false
+      trial_budget:
+        stage1_training: 20
+        stage2_architecture: 40
+        stage3_joint: 12
     models:
       lstm_autoencoder:
         hidden_dim: [32, 64, 128]
@@ -74,13 +96,30 @@ classification:
         n_estimators: [200, 500]
         max_features: [sqrt, log2]
     hpo:
-      sampler: tpe
       direction: maximize
+      validation_mode: holdout      # holdout | segment_temporal_cv
+      sampler: tpe                  # ML policy default
+      pruner: none                  # ML policy: no pruner
+      study_name_prefix: classification_lightgbm
+      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
       n_trials_phase1: 50
       timeout_seconds: null
 
   dl:
     active_model: tcn
+    hpo:
+      mode: auto_two_stage        # transparent orchestration: stage1 -> stage2 -> optional stage3
+      sampler: tpe
+      pruner: hyperband
+      validation_mode: holdout
+      early_stopping: true
+      study_name_prefix: classification_dl
+      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_dl.db"
+      run_stage3: false
+      trial_budget:
+        stage1_training: 20
+        stage2_architecture: 40
+        stage3_joint: 12
     models:
       cnn_1d:
         filters: [32, 64, 128]

@@ -47,8 +47,6 @@ PROFILE_FLAG_KEYS = {
     "window_step",
     "multiscale_window_sizes",
     "spectral_min_fs",
-    "spectral_n_top_freqs",
-    "psd_n_bands",
     "wpd_level",
     "wpd_wavelet",
     "ceemdan_n_imfs",
@@ -58,41 +56,6 @@ PROFILE_FLAG_KEYS = {
     "temp_power_eps",
     "irr_norm_floor",
     "mrmr_k",
-}
-
-DERIVED_FEATURE_ENABLE_FLAGS = {
-    "delta_temp": "enable_delta_temp",
-    "dP_dt": "enable_dP_dt",
-    "dV_dt": "enable_dV_dt",
-    "dI_dt": "enable_dI_dt",
-    "Vg_normalized": "enable_Vg_normalized",
-    "power_imbalance": "enable_power_imbalance",
-    "current_imbalance": "enable_current_imbalance",
-    "voltage_imbalance": "enable_voltage_imbalance",
-    "string1_power_share": "enable_string_share",
-    "string1_current_share": "enable_string_share",
-    "temp_loss_pmax": "enable_temp_power_correction",
-    "pdc_temp_corrected": "enable_temp_power_correction",
-    "pdc_temp_corrected_norm_irr": "enable_temp_power_correction",
-    "Pg_wavelet": "enable_wavelet",
-    "delta_p": "enable_differential_signal",
-}
-
-DERIVED_SOURCE_COLUMNS = {
-    "delta_temp": {"TPV", "TA"},
-    "dP_dt": {"Pg"},
-    "dV_dt": {"Vg"},
-    "dI_dt": {"Ig"},
-    "Vg_normalized": {"Vg"},
-    "power_imbalance": {"pdc1", "pdc2"},
-    "current_imbalance": {"idc1", "idc2"},
-    "voltage_imbalance": {"vdc1", "vdc2"},
-    "string1_power_share": {"pdc1", "pdc2"},
-    "string1_current_share": {"idc1", "idc2"},
-    "temp_loss_pmax": {"pvt"},
-    "pdc_temp_corrected": {"pdc", "pvt"},
-    "pdc_temp_corrected_norm_irr": {"pdc", "pvt", "irr"},
-    "Pg_wavelet": {"Pg"},
 }
 
 
@@ -295,12 +258,11 @@ def _apply_eda_selection_priors(
     selection_cfg: dict,
     eda_findings: dict | None,
     eda_policy: dict,
-) -> tuple[dict, list[str]]:
+) -> dict:
     effective = dict(selection_cfg)
-    pre_drop: list[str] = []
 
     if not eda_findings:
-        return effective, pre_drop
+        return effective
 
     if effective.get("eda_override_thresholds", False):
         sp_thr = eda_findings.get("spearman", {}).get("recommended_corr_threshold")
@@ -323,11 +285,7 @@ def _apply_eda_selection_priors(
         anchors.update(mw_sig[:5])
     effective["anchor_features"] = sorted(anchors)
 
-    if effective.get("eda_pre_drop_candidates", True):
-        recs = eda_findings.get("recommendations", {})
-        pre_drop = [f for f in recs.get("redundant_drop_candidates", []) if f not in anchors]
-
-    return effective, pre_drop
+    return effective
 
 
 def _tsfresh_mode(tsfresh_cfg: dict) -> str:
@@ -357,85 +315,6 @@ def _resolve_run_dir(base_run_dir: Path) -> Path:
 
     stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     return base_run_dir.with_name(f"{base_run_dir.name}__{stamp}")
-
-
-def _apply_eda_predrop_before_feature_generation(
-    split_frames: dict[str, pd.DataFrame],
-    pre_drop_cols: list[str],
-) -> tuple[dict[str, pd.DataFrame], list[str], list[str]]:
-    """Drop EDA pre-drop columns from all splits before feature generation."""
-    applied: list[str] = []
-    unavailable: list[str] = []
-
-    for col in pre_drop_cols:
-        if any(col in split_frames[s].columns for s in ("train", "val", "test")):
-            applied.append(col)
-        else:
-            unavailable.append(col)
-
-    if not applied:
-        return split_frames, applied, unavailable
-
-    updated: dict[str, pd.DataFrame] = {}
-    for subset, frame in split_frames.items():
-        drop_cols = [c for c in applied if c in frame.columns]
-        updated[subset] = frame.drop(columns=drop_cols)
-    return updated, applied, unavailable
-
-
-def _apply_predrop_derived_blocking(
-    flags: dict, predropped_cols: list[str]
-) -> tuple[dict, list[dict]]:
-    """Disable derived features that depend on EDA pre-dropped sources."""
-    predropped = set(predropped_cols)
-    effective = dict(flags)
-    blocked: list[dict] = []
-
-    def _block(feature_name: str, blocked_sources: list[str]) -> None:
-        enable_key = DERIVED_FEATURE_ENABLE_FLAGS[feature_name]
-        if not effective.get(enable_key, False):
-            return
-        effective[enable_key] = False
-        blocked.append(
-            {
-                "feature": feature_name,
-                "flag": enable_key,
-                "reason": "source_predropped_by_eda",
-                "blocked_by_sources": blocked_sources,
-            }
-        )
-
-    for feature_name, source_cols in DERIVED_SOURCE_COLUMNS.items():
-        overlap = sorted(source_cols.intersection(predropped))
-        if overlap:
-            _block(feature_name, overlap)
-
-    # delta_p can be computed from either inverter pair or Pg/Pg_ref pair.
-    if effective.get("enable_differential_signal", False):
-        source_groups = [
-            {"Pg_inv1", "Pg_inv2"},
-            {"Pg", "Pg_ref"},
-        ]
-        group_is_viable = [group.isdisjoint(predropped) for group in source_groups]
-        if not any(group_is_viable):
-            blocked_sources = sorted({c for g in source_groups for c in g if c in predropped})
-            _block("delta_p", blocked_sources)
-
-    return effective, blocked
-
-
-def _protect_predrop_sources_for_enabled_derived(
-    pre_drop_cols: list[str], flags: dict
-) -> tuple[list[str], list[str]]:
-    """Avoid pre-dropping source channels required by currently enabled derived features."""
-    protected_sources: set[str] = set()
-    for feature_name, enable_key in DERIVED_FEATURE_ENABLE_FLAGS.items():
-        if flags.get(enable_key, False):
-            protected_sources.update(DERIVED_SOURCE_COLUMNS.get(feature_name, set()))
-
-    kept = [c for c in pre_drop_cols if c not in protected_sources]
-    removed = [c for c in pre_drop_cols if c in protected_sources]
-    return kept, removed
 
 
 def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, list[str]]:
@@ -570,7 +449,7 @@ def main() -> None:
         if flags.get("enable_wavelet", False):
             logger.info("Path A policy: disabling wavelet/spectral features (Path B only)")
             flags["enable_wavelet"] = False
-        for _spectral_flag in ("enable_spectral", "enable_psd", "enable_wpd", "enable_ceemdan"):
+        for _spectral_flag in ("enable_wpd", "enable_ceemdan"):
             if flags.get(_spectral_flag, False):
                 logger.info(f"Path A policy: disabling {_spectral_flag} (Path B only)")
                 flags[_spectral_flag] = False
@@ -593,23 +472,9 @@ def main() -> None:
 
     eda_policy = _resolve_eda_policy(task, task_directives)
     eda_findings, eda_meta = _load_eda_findings(PROJECT_ROOT, selection_cfg)
-    selection_effective, eda_pre_drop = _apply_eda_selection_priors(
-        selection_cfg, eda_findings, eda_policy
-    )
+    selection_effective = _apply_eda_selection_priors(selection_cfg, eda_findings, eda_policy)
     tsfresh_mode = _tsfresh_mode(tsfresh_cfg)
     tsfresh_label_strategy = str(task_directives.get("tsfresh_label_strategy", "any_fault"))
-    predrop_before_featurization = bool(
-        selection_effective.get("eda_apply_predrop_before_feature_generation", True)
-    )
-    block_derived_from_predrop = bool(
-        selection_effective.get("eda_block_derived_from_predropped_sources", True)
-    )
-
-    eda_pre_drop_original = list(eda_pre_drop)
-    eda_pre_drop, eda_predrop_protected_sources = _protect_predrop_sources_for_enabled_derived(
-        eda_pre_drop,
-        flags,
-    )
     resolved_for_fingerprint = {
         "task": task,
         "split_path": args.split_path,
@@ -630,17 +495,12 @@ def main() -> None:
             "eda_prefer_anchors_from_findings": bool(
                 selection_effective.get("eda_prefer_anchors_from_findings", True)
             ),
-            "eda_pre_drop_candidates": bool(
-                selection_effective.get("eda_pre_drop_candidates", True)
-            ),
-            "eda_pre_drop_original": eda_pre_drop_original,
-            "eda_pre_drop_after_source_protection": eda_pre_drop,
-            "eda_pre_drop_removed_due_to_derived_sources": eda_predrop_protected_sources,
+            "eda_pre_drop_candidates": False,
             "eda_override_thresholds": bool(
                 selection_effective.get("eda_override_thresholds", False)
             ),
-            "eda_apply_predrop_before_feature_generation": predrop_before_featurization,
-            "eda_block_derived_from_predropped_sources": block_derived_from_predrop,
+            "eda_apply_predrop_before_feature_generation": False,
+            "eda_block_derived_from_predropped_sources": False,
         },
         "tsfresh": {
             "mode": tsfresh_mode,
@@ -651,7 +511,7 @@ def main() -> None:
         },
     }
     config_fingerprint = _build_config_fingerprint(resolved_for_fingerprint)
-    base_run_dir = runs_root / f"{profile_key}__{config_fingerprint}"
+    base_run_dir = runs_root / profile_key
     run_dir = _resolve_run_dir(base_run_dir)
 
     if not input_dir.exists():
@@ -674,27 +534,12 @@ def main() -> None:
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
         split_frames[subset] = frame
 
-    eda_predrop_applied_before_fe: list[str] = []
-    eda_predrop_unavailable_before_fe: list[str] = []
-    if predrop_before_featurization and eda_pre_drop:
-        split_frames, eda_predrop_applied_before_fe, eda_predrop_unavailable_before_fe = (
-            _apply_eda_predrop_before_feature_generation(split_frames, eda_pre_drop)
-        )
-
-    generation_flags = dict(flags)
-    derived_blocked_by_predrop: list[dict] = []
-    if block_derived_from_predrop and eda_predrop_applied_before_fe:
-        generation_flags, derived_blocked_by_predrop = _apply_predrop_derived_blocking(
-            generation_flags,
-            eda_predrop_applied_before_fe,
-        )
-
     label_col = infer_label_column(split_frames["train"])
     base_cols = get_dataset_base_feature_columns(config, args.dataset, split_frames["train"])
 
     generated_cols: dict[str, list[str]] = {}
     for subset in ("train", "val", "test"):
-        split_frames[subset], added = add_optional_features(split_frames[subset], generation_flags)
+        split_frames[subset], added = add_optional_features(split_frames[subset], flags)
         generated_cols[subset] = added
 
     windowing_meta: dict = {"enabled": False}
@@ -727,10 +572,6 @@ def main() -> None:
                 label_col=label_col,
                 segment_col="segment_id",
                 fs=_fs,
-                enable_fft=bool(flags.get("enable_spectral", False)),
-                n_top_freqs=int(flags.get("spectral_n_top_freqs", 5)),
-                enable_psd=bool(flags.get("enable_psd", False)),
-                psd_n_bands=int(flags.get("psd_n_bands", 5)),
                 enable_wpd=bool(flags.get("enable_wpd", False)),
                 wpd_level=int(flags.get("wpd_level", 3)),
                 wpd_wavelet=str(flags.get("wpd_wavelet", "db4")),
@@ -753,8 +594,6 @@ def main() -> None:
             "multiscale": bool(flags.get("enable_multiscale", False)),
             "sampling_hz": _fs,
             "spectral": {
-                "fft_top_n": bool(flags.get("enable_spectral", False)),
-                "psd": bool(flags.get("enable_psd", False)),
                 "wpd": bool(flags.get("enable_wpd", False)),
                 "ceemdan": bool(flags.get("enable_ceemdan", False)),
             },
@@ -769,9 +608,6 @@ def main() -> None:
         set(base_cols + generated_cols["train"] + generated_cols["val"] + generated_cols["test"])
     )
     candidate_features = [c for c in candidate_features if c in split_frames["train"].columns]
-    candidate_predrop_applied = [c for c in eda_pre_drop if c in set(candidate_features)]
-    if eda_pre_drop:
-        candidate_features = [c for c in candidate_features if c not in set(eda_pre_drop)]
 
     corr_dropped: list[dict] = []
     vif_dropped: list[dict] = []
@@ -902,7 +738,7 @@ def main() -> None:
         "source_preprocessed_dir": str(input_dir),
         "label_column": label_col,
         "active_flags": flags,
-        "effective_generation_flags": generation_flags,
+        "effective_generation_flags": flags,
         "task_directives_effective": task_directives,
         "selection": {
             "enable_hygiene_pruning": bool(flags.get("enable_hygiene_pruning", False)),
@@ -914,17 +750,7 @@ def main() -> None:
             "anchor_features": selection_effective.get("anchor_features", []),
             "use_eda_findings": bool(selection_effective.get("use_eda_findings", False)),
             "eda_policy": eda_policy,
-            "eda_pre_drop_original": eda_pre_drop_original,
-            "eda_pre_drop_candidates": eda_pre_drop,
-            "eda_pre_drop_removed_due_to_derived_sources": eda_predrop_protected_sources,
-            "eda_predrop_before_featurization_enabled": predrop_before_featurization,
-            "eda_pre_drop_applied_before_featurization": eda_predrop_applied_before_fe,
-            "eda_pre_drop_unavailable_before_featurization": eda_predrop_unavailable_before_fe,
-            "eda_pre_drop_applied_candidate_filter": candidate_predrop_applied,
-            "derived_blocking": {
-                "enabled": block_derived_from_predrop,
-                "blocked_features": derived_blocked_by_predrop,
-            },
+            "eda_pre_drop_candidates": False,
             "hygiene_dropped": hygiene_dropped,
             "mrmr_dropped": mrmr_dropped,
             "corr_dropped": corr_dropped,
