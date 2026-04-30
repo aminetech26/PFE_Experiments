@@ -87,10 +87,10 @@ def main():
     with open(args.metrics_path, "r") as f:
         metrics = json.load(f)
     
-    threshold = metrics["anomaly_statistics"]["anomaly_threshold_95_percentile"]
+    thresholds_dict = metrics["anomaly_statistics"].get("anomaly_thresholds_per_feature", {})
     input_cols = metrics["input_features"]
     lookback = metrics["best_parameters"]["lookback"]
-    logger.info(f"Loaded Threshold: {threshold:.6f}, Lookback: {lookback}")
+    logger.info(f"Loaded Lookback: {lookback}. Available threshold methods: {list(thresholds_dict.keys())}")
 
     logger.info(f"Loading model from {args.model_path}")
     model = tf.keras.models.load_model(args.model_path)
@@ -122,19 +122,25 @@ def main():
     logger.info("Running inference...")
     preds = model.predict(X_seq, batch_size=256)
     
-    # Calculate MAE over time and feature dimensions
-    seq_maes = np.mean(np.abs(preds - X_seq), axis=(1, 2))
+    # Calculate MAE over time (axis 1) so shape matches (N_seq, N_features)
+    seq_maes = np.mean(np.abs(preds - X_seq), axis=1)
     
-    logger.info("Calculating statistics...")
-    # Threshold masking
-    predicted_anomalies = (seq_maes > threshold).astype(int)
+    logger.info("Calculating statistics for each feature threshold method...")
+    
+    for method, thresholds_str in thresholds_dict.items():
+        logger.info(f"\n>>>> EVALUATING THRESHOLD METHOD: {method.upper()} <<<<")
+        
+        # Convert list to numpy array for vector broadcasting
+        threshold_arr = np.array(thresholds_str)
+        
+        # Threshold masking: Anomaly = ANY feature exceeds its specific feature-threshold
+        predicted_anomalies = (seq_maes > threshold_arr).any(axis=1).astype(int)
 
-    # Global masks (Since all sequences left are actual anomalies/faults, i.e., actual == 1)
-    tp_mask = (predicted_anomalies == 1)
-    fn_mask = (predicted_anomalies == 0)
+        # Global masks (Since all sequences left are actual anomalies/faults, i.e., actual == 1)
+        tp_mask = (predicted_anomalies == 1)
+        fn_mask = (predicted_anomalies == 0)
 
-    print_class_statistics(Y_multi_seq, tp_mask, fn_mask)
-
+        print_class_statistics(Y_multi_seq, tp_mask, fn_mask)
 
 if __name__ == "__main__":
     import os

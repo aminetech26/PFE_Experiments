@@ -37,7 +37,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "experiments" / "checkpoints" / "lstmae"
 DEFAULT_METRICS_DIR = PROJECT_ROOT / "experiments" / "metrics"
 
-DEFAULT_INPUT_COLS = ["irr", "idc1", "idc2", "vdc1", "vdc2"]
+DEFAULT_INPUT_COLS = ["irr", "idc1", "idc2", "vdc1", "vdc2", "pdc1", "pdc2", "clearness_index", "pvt"]
 
 def create_sequences_with_labels(data: np.ndarray, labels: np.ndarray, lookback: int) -> tuple[np.ndarray, np.ndarray]:
     """Create sliding window sequences and designate window as faulty if ANY fault exists."""
@@ -50,10 +50,10 @@ def create_sequences_with_labels(data: np.ndarray, labels: np.ndarray, lookback:
     return np.array(X), np.array(Y)
 
 def get_sequence_mae(model, X_seq: np.ndarray) -> np.ndarray:
-    """Calculates MAE for each sequence mapping across original shapes."""
+    """Calculates MAE for each sequence mapped strictly per-feature. Shape: (n_seq, n_features)"""
     preds = model.predict(X_seq, verbose=0)
-    # Average across time (dim 1) and features (dim 2)
-    return np.mean(np.abs(preds - X_seq), axis=(1, 2))
+    # Average across time (dim 1) ONLY, keeping features distinct (dim 2)
+    return np.mean(np.abs(preds - X_seq), axis=1)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -146,9 +146,19 @@ def main():
             verbose=0
         )
         
-        # Learn threshold: 95th percentile of MAE on training data
-        train_mae_per_seq = get_sequence_mae(model, X_train_healthy)
-        threshold_95 = np.percentile(train_mae_per_seq, 95)
+        # Learn thresholds per feature
+        train_mae_per_seq = get_sequence_mae(model, X_train_healthy)  # Shape: (N, features)
+
+        thresholds_dict = {
+            "90th_percentile": np.percentile(train_mae_per_seq, 90, axis=0).tolist(),
+            "95th_percentile": np.percentile(train_mae_per_seq, 95, axis=0).tolist(),
+            "99th_percentile": np.percentile(train_mae_per_seq, 99, axis=0).tolist(),
+            "max": np.max(train_mae_per_seq, axis=0).tolist(),
+            "mean_plus_3std": (np.mean(train_mae_per_seq, axis=0) + 3*np.std(train_mae_per_seq, axis=0)).tolist()
+        }
+        
+        # Use a singular default for model selection (95th)
+        threshold_95 = np.array(thresholds_dict["95th_percentile"])
         
         # Evaluate Healthy Reconstruction Metrics on Unseen Test set
         X_test_pred = model.predict(X_test_healthy, verbose=0)
@@ -159,13 +169,14 @@ def main():
         test_mae = mean_absolute_error(test_flat, pred_flat)
         test_r2 = r2_score(test_flat, pred_flat)
         
-        # Evaluate Statistical Flags (False Positives vs True Positives) using calculated threshold
+        # Evaluate Statistical Flags (False Positives vs True Positives)
+        # Any feature going above its designated feature-threshold = anomaly!
         test_mae_per_seq = get_sequence_mae(model, X_test_healthy)
         faulty_mae_per_seq = get_sequence_mae(model, X_faulty)
 
-        # Flag anomalies 
-        fp_mask = test_mae_per_seq > threshold_95
-        tp_mask = faulty_mae_per_seq > threshold_95
+        # Flag anomalies (reduce over axis 1 to get a 1D mask)
+        fp_mask = (test_mae_per_seq > threshold_95).any(axis=1)
+        tp_mask = (faulty_mae_per_seq > threshold_95).any(axis=1)
         
         fp_count = np.sum(fp_mask)
         tn_count = len(test_mae_per_seq) - fp_count
@@ -177,7 +188,7 @@ def main():
         recall = tp_count / (tp_count + fn_count) if (tp_count + fn_count) > 0 else 0.0
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
         
-        logger.info(f"  Result: Test MSE={test_mse:.6f}, Threshold={threshold_95:.6f} | F1={f1:.4f}, TPR(Recall)={recall:.4f}, FPR={fp_count/(fp_count+tn_count):.4f}")
+        logger.info(f"  Result: Test MSE={test_mse:.6f} | F1={f1:.4f}, TPR(Recall)={recall:.4f}, FPR={fp_count/(fp_count+tn_count):.4f}")
         
         trial_result = {
             "lstm_units": units,
@@ -188,7 +199,7 @@ def main():
             "test_healthy_mse": test_mse,
             "test_healthy_mae": test_mae,
             "test_healthy_r2": test_r2,
-            "learned_threshold": threshold_95,
+            "learned_thresholds": thresholds_dict,
             "true_positives": int(tp_count),
             "true_negatives": int(tn_count),
             "false_positives": int(fp_count),
@@ -234,7 +245,7 @@ def main():
             "test_healthy_R2": best_params["test_healthy_r2"],
         },
         "anomaly_statistics": {
-            "anomaly_threshold_95_percentile": best_params["learned_threshold"],
+            "anomaly_thresholds_per_feature": best_params["learned_thresholds"],
             "precision": best_params["precision"],
             "recall_TPR": best_params["recall"],
             "f1_score": best_params["f1_score"],

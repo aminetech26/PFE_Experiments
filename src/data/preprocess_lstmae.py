@@ -13,11 +13,17 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 from loguru import logger
+import pvlib
 
 # Global parameters for normalization
 SHORT_CIRCUIT_CURRENT = 9.45  # A
 OPEN_CIRCUIT_VOLTAGE = 45.6   # V
+PEAK_POWER = 4000.0           # W (Published peak power yield)
 
+# Coordinates for Clearness Index (USER TO FILL)
+LATITUDE = -25.438686
+LONGITUDE = -49.268487
+ALTITUDE = 935
 
 def preprocess_for_lstmae(input_parquet: str | Path, output_parquet: str | Path) -> None:
     input_parquet = Path(input_parquet)
@@ -41,7 +47,27 @@ def preprocess_for_lstmae(input_parquet: str | Path, output_parquet: str | Path)
     else:
         logger.warning("No 'timestamp' column found. Time of day features skipped.")
 
-    # 2. Normalize currents and voltages
+    # 2. Physics-Based Features Calculation (BEFORE Normalization)
+    if "irr" in df.columns and "timestamp" in df.columns:
+        # Calculate clear sky irradiance using pvlib
+        loc = pvlib.location.Location(LATITUDE, LONGITUDE, altitude=ALTITUDE)
+        times = pd.DatetimeIndex(df["timestamp"])
+        
+        # Determine the timezone - assume UTC if naive
+        if times.tzinfo is None:
+            times = times.tz_localize("UTC")
+            
+        clear_sky = loc.get_clearsky(times)
+        
+        # Calculate Clearness Index (Measured Irradiance / Clear Sky GHI)
+        # Add epsilon to prevent division by zero during nights/eclipses
+        df["clearness_index"] = df["irr"].values / (clear_sky["ghi"].values + 1e-6)
+        
+        # Cap abnormal values (e.g. slight sensor positive reading at night, but clear sky is ~0)
+        df["clearness_index"] = df["clearness_index"].clip(lower=0, upper=1.5)
+        logger.info("Added physics-based feature: clearness_index.")
+
+    # 3. Normalize currents, voltages, and powers
     for col in ["idc1", "idc2"]:
         if col in df.columns:
             df[col] = df[col] / SHORT_CIRCUIT_CURRENT
@@ -50,9 +76,13 @@ def preprocess_for_lstmae(input_parquet: str | Path, output_parquet: str | Path)
         if col in df.columns:
             df[col] = df[col] / OPEN_CIRCUIT_VOLTAGE
             
-    logger.info(f"Normalized currents by {SHORT_CIRCUIT_CURRENT}A and voltages by {OPEN_CIRCUIT_VOLTAGE}V.")
+    for col in ["pdc1", "pdc2"]:
+        if col in df.columns:
+            df[col] = df[col] / PEAK_POWER
+            
+    logger.info(f"Normalized currents ({SHORT_CIRCUIT_CURRENT}A), voltages ({OPEN_CIRCUIT_VOLTAGE}V), and powers ({PEAK_POWER}W).")
 
-    # 3. Normalize irradiance
+    # 4. Normalize irradiance
     if "irr" in df.columns:
         df["irr"] = df["irr"] / 1000.0
         logger.info("Normalized irr by 1000.")

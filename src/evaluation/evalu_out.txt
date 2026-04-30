@@ -1,24 +1,24 @@
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1777552248.130812   58867 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+I0000 00:00:1777554085.829562   66753 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
 WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
-I0000 00:00:1777552249.764628   58867 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
-2026-04-30 12:30:51,178 [INFO] Loading metrics and settings from /content/PFE_Experiments/experiments/metrics/lstmae_results.json
-2026-04-30 12:30:51,178 [INFO] Loaded Threshold: 0.019242, Lookback: 10
-2026-04-30 12:30:51,178 [INFO] Loading model from /content/PFE_Experiments/experiments/checkpoints/lstmae/lstmae_best.keras
-2026-04-30 12:30:52,981 [INFO] Loading dataset from /content/PFE_Experiments/data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
-2026-04-30 12:30:53,056 [WARNING] 'fault_label' column missing, defaulting class splits to 'label' column directly.
-2026-04-30 12:30:53,056 [INFO] Creating sequences...
-2026-04-30 12:31:01,705 [INFO] Running inference...
-2016/2016 ━━━━━━━━━━━━━━━━━━━━ 5s 2ms/step
-2026-04-30 12:31:08,516 [INFO] Calculating statistics...
-2026-04-30 12:31:08,529 [INFO] ============================================================
-2026-04-30 12:31:08,529 [INFO] Class    | Type     | TP     | TN     | FP     | FN     | Prec    | Recall  | F1     
-2026-04-30 12:31:08,529 [INFO] ------------------------------------------------------------
-2026-04-30 12:31:08,532 [INFO] 0        | Healthy  | 0      | 286104 | 19494  | 0      | 0.0000  | 0.0000  | 0.0000 
-2026-04-30 12:31:08,534 [INFO] 1        | Fault    | 6043   | 0      | 0      | 0      | 1.0000  | 1.0000  | 1.0000 
-2026-04-30 12:31:08,536 [INFO] 2        | Fault    | 10320  | 0      | 0      | 126    | 1.0000  | 0.9879  | 0.9939 
-2026-04-30 12:31:08,538 [INFO] 3        | Fault    | 6076   | 0      | 0      | 0      | 1.0000  | 1.0000  | 1.0000 
-2026-04-30 12:31:08,540 [INFO] 4        | Fault    | 135212 | 0      | 0      | 52574  | 1.0000  | 0.7200  | 0.8372 
-2026-04-30 12:31:08,540 [INFO] ============================================================
-2026-04-30 12:31:08,541 [INFO] ALL      | Overall  | 157651 | 286104 | 19494  | 52700  | 0.8900  | 0.7495  | 0.8137 
-2026-04-30 12:31:08,541 [INFO] ============================================================
+I0000 00:00:1777554087.456371   66753 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-04-30 13:01:28,870 [INFO] Loading metrics and settings from /content/PFE_Experiments/experiments/metrics/lstmae_results.json
+2026-04-30 13:01:28,870 [INFO] Loaded Threshold: 0.019242, Lookback: 10
+2026-04-30 13:01:28,870 [INFO] Loading model from /content/PFE_Experiments/experiments/checkpoints/lstmae/lstmae_best.keras
+2026-04-30 13:01:30,656 [INFO] Loading dataset from /content/PFE_Experiments/data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
+2026-04-30 13:01:30,730 [WARNING] 'fault_label' column missing, defaulting class splits to 'label' column directly.
+2026-04-30 13:01:30,730 [INFO] Creating sequences...
+2026-04-30 13:01:39,444 [INFO] Filtered down to 210351 purely faulty sequences.
+2026-04-30 13:01:39,444 [INFO] Running inference...
+822/822 ━━━━━━━━━━━━━━━━━━━━ 3s 3ms/step
+2026-04-30 13:01:42,718 [INFO] Calculating statistics...
+2026-04-30 13:01:42,722 [INFO] ============================================================
+2026-04-30 13:01:42,723 [INFO] Class    | Total     | Detected (TP)  | Missed (FN)  | Recall 
+2026-04-30 13:01:42,723 [INFO] ------------------------------------------------------------
+2026-04-30 13:01:42,724 [INFO] 1        | 6043      | 6043           | 0            | 1.0000 
+2026-04-30 13:01:42,724 [INFO] 2        | 10446     | 10320          | 126          | 0.9879 
+2026-04-30 13:01:42,725 [INFO] 3        | 6076      | 6076           | 0            | 1.0000 
+2026-04-30 13:01:42,725 [INFO] 4        | 187786    | 135212         | 52574        | 0.7200 
+2026-04-30 13:01:42,725 [INFO] ============================================================
+2026-04-30 13:01:42,725 [INFO] ALL      | 210351    | 157651         | 52700        | 0.7495 
+2026-04-30 13:01:42,725 [INFO] ============================================================
