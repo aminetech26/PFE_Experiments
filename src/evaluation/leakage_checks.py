@@ -110,6 +110,36 @@ def duplicate_sample_check(
     return result
 
 
+def exact_duplicate_overlap_check(
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    feature_cols: list[str],
+) -> dict:
+    """Strict exact-duplicate overlap check with zero-tolerance policy."""
+    train_set = set(df_train[feature_cols].apply(tuple, axis=1))
+    val_set = set(df_val[feature_cols].apply(tuple, axis=1))
+    overlap = train_set & val_set
+    overlap_count = len(overlap)
+    overlap_pct = (overlap_count / len(val_set) * 100.0) if len(val_set) > 0 else 0.0
+
+    result = {
+        "train_unique_samples": len(train_set),
+        "val_unique_samples": len(val_set),
+        "overlapping_samples": overlap_count,
+        "overlap_pct": overlap_pct,
+        "is_clean": overlap_count == 0,
+    }
+    if result["is_clean"]:
+        logger.success(f"Exact Duplicate Pre-Check OK: {overlap_count} overlaps")
+    else:
+        logger.warning(
+            "LEAKAGE ALERT (Exact Duplicates): {} overlapping rows ({:.4f}%) between train/val",
+            overlap_count,
+            overlap_pct,
+        )
+    return result
+
+
 # ============================================================================
 # 3. TIME-SPLIT VALIDATION (Temporal Leakage)
 # ============================================================================

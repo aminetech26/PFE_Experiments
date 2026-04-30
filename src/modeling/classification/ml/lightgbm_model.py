@@ -16,7 +16,7 @@ from sklearn.metrics import accuracy_score, average_precision_score, classificat
 from sklearn.preprocessing import LabelEncoder, label_binarize
 
 from src.data.splitting import PerClassSegmentTimeSeriesCV
-from src.evaluation.leakage_checks import run_leakage_report
+from src.evaluation.leakage_checks import exact_duplicate_overlap_check, run_leakage_report
 from src.mlflow_setup import init_tracking
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
@@ -67,6 +67,12 @@ def _resolve_classification_ml_config(config: dict) -> tuple[dict, dict, dict]:
         raise KeyError("Missing 'classification.ml.hpo' section in model_config.yaml")
 
     return {"active_model": active_model, "model_spaces": model_spaces}, classification_cfg, hpo_cfg
+
+
+def _resolve_runtime_seed(runtime_config: dict, cli_seed: int | None) -> int:
+    if cli_seed is not None:
+        return int(cli_seed)
+    return int(runtime_config.get("experiment", {}).get("seed", 42))
 
 
 def _prepare_xy(
@@ -208,6 +214,12 @@ def run_lightgbm(config: dict | None = None) -> None:
         "--no-optuna", action="store_true", help="Disable Optuna and use midpoint baseline params"
     )
     parser.add_argument("--n-trials", type=int, default=None, help="Override Optuna trial count")
+    parser.add_argument("--seed", type=int, default=None, help="Override experiment seed")
+    parser.add_argument(
+        "--run-type",
+        default="baseline",
+        help="Experiment run type label for comparison records (baseline|ablation|final)",
+    )
     parser.add_argument(
         "--threads", type=int, default=None, help="Override max model training threads"
     )
@@ -247,7 +259,7 @@ def run_lightgbm(config: dict | None = None) -> None:
 
     n_trials = args.n_trials or int(hpo_cfg.get("n_trials_phase1", 50))
     hpo_direction = str(hpo_cfg.get("direction", "maximize"))
-    hpo_seed = int(runtime_config.get("experiment", {}).get("seed", 42))
+    hpo_seed = _resolve_runtime_seed(runtime_config, args.seed)
     hpo_timeout = hpo_cfg.get("timeout_seconds", None)
     hpo_sampler = str(hpo_cfg.get("sampler", "tpe"))
     hpo_pruner = hpo_cfg.get("pruner", "none")
@@ -301,6 +313,14 @@ def run_lightgbm(config: dict | None = None) -> None:
     x_train, y_train_raw = _prepare_xy(train_df, features, label_column)
     x_val, y_val_raw = _prepare_xy(val_df, features, label_column)
     x_test, y_test_raw = _prepare_xy(test_df, features, label_column)
+
+    duplicate_precheck = exact_duplicate_overlap_check(train_df, val_df, features)
+    if not duplicate_precheck.get("is_clean", False):
+        logger.warning(
+            "Pre-model exact duplicate overlap detected (train/val): {} samples ({:.4f}%)",
+            duplicate_precheck.get("overlapping_samples", 0),
+            duplicate_precheck.get("overlap_pct", 0.0),
+        )
 
     encoder = LabelEncoder()
     y_train = encoder.fit_transform(y_train_raw)
@@ -359,6 +379,8 @@ def run_lightgbm(config: dict | None = None) -> None:
                 "task": args.task,
                 "dataset": args.dataset,
                 "split_path": args.split_path,
+                "seed": hpo_seed,
+                "run_type": args.run_type,
                 "feature_profile": effective_profile,
                 "feature_profile_requested": requested_profile,
                 "feature_run_id": effective_run_id,
@@ -380,6 +402,10 @@ def run_lightgbm(config: dict | None = None) -> None:
                 "threads_per_trial": int(threading_plan["threads_per_trial"]),
                 "cv_strategy": "segment_aware_per_class" if segments_cv is not None else "fixed_holdout",
                 "cv_n_splits": n_cv_folds if segments_cv is not None else 1,
+                "duplicate_precheck_overlaps": int(
+                    duplicate_precheck.get("overlapping_samples", 0)
+                ),
+                "duplicate_precheck_is_clean": bool(duplicate_precheck.get("is_clean", True)),
             }
         )
 
@@ -612,8 +638,12 @@ def run_lightgbm(config: dict | None = None) -> None:
         mlflow.log_artifact(str(model_path))
         mlflow.log_dict(manifest, "features_manifest.json")
         mlflow.log_dict(threading_plan, "threading_plan.json")
+        mlflow.log_dict(duplicate_precheck, "duplicate_precheck.json")
         mlflow.log_metric(
             "leakage_flag_count", float(len(leakage_payload.get("leakage_flags", [])))
+        )
+        mlflow.log_metric(
+            "duplicate_precheck_overlaps", float(duplicate_precheck.get("overlapping_samples", 0))
         )
         mlflow.log_param("leakage_checks_enabled", not bool(args.skip_leakage_checks))
 
@@ -624,6 +654,9 @@ def run_lightgbm(config: dict | None = None) -> None:
             "dataset": args.dataset,
             "split_path": args.split_path,
             "model": "lightgbm",
+            "model_family": "classification_ml",
+            "run_type": args.run_type,
+            "seed": hpo_seed,
             "feature_profile": effective_profile,
             "feature_profile_requested": requested_profile,
             "feature_run_id": effective_run_id,
@@ -638,6 +671,8 @@ def run_lightgbm(config: dict | None = None) -> None:
             "test_pr_auc_weighted": pr_auc_weighted,
             "leakage_flag_count": len(leakage_payload.get("leakage_flags", [])),
             "leakage_is_clean": bool(leakage_payload.get("is_clean", False)),
+            "duplicate_precheck_overlaps": int(duplicate_precheck.get("overlapping_samples", 0)),
+            "duplicate_precheck_is_clean": bool(duplicate_precheck.get("is_clean", True)),
             "mlflow_run_id": mlflow.active_run().info.run_id if mlflow.active_run() else None,
         }
         records_path = Path(args.comparison_records_path)

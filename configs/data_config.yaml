@@ -449,7 +449,7 @@ feature_engineering:
       enable_vif_pruning:         false
       enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
-      enable_differential_signal: true
+      enable_differential_signal: true   # runtime-disabled for costa (no healthy-reference channel)
       tsfresh_mode:               "off"
 
     plus_rolling:

@@ -461,6 +461,14 @@ def main() -> None:
         )
         flags["enable_rolling_stats"] = False
 
+    # Dataset-level admissibility: Costa has no healthy reference stream for differential signal.
+    if args.dataset == "costa" and flags.get("enable_differential_signal", False):
+        logger.info(
+            "Dataset policy: disabling differential signal for costa "
+            "(no healthy-reference channel for meaningful delta_p)."
+        )
+        flags["enable_differential_signal"] = False
+
     input_dir = _resolve_input_dir(args.dataset, task, args.split_path)
     profile_key = _safe_name(profile_name or "default")
     task_key = _safe_name(task)

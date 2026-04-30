@@ -14,6 +14,7 @@ import stumpy
 import yaml
 from loguru import logger
 from sklearn.metrics import (
+    accuracy_score,
     average_precision_score,
     confusion_matrix,
     f1_score,
@@ -22,6 +23,7 @@ from sklearn.metrics import (
     recall_score,
 )
 
+from src.evaluation.leakage_checks import exact_duplicate_overlap_check
 from src.mlflow_setup import init_tracking
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
@@ -34,6 +36,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
 DEFAULT_METRICS_PATH = (
     PROJECT_ROOT / "experiments" / "metrics" / "anomaly_matrix_profile_results.json"
+)
+DEFAULT_COMPARISON_RECORDS_PATH = (
+    PROJECT_ROOT / "experiments" / "metrics" / "anomaly_comparison_records.jsonl"
 )
 DEFAULT_FIGURES_DIR = PROJECT_ROOT / "experiments" / "figures" / "anomaly" / "matrix_profile"
 
@@ -72,6 +77,12 @@ def _resolve_anomaly_hpo_cfg(config: dict) -> dict:
     if not isinstance(hpo_cfg, dict):
         raise KeyError("'anomaly_detection.ml.hpo' must be a mapping when provided")
     return hpo_cfg
+
+
+def _resolve_runtime_seed(runtime_config: dict, cli_seed: int | None) -> int:
+    if cli_seed is not None:
+        return int(cli_seed)
+    return int(runtime_config.get("experiment", {}).get("seed", 42))
 
 
 def _infer_signal_column(df: pd.DataFrame, feature_cols: list[str]) -> str:
@@ -130,6 +141,7 @@ def _compute_metrics(y_true: np.ndarray, scores: np.ndarray, threshold: float) -
     cm = confusion_matrix(y_true, y_pred).tolist()
     return {
         "pr_auc": pr_auc,
+        "accuracy": float(accuracy_score(y_true, y_pred)),
         "f1": float(f1_score(y_true, y_pred, zero_division=0)),
         "precision": float(precision_score(y_true, y_pred, zero_division=0)),
         "recall": float(recall_score(y_true, y_pred, zero_division=0)),
@@ -212,8 +224,19 @@ def run_matrix_profile(config: dict | None = None) -> None:
         "--no-optuna", action="store_true", help="Disable Optuna and use midpoint baseline params"
     )
     parser.add_argument("--n-trials", type=int, default=None, help="Override Optuna trial count")
+    parser.add_argument("--seed", type=int, default=None, help="Override experiment seed")
+    parser.add_argument(
+        "--run-type",
+        default="baseline",
+        help="Experiment run type label for comparison records (baseline|ablation|final)",
+    )
     parser.add_argument("--signal-col", default=None, help="Optional override signal column")
     parser.add_argument("--metrics-path", default=str(DEFAULT_METRICS_PATH))
+    parser.add_argument(
+        "--comparison-records-path",
+        default=str(DEFAULT_COMPARISON_RECORDS_PATH),
+        help="Where to append anomaly comparison record jsonl",
+    )
     parser.add_argument("--figures-dir", default=str(DEFAULT_FIGURES_DIR))
     args = parser.parse_args()
 
@@ -224,7 +247,7 @@ def run_matrix_profile(config: dict | None = None) -> None:
     configured_windows = model_cfg.get("window_size", [60])
     n_trials = int(args.n_trials or hpo_cfg.get("n_trials_phase1", 20))
     hpo_direction = str(hpo_cfg.get("direction", "maximize"))
-    hpo_seed = int(runtime_config.get("experiment", {}).get("seed", 42))
+    hpo_seed = _resolve_runtime_seed(runtime_config, args.seed)
     hpo_timeout = hpo_cfg.get("timeout_seconds", None)
     hpo_sampler = str(hpo_cfg.get("sampler", "tpe"))
     hpo_pruner = hpo_cfg.get("pruner", "none")
@@ -289,6 +312,7 @@ def run_matrix_profile(config: dict | None = None) -> None:
     y_train = _binary_labels(train_df, label_col)
     y_val = _binary_labels(val_df, label_col)
     y_test = _binary_labels(test_df, label_col)
+    duplicate_precheck = exact_duplicate_overlap_check(train_df, val_df, feature_cols)
 
     def _evaluate_window(window: int) -> tuple[float, float]:
         val_scores_local = _matrix_profile_scores(val_signal, window)
@@ -389,6 +413,8 @@ def run_matrix_profile(config: dict | None = None) -> None:
                 "split_path": args.split_path,
                 "model_family": "anomaly_detection_ml",
                 "model_name": "matrix_profile",
+                "seed": hpo_seed,
+                "run_type": args.run_type,
             }
         )
 
@@ -402,10 +428,16 @@ def run_matrix_profile(config: dict | None = None) -> None:
                 "signal_column": signal_col,
                 "window_size": window_size,
                 "threshold": threshold,
+                "seed": hpo_seed,
+                "run_type": args.run_type,
                 "optuna_enabled": args.window_size is None and not args.no_optuna,
                 "optuna_sampler": hpo_sampler,
                 "optuna_pruner": str(hpo_pruner),
                 "optuna_storage_enabled": bool(hpo_storage),
+                "duplicate_precheck_overlaps": int(
+                    duplicate_precheck.get("overlapping_samples", 0)
+                ),
+                "duplicate_precheck_is_clean": bool(duplicate_precheck.get("is_clean", True)),
             }
         )
 
@@ -423,6 +455,7 @@ def run_matrix_profile(config: dict | None = None) -> None:
                 "train_pr_auc": train_metrics["pr_auc"],
                 "val_pr_auc": val_metrics["pr_auc"],
                 "test_pr_auc": test_metrics["pr_auc"],
+                "test_accuracy": test_metrics["accuracy"],
                 "val_f1": val_metrics["f1"],
                 "test_f1": test_metrics["f1"],
                 "val_precision": val_metrics["precision"],
@@ -433,9 +466,40 @@ def run_matrix_profile(config: dict | None = None) -> None:
         )
 
         mlflow.log_artifact(str(metrics_path))
+        mlflow.log_dict(duplicate_precheck, "duplicate_precheck.json")
         mlflow.log_artifact(str(pr_curve_path))
         mlflow.log_artifact(str(hist_path))
         mlflow.log_artifact(str(timeline_path))
+
+        comparison_record = {
+            "timestamp_utc": datetime.now(UTC).isoformat(),
+            "run_name": run_name,
+            "task": args.task,
+            "dataset": args.dataset,
+            "split_path": args.split_path,
+            "model": "matrix_profile",
+            "model_family": "anomaly_detection_ml",
+            "run_type": args.run_type,
+            "seed": hpo_seed,
+            "feature_profile": str(manifest.get("profile") or args.profile),
+            "feature_run_id": resolved_run_dir.name,
+            "feature_run_dir": str(resolved_run_dir),
+            "optuna_enabled": args.window_size is None and not args.no_optuna,
+            "optuna_n_trials_requested": int(n_trials),
+            "test_pr_auc": float(test_metrics["pr_auc"]),
+            "test_accuracy": float(test_metrics["accuracy"]),
+            "test_f1": float(test_metrics["f1"]),
+            "test_precision": float(test_metrics["precision"]),
+            "test_recall": float(test_metrics["recall"]),
+            "duplicate_precheck_overlaps": int(duplicate_precheck.get("overlapping_samples", 0)),
+            "duplicate_precheck_is_clean": bool(duplicate_precheck.get("is_clean", True)),
+            "mlflow_run_id": mlflow.active_run().info.run_id if mlflow.active_run() else None,
+        }
+        records_path = Path(args.comparison_records_path)
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+        with records_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(comparison_record, default=str) + "\n")
+        mlflow.log_artifact(str(records_path))
 
     logger.success(
         "Matrix Profile done | test_pr_auc={:.4f} test_f1={:.4f} threshold={:.4f} metrics={}",
