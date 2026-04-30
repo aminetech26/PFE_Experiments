@@ -1,0 +1,1175 @@
+Running stage 'ingest':
+> uv run python -m src.data.ingestion --dataset costa
+2026-04-30 09:43:51.597 | INFO     | __main__:<module>:652 - === Stage 0: Data Ingestion — dataset=costa ===
+2026-04-30 09:43:51.707 | INFO     | __main__:load_costa:291 - Loading Costa dataset_elec.mat ...
+2026-04-30 09:43:51.975 | INFO     | __main__:load_costa:294 - Loading Costa dataset_amb.mat ...
+2026-04-30 09:43:52.168 | INFO     | __main__:load_costa:307 - Costa dataset loaded | N=1,373,798 samples ≈ 15.90 days at 1 Hz
+2026-04-30 09:43:52.208 | INFO     | __main__:load_costa:315 - Costa ingestion irradiance threshold: 100.0 W/m²
+2026-04-30 09:43:52.232 | INFO     | __main__:load_costa:337 - Costa irradiance filter (irr >= 100.0): 515,958 / 1,373,798 rows kept (37.6%)
+2026-04-30 09:43:52.265 | INFO     | __main__:load_costa:361 - Fault distribution (f_nv):
+2026-04-30 09:43:52.275 | INFO     | __main__:load_costa:373 -   0 (Normal       ):   309,253 (59.94%)
+2026-04-30 09:43:52.276 | INFO     | __main__:load_costa:373 -   1 (ShortCircuit ):     5,999 (1.16%)
+2026-04-30 09:43:52.276 | INFO     | __main__:load_costa:373 -   2 (Degradation  ):    10,371 (2.01%)
+2026-04-30 09:43:52.276 | INFO     | __main__:load_costa:373 -   3 (OpenCircuit  ):     6,024 (1.17%)
+2026-04-30 09:43:52.276 | INFO     | __main__:load_costa:373 -   4 (Shadowing    ):   184,311 (35.72%)
+2026-04-30 09:43:52.355 | SUCCESS  | __main__:_write_ingestion_outputs:117 - Saved → /content/PFE_Experiments/data/interim/ingestion/costa/costa_merged.parquet
+2026-04-30 09:43:52.355 | SUCCESS  | __main__:_write_ingestion_outputs:118 - Schema manifest → /content/PFE_Experiments/data/interim/ingestion/costa/costa_merged.schema.json
+2026-04-30 09:43:52.358 | INFO     | __main__:<module>:655 - Schema: {'timestamp': "Datetime(time_unit='us', time_zone='UTC')", 'label': 'Float64', 'vdc1': 'Float64', 'vdc2': 'Float64', 'idc1': 'Float64', 'idc2': 'Float64', 'pdc1': 'Float64', 'pdc2': 'Float64', 'pdc': 'Float64', 'irr': 'Float64', 'pvt': 'Float64'}
+2026-04-30 09:43:52.359 | INFO     | __main__:<module>:656 - First row: {'timestamp': datetime.datetime(2020, 4, 6, 12, 9, 22, tzinfo=zoneinfo.ZoneInfo(key='UTC')), 'label': 0.0, 'vdc1': 336.205, 'vdc2': 281.194, 'idc1': 0.1425, 'idc2': 0.039, 'pdc1': 47.909212499999995, 'pdc2': 10.966566, 'pdc': 58.875778499999996, 'irr': 100.185, 'pvt': -0.8391}
+2026-04-30 09:43:52.359 | SUCCESS  | __main__:<module>:662 - === Ingestion complete | dataset=costa ===
+  0% 0/3 [00:00<?, ?file/s{'info': ''}]                                      
+memory://.zVKU-lZl_SBzCrsqFWUycg.tmp:   0% 0.00/164 [00:00<?, ?B/s]
+memory://.zVKU-lZl_SBzCrsqFWUycg.tmp:   0% 0.00/164 [00:00<?, ?B/s{'info': ''}]
+Updating lock file 'dvc.lock'
+
+Running stage 'preprocess_lstmae':
+> uv run python -m src.data.preprocess_lstmae
+2026-04-30 09:43:53.172 | INFO     | __main__:preprocess_for_lstmae:26 - Reading ingestion parquet: data/interim/ingestion/costa/costa_merged.parquet
+2026-04-30 09:43:53.285 | INFO     | __main__:preprocess_for_lstmae:40 - Added time_of_day_sin and time_of_day_cos features.
+2026-04-30 09:43:53.298 | INFO     | __main__:preprocess_for_lstmae:53 - Normalized currents by 9.45A and voltages by 45.6V.
+2026-04-30 09:43:53.302 | INFO     | __main__:preprocess_for_lstmae:58 - Normalized irr by 1000.
+2026-04-30 09:43:53.308 | INFO     | __main__:preprocess_for_lstmae:68 - MinMax scaled pvt (temperature).
+2026-04-30 09:43:53.606 | SUCCESS  | __main__:preprocess_for_lstmae:72 - Saved LSTM-AE preprocessed data to data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
+Updating lock file 'dvc.lock'
+
+Running stage 'train_lstmae':
+> uv run python -m src.modeling.anomaly_detection.dl.train_lstmae
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1777542236.860506    3359 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1777542242.091557    3359 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-04-30 09:44:04.453 | INFO     | __main__:main:84 - Loading data from /content/PFE_Experiments/data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
+2026-04-30 09:44:04.528 | INFO     | __main__:main:110 - Starting Grid Search with 32 combinations training ONLY on healthy data...
+2026-04-30 09:44:04.528 | INFO     | __main__:main:113 - Trial 1/32 - units:16, latent:8, lr:0.01, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 3,357
+2026-04-30 09:50:06.630 | INFO     | __main__:main:180 -   Result: Test MSE=0.005703, Threshold=0.071097 | F1=0.7413, TPR(Recall)=0.6027, FPR=0.0805
+2026-04-30 09:50:06.688 | INFO     | __main__:main:113 - Trial 2/32 - units:16, latent:8, lr:0.01, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 3,357
+2026-04-30 09:53:08.687 | INFO     | __main__:main:180 -   Result: Test MSE=0.003107, Threshold=0.057467 | F1=0.6801, TPR(Recall)=0.5267, FPR=0.0761
+2026-04-30 09:53:08.687 | INFO     | __main__:main:113 - Trial 3/32 - units:16, latent:8, lr:0.01, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 3,357
+2026-04-30 09:56:55.635 | INFO     | __main__:main:180 -   Result: Test MSE=0.009670, Threshold=0.128140 | F1=0.5659, TPR(Recall)=0.4025, FPR=0.0693
+2026-04-30 09:56:55.635 | INFO     | __main__:main:113 - Trial 4/32 - units:16, latent:8, lr:0.01, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 3,357
+2026-04-30 09:59:19.927 | INFO     | __main__:main:180 -   Result: Test MSE=0.011195, Threshold=0.139993 | F1=0.5615, TPR(Recall)=0.3962, FPR=0.0525
+2026-04-30 09:59:19.927 | INFO     | __main__:main:113 - Trial 5/32 - units:16, latent:8, lr:0.001, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 3,357
+2026-04-30 10:09:30.963 | INFO     | __main__:main:180 -   Result: Test MSE=0.000478, Threshold=0.019242 | F1=0.8402, TPR(Recall)=0.7492, FPR=0.1178
+2026-04-30 10:09:31.017 | INFO     | __main__:main:113 - Trial 6/32 - units:16, latent:8, lr:0.001, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 3,357
+2026-04-30 10:11:35.885 | INFO     | __main__:main:180 -   Result: Test MSE=0.008214, Threshold=0.101664 | F1=0.8251, TPR(Recall)=0.7217, FPR=0.0950
+2026-04-30 10:11:35.886 | INFO     | __main__:main:113 - Trial 7/32 - units:16, latent:8, lr:0.001, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 3,357
+2026-04-30 10:15:17.588 | INFO     | __main__:main:180 -   Result: Test MSE=0.033429, Threshold=0.144840 | F1=0.4452, TPR(Recall)=0.2903, FPR=0.0477
+2026-04-30 10:15:17.588 | INFO     | __main__:main:113 - Trial 8/32 - units:16, latent:8, lr:0.001, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           136 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         1,600 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 3,357 (13.11 KB)
+ Trainable params: 3,293 (12.86 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 3,357
+2026-04-30 10:17:41.488 | INFO     | __main__:main:180 -   Result: Test MSE=0.005136, Threshold=0.075263 | F1=0.7633, TPR(Recall)=0.6294, FPR=0.0692
+2026-04-30 10:17:41.488 | INFO     | __main__:main:113 - Trial 9/32 - units:16, latent:16, lr:0.01, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 4,005
+2026-04-30 10:20:53.636 | INFO     | __main__:main:180 -   Result: Test MSE=0.016235, Threshold=0.143404 | F1=0.4681, TPR(Recall)=0.3082, FPR=0.0297
+2026-04-30 10:20:53.636 | INFO     | __main__:main:113 - Trial 10/32 - units:16, latent:16, lr:0.01, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 4,005
+2026-04-30 10:22:57.128 | INFO     | __main__:main:180 -   Result: Test MSE=0.007879, Threshold=0.097466 | F1=0.7237, TPR(Recall)=0.5690, FPR=0.0125
+2026-04-30 10:22:57.128 | INFO     | __main__:main:113 - Trial 11/32 - units:16, latent:16, lr:0.01, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 4,005
+2026-04-30 10:26:39.134 | INFO     | __main__:main:180 -   Result: Test MSE=0.040167, Threshold=0.205913 | F1=0.3293, TPR(Recall)=0.1974, FPR=0.0051
+2026-04-30 10:26:39.134 | INFO     | __main__:main:113 - Trial 12/32 - units:16, latent:16, lr:0.01, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 4,005
+2026-04-30 10:29:02.466 | INFO     | __main__:main:180 -   Result: Test MSE=0.012258, Threshold=0.119922 | F1=0.4824, TPR(Recall)=0.3225, FPR=0.0516
+2026-04-30 10:29:02.466 | INFO     | __main__:main:113 - Trial 13/32 - units:16, latent:16, lr:0.001, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 4,005
+2026-04-30 10:32:15.697 | INFO     | __main__:main:180 -   Result: Test MSE=0.012615, Threshold=0.131229 | F1=0.7797, TPR(Recall)=0.6459, FPR=0.0372
+2026-04-30 10:32:15.697 | INFO     | __main__:main:113 - Trial 14/32 - units:16, latent:16, lr:0.001, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 4,005
+2026-04-30 10:34:19.425 | INFO     | __main__:main:180 -   Result: Test MSE=0.003356, Threshold=0.061009 | F1=0.7641, TPR(Recall)=0.6301, FPR=0.0656
+2026-04-30 10:34:19.425 | INFO     | __main__:main:113 - Trial 15/32 - units:16, latent:16, lr:0.001, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 4,005
+2026-04-30 10:38:00.223 | INFO     | __main__:main:180 -   Result: Test MSE=0.003414, Threshold=0.057353 | F1=0.7281, TPR(Recall)=0.5879, FPR=0.0944
+2026-04-30 10:38:00.223 | INFO     | __main__:main:113 - Trial 16/32 - units:16, latent:16, lr:0.001, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 16)             │         1,408 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 16)             │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 16)         │         2,112 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 16)         │            64 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │            85 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 4,005 (15.64 KB)
+ Trainable params: 3,941 (15.39 KB)
+ Non-trainable params: 64 (256.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (16 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (16 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 4,005
+2026-04-30 10:40:24.915 | INFO     | __main__:main:180 -   Result: Test MSE=0.004839, Threshold=0.077307 | F1=0.7644, TPR(Recall)=0.6298, FPR=0.0628
+2026-04-30 10:40:24.915 | INFO     | __main__:main:113 - Trial 17/32 - units:32, latent:8, lr:0.01, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 10,797
+2026-04-30 10:43:38.171 | INFO     | __main__:main:180 -   Result: Test MSE=0.020718, Threshold=0.122614 | F1=0.6636, TPR(Recall)=0.5037, FPR=0.0497
+2026-04-30 10:43:38.171 | INFO     | __main__:main:113 - Trial 18/32 - units:32, latent:8, lr:0.01, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 10,797
+2026-04-30 10:45:41.338 | INFO     | __main__:main:180 -   Result: Test MSE=0.006919, Threshold=0.079515 | F1=0.7383, TPR(Recall)=0.5958, FPR=0.0625
+2026-04-30 10:45:41.338 | INFO     | __main__:main:113 - Trial 19/32 - units:32, latent:8, lr:0.01, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 10,797
+2026-04-30 10:49:23.669 | INFO     | __main__:main:180 -   Result: Test MSE=0.122847, Threshold=0.299423 | F1=0.5078, TPR(Recall)=0.3404, FPR=0.0010
+2026-04-30 10:49:23.669 | INFO     | __main__:main:113 - Trial 20/32 - units:32, latent:8, lr:0.01, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 10,797
+2026-04-30 10:51:46.510 | INFO     | __main__:main:180 -   Result: Test MSE=0.006146, Threshold=0.086787 | F1=0.7741, TPR(Recall)=0.6399, FPR=0.0472
+2026-04-30 10:51:46.510 | INFO     | __main__:main:113 - Trial 21/32 - units:32, latent:8, lr:0.001, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 10,797
+2026-04-30 10:54:59.734 | INFO     | __main__:main:180 -   Result: Test MSE=0.014699, Threshold=0.141412 | F1=0.4194, TPR(Recall)=0.2686, FPR=0.0418
+2026-04-30 10:54:59.734 | INFO     | __main__:main:113 - Trial 22/32 - units:32, latent:8, lr:0.001, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 10,797
+2026-04-30 10:57:02.806 | INFO     | __main__:main:180 -   Result: Test MSE=0.022344, Threshold=0.165949 | F1=0.6508, TPR(Recall)=0.4909, FPR=0.0605
+2026-04-30 10:57:02.806 | INFO     | __main__:main:113 - Trial 23/32 - units:32, latent:8, lr:0.001, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 10,797
+2026-04-30 11:00:46.265 | INFO     | __main__:main:180 -   Result: Test MSE=0.032223, Threshold=0.154295 | F1=0.2992, TPR(Recall)=0.1765, FPR=0.0126
+2026-04-30 11:00:46.266 | INFO     | __main__:main:113 - Trial 24/32 - units:32, latent:8, lr:0.001, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 8)              │           264 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 8)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         5,248 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 10,797 (42.18 KB)
+ Trainable params: 10,669 (41.68 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 8
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 10,797
+2026-04-30 11:03:08.898 | INFO     | __main__:main:180 -   Result: Test MSE=0.006451, Threshold=0.090988 | F1=0.6394, TPR(Recall)=0.4785, FPR=0.0640
+2026-04-30 11:03:08.898 | INFO     | __main__:main:113 - Trial 25/32 - units:32, latent:16, lr:0.01, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 12,085
+2026-04-30 11:06:20.888 | INFO     | __main__:main:180 -   Result: Test MSE=0.010622, Threshold=0.136917 | F1=0.6155, TPR(Recall)=0.4461, FPR=0.0120
+2026-04-30 11:06:20.888 | INFO     | __main__:main:113 - Trial 26/32 - units:32, latent:16, lr:0.01, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 12,085
+2026-04-30 11:08:23.598 | INFO     | __main__:main:180 -   Result: Test MSE=0.014914, Threshold=0.106601 | F1=0.4369, TPR(Recall)=0.2807, FPR=0.0154
+2026-04-30 11:08:23.598 | INFO     | __main__:main:113 - Trial 27/32 - units:32, latent:16, lr:0.01, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 12,085
+2026-04-30 11:12:07.775 | INFO     | __main__:main:180 -   Result: Test MSE=0.012657, Threshold=0.118580 | F1=0.3867, TPR(Recall)=0.2496, FPR=0.1440
+2026-04-30 11:12:07.775 | INFO     | __main__:main:113 - Trial 28/32 - units:32, latent:16, lr:0.01, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.01)
+  - Total Parameters: 12,085
+2026-04-30 11:14:30.644 | INFO     | __main__:main:180 -   Result: Test MSE=0.008334, Threshold=0.092519 | F1=0.8391, TPR(Recall)=0.7387, FPR=0.0771
+2026-04-30 11:14:30.644 | INFO     | __main__:main:113 - Trial 29/32 - units:32, latent:16, lr:0.001, lookback:10, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 12,085
+2026-04-30 11:17:44.328 | INFO     | __main__:main:180 -   Result: Test MSE=0.005921, Threshold=0.075828 | F1=0.5464, TPR(Recall)=0.3787, FPR=0.0254
+2026-04-30 11:17:44.328 | INFO     | __main__:main:113 - Trial 30/32 - units:32, latent:16, lr:0.001, lookback:10, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 10, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 10, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 10, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 10, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 10, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (10, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 12,085
+2026-04-30 11:19:47.856 | INFO     | __main__:main:180 -   Result: Test MSE=0.014458, Threshold=0.139331 | F1=0.3133, TPR(Recall)=0.1877, FPR=0.0355
+2026-04-30 11:19:47.856 | INFO     | __main__:main:113 - Trial 31/32 - units:32, latent:16, lr:0.001, lookback:20, batch:64
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 12,085
+2026-04-30 11:23:30.568 | INFO     | __main__:main:180 -   Result: Test MSE=0.003620, Threshold=0.055728 | F1=0.7046, TPR(Recall)=0.5546, FPR=0.0688
+2026-04-30 11:23:30.568 | INFO     | __main__:main:113 - Trial 32/32 - units:32, latent:16, lr:0.001, lookback:20, batch:128
+Simplified LSTM Autoencoder Architecture:
+Model: "LSTM_AE_FaultDetection"
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Layer (type)                    ┃ Output Shape           ┃       Param # ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ encoder_input (InputLayer)      │ (None, 20, 5)          │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ encoder_lstm (LSTM)             │ (None, 32)             │         4,864 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ enc_bn (BatchNormalization)     │ (None, 32)             │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ latent_space (Dense)            │ (None, 16)             │           528 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ repeat_vector (RepeatVector)    │ (None, 20, 16)         │             0 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ decoder_lstm (LSTM)             │ (None, 20, 32)         │         6,272 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ dec_bn (BatchNormalization)     │ (None, 20, 32)         │           128 │
+├─────────────────────────────────┼────────────────────────┼───────────────┤
+│ output (TimeDistributed)        │ (None, 20, 5)          │           165 │
+└─────────────────────────────────┴────────────────────────┴───────────────┘
+ Total params: 12,085 (47.21 KB)
+ Trainable params: 11,957 (46.71 KB)
+ Non-trainable params: 128 (512.00 B)
+
+Autoencoder Configuration:
+  - Encoder: 1 LSTM layer (32 units)
+  - Latent Dimension: 16
+  - Decoder: 1 LSTM layer (32 units)
+  - Output: Reconstructed sequences of shape (20, 5)
+  - Loss function: MSE (reconstruction loss)
+  - Optimizer: Adam (lr=0.001)
+  - Total Parameters: 12,085
+2026-04-30 11:25:53.908 | INFO     | __main__:main:180 -   Result: Test MSE=0.003976, Threshold=0.069727 | F1=0.7303, TPR(Recall)=0.5898, FPR=0.0886
+2026-04-30 11:25:53.908 | SUCCESS  | __main__:main:217 - Grid Search Complete. Best parameters: {'lstm_units': 16, 'latent_dim': 8, 'learning_rate': 0.001, 'lookback': 10, 'batch_size': 64, 'test_healthy_mse': 0.00047777287710914606, 'test_healthy_mae': 0.013485936152735342, 'test_healthy_r2': 0.9955361426683791, 'learned_threshold': np.float64(0.019242234367307435), 'true_positives': 157601, 'true_negatives': 53922, 'false_positives': 7198, 'false_negatives': 52750, 'precision': np.float64(0.9563225505009132), 'recall': np.float64(0.7492286701750883), 'f1_score': np.float64(0.8402025856324138)}
+2026-04-30 11:25:53.909 | SUCCESS  | __main__:main:250 - Metrics saved to /content/PFE_Experiments/experiments/metrics/lstmae_results.json
+2026-04-30 11:25:53.909 | SUCCESS  | __main__:main:251 - Best model saved to /content/PFE_Experiments/experiments/checkpoints/lstmae/lstmae_best.keras
+Updating lock file 'dvc.lock'
+
+To track the changes with git, run:
+
+	git add dvc.lock
+
+To enable auto staging, run:
+
+	dvc config core.autostage true
+Use `dvc push` to send your updates to remote storage.
