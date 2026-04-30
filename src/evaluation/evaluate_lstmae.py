@@ -43,46 +43,36 @@ def create_eval_sequences(data: np.ndarray, labels: np.ndarray, fault_labels: np
         
     return np.array(X), np.array(Y_binary), np.array(Y_multi)
 
-def print_class_statistics(seq_multi, tp_mask, fp_mask, fn_mask, tn_mask):
+def print_class_statistics(seq_multi, tp_mask, fn_mask):
     """
-    Prints precision/recall and counts for each distinct fault_label class 
-    by slicing out the respective counts.
+    Prints recall and counts for each distinct fault_label class.
+    Only evaluates faulty sequences, so TN and FP are excluded.
     """
-    unique_classes = np.unique(seq_multi)
+    unique_classes = [c for c in np.unique(seq_multi) if c != 0]
     
     logger.info("=" * 60)
-    logger.info(f"{'Class':<8} | {'Type':<8} | {'TP':<6} | {'TN':<6} | {'FP':<6} | {'FN':<6} | {'Prec':<7} | {'Recall':<7} | {'F1':<7}")
+    logger.info(f"{'Class':<8} | {'Total':<9} | {'Detected (TP)':<14} | {'Missed (FN)':<12} | {'Recall':<7}")
     logger.info("-" * 60)
     
     global_tp = np.sum(tp_mask)
-    global_tn = np.sum(tn_mask)
-    global_fp = np.sum(fp_mask)
     global_fn = np.sum(fn_mask)
+    global_total = global_tp + global_fn
     
     for cls in unique_classes:
         cls_mask = (seq_multi == cls)
         
-        # For class 0 (Healthy), its success is TN, failure is FP. TP/FN don't apply semantically to 'healthy' in Anomaly Detection as it's the negative class.
-        # But we can still count them locally (if seq_multi == 0, true label is 0)
         c_tp = np.sum(tp_mask & cls_mask)
-        c_tn = np.sum(tn_mask & cls_mask)
-        c_fp = np.sum(fp_mask & cls_mask)
         c_fn = np.sum(fn_mask & cls_mask)
+        c_total = c_tp + c_fn
         
-        c_prec = c_tp / (c_tp + c_fp) if (c_tp + c_fp) > 0 else 0.0
-        c_rec = c_tp / (c_tp + c_fn) if (c_tp + c_fn) > 0 else 0.0
-        c_f1 = 2 * c_prec * c_rec / (c_prec + c_rec) if (c_prec + c_rec) > 0 else 0.0
+        c_rec = c_tp / c_total if c_total > 0 else 0.0
         
-        type_str = "Healthy" if cls == 0 else "Fault"
-        
-        logger.info(f"{cls:<8} | {type_str:<8} | {c_tp:<6} | {c_tn:<6} | {c_fp:<6} | {c_fn:<6} | {c_prec:<7.4f} | {c_rec:<7.4f} | {c_f1:<7.4f}")
+        logger.info(f"{cls:<8} | {c_total:<9} | {c_tp:<14} | {c_fn:<12} | {c_rec:<7.4f}")
         
     logger.info("=" * 60)
     
-    g_prec = global_tp / (global_tp + global_fp) if (global_tp + global_fp) > 0 else 0.0
-    g_rec = global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else 0.0
-    g_f1 = 2 * g_prec * g_rec / (g_prec + g_rec) if (g_prec + g_rec) > 0 else 0.0
-    logger.info(f"{'ALL':<8} | {'Overall':<8} | {global_tp:<6} | {global_tn:<6} | {global_fp:<6} | {global_fn:<6} | {g_prec:<7.4f} | {g_rec:<7.4f} | {g_f1:<7.4f}")
+    g_rec = global_tp / global_total if global_total > 0 else 0.0
+    logger.info(f"{'ALL':<8} | {global_total:<9} | {global_tp:<14} | {global_fn:<12} | {g_rec:<7.4f}")
     logger.info("=" * 60)
 
 
@@ -121,6 +111,14 @@ def main():
     logger.info("Creating sequences...")
     X_seq, Y_binary_seq, Y_multi_seq = create_eval_sequences(data_array, labels_array, fault_labels_array, lookback)
 
+    # Keep ONLY faulty data for this evaluation
+    faulty_mask = (Y_binary_seq == 1)
+    X_seq = X_seq[faulty_mask]
+    Y_binary_seq = Y_binary_seq[faulty_mask]
+    Y_multi_seq = Y_multi_seq[faulty_mask]
+
+    logger.info(f"Filtered down to {len(X_seq)} purely faulty sequences.")
+
     logger.info("Running inference...")
     preds = model.predict(X_seq, batch_size=256)
     
@@ -130,15 +128,12 @@ def main():
     logger.info("Calculating statistics...")
     # Threshold masking
     predicted_anomalies = (seq_maes > threshold).astype(int)
-    actual_anomalies = Y_binary_seq
 
-    # Global masks
-    tp_mask = (predicted_anomalies == 1) & (actual_anomalies == 1)
-    tn_mask = (predicted_anomalies == 0) & (actual_anomalies == 0)
-    fp_mask = (predicted_anomalies == 1) & (actual_anomalies == 0)
-    fn_mask = (predicted_anomalies == 0) & (actual_anomalies == 1)
+    # Global masks (Since all sequences left are actual anomalies/faults, i.e., actual == 1)
+    tp_mask = (predicted_anomalies == 1)
+    fn_mask = (predicted_anomalies == 0)
 
-    print_class_statistics(Y_multi_seq, tp_mask, fp_mask, fn_mask, tn_mask)
+    print_class_statistics(Y_multi_seq, tp_mask, fn_mask)
 
 
 if __name__ == "__main__":
