@@ -2,6 +2,12 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import os
+
+# Fix matplotlib backend in headless/Colab environments before any keras imports
+os.environ['MPLBACKEND'] = 'Agg'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
