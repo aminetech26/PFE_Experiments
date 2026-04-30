@@ -27,7 +27,7 @@ data/interim/
 data/processed/
 
 # ── Model checkpoints (large, DVC-tracked) ───────────────────────────────
-experiments/checkpoints/
+# experiments/checkpoints/
 
 # ── Jupyter ───────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
