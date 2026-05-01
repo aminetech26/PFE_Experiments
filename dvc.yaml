@@ -35,11 +35,11 @@ stages:
 
   # Stage 2: active dataset feature engineering
   featurize:
-    cmd: uv run python -m src.data.featurize_pipeline --dataset ${active_dataset} --profile plus_physics --task classification
+    cmd: uv run python -m src.data.featurize_pipeline --dataset ${active_dataset} --profile baseline_raw --task anomaly_semisup
     deps:
       - src/data/features.py
       - src/data/featurize_pipeline.py
-      - data/processed/preprocessed/${active_dataset}/classification/
+      - data/processed/preprocessed/${active_dataset}/anomaly_semisup/
       - configs/data_config.yaml
     outs:
       - data/processed/features/${active_dataset}/
