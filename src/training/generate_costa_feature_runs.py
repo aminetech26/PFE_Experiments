@@ -24,7 +24,7 @@ def _all_profiles(config: dict) -> list[str]:
     profiles = config.get("feature_engineering", {}).get("profiles", {})
     if not isinstance(profiles, dict) or not profiles:
         raise ValueError("No feature_engineering.profiles found in configs/data_config.yaml")
-    return list(profiles.keys())
+    return [name for name in profiles.keys() if name != "plus_differential"]
 
 
 def _features_root(dataset: str, split_path: str) -> Path:
