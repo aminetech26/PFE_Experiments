@@ -13,7 +13,7 @@ experiment:
 anomaly_detection:
   # Runtime decomposition: ml and dl (no baseline namespace)
   ml:
-    active_model: isolation_forest
+    active_model: one_class_svm
     hpo:
       direction: maximize
       validation_mode: holdout
@@ -21,7 +21,7 @@ anomaly_detection:
       pruner: none
       study_name_prefix: anomaly_ml
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
-      n_trials_phase1: 20
+      n_trials_phase1: 30
       timeout_seconds: null
     models:
       isolation_forest:
@@ -29,7 +29,7 @@ anomaly_detection:
         contamination: [0.03, 0.05, 0.10]
       one_class_svm:
         scaling: standard          # StandardScaler fitted on train only
-        max_train_samples: 20000   # subsample cap for libsvm tractability
+        max_train_samples: 20000   
         cache_size_mb: 1000
         shrinking: true
         tol: 1.0e-3

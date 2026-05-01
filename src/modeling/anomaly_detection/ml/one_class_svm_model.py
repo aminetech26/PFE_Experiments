@@ -39,6 +39,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 def _default_comparison_records_path() -> Path:
     return get_experiments_root() / "metrics" / "anomaly_comparison_records.jsonl"
+
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
@@ -82,6 +84,98 @@ def _anomaly_score(model: OneClassSVM, x: np.ndarray) -> np.ndarray:
     return -model.decision_function(x)
 
 
+def _pick_sampling_group_column(df: pd.DataFrame, split_path: str) -> str | None:
+    if split_path == "path_b":
+        preferred = ["operating_day_id", "episode_id", "segment_id"]
+    else:
+        preferred = ["episode_id", "segment_id", "operating_day_id"]
+    for col in preferred:
+        if col in df.columns and bool(df[col].notna().any()):
+            return col
+    return None
+
+
+def _subsample_train_indices(
+    train_df: pd.DataFrame,
+    n_target: int,
+    seed: int,
+    split_path: str,
+) -> tuple[np.ndarray, dict]:
+    n_rows = len(train_df)
+    if n_target >= n_rows:
+        return np.arange(n_rows, dtype=np.int64), {
+            "strategy": "all_rows",
+            "group_col": None,
+            "n_groups": 0,
+            "n_selected": int(n_rows),
+        }
+
+    group_col = _pick_sampling_group_column(train_df, split_path)
+    rng = np.random.default_rng(seed)
+    if group_col is None:
+        idx = rng.choice(n_rows, size=n_target, replace=False)
+        return np.sort(idx.astype(np.int64)), {
+            "strategy": "row_random",
+            "group_col": None,
+            "n_groups": 0,
+            "n_selected": int(n_target),
+        }
+
+    groups = train_df[group_col]
+    valid_mask = groups.notna()
+    valid_df = train_df.loc[valid_mask].copy()
+    valid_df["__row_idx"] = np.flatnonzero(valid_mask.to_numpy())
+    by_group = valid_df.groupby(group_col, sort=False)["__row_idx"].apply(list)
+    group_keys = list(by_group.index)
+    rng.shuffle(group_keys)
+
+    n_groups = len(group_keys)
+    if n_groups == 0:
+        idx = rng.choice(n_rows, size=n_target, replace=False)
+        return np.sort(idx.astype(np.int64)), {
+            "strategy": "row_random",
+            "group_col": None,
+            "n_groups": 0,
+            "n_selected": int(n_target),
+        }
+
+    base_quota = n_target // n_groups
+    remainder = n_target % n_groups
+    selected: list[int] = []
+
+    for rank, g in enumerate(group_keys):
+        rows = by_group[g]
+        if not rows:
+            continue
+        quota = base_quota + (1 if rank < remainder else 0)
+        if quota <= 0:
+            continue
+        if quota >= len(rows):
+            selected.extend(rows)
+            continue
+
+        rows_sorted = np.array(sorted(rows), dtype=np.int64)
+        pos = np.linspace(0, len(rows_sorted) - 1, num=quota, dtype=int)
+        selected.extend(rows_sorted[pos].tolist())
+
+    selected_arr = np.array(sorted(set(selected)), dtype=np.int64)
+    if len(selected_arr) < n_target:
+        remaining = np.setdiff1d(np.arange(n_rows, dtype=np.int64), selected_arr)
+        top_up = rng.choice(remaining, size=n_target - len(selected_arr), replace=False)
+        selected_arr = np.sort(np.concatenate([selected_arr, top_up.astype(np.int64)]))
+    elif len(selected_arr) > n_target:
+        selected_arr = np.sort(
+            rng.choice(selected_arr, size=n_target, replace=False).astype(np.int64)
+        )
+
+    return selected_arr, {
+        "strategy": "group_quota_temporal_spacing",
+        "group_col": group_col,
+        "n_groups": int(n_groups),
+        "n_selected": int(len(selected_arr)),
+    }
+
+
 def _calibrate_threshold(
     scores: np.ndarray, labels: np.ndarray
 ) -> tuple[float, float, float, float]:
@@ -110,7 +204,10 @@ def _save_pr_curve(
     path: Path,
 ) -> None:
     fig, ax = plt.subplots(figsize=(7, 5))
-    for scores, labels, split in [(val_scores, val_labels, "Val"), (test_scores, test_labels, "Test")]:
+    for scores, labels, split in [
+        (val_scores, val_labels, "Val"),
+        (test_scores, test_labels, "Test"),
+    ]:
         prec, rec, _ = precision_recall_curve(labels, scores)
         auc = average_precision_score(labels, scores)
         ax.plot(rec, prec, label=f"{split} (PR-AUC={auc:.3f})")
@@ -136,7 +233,9 @@ def _save_score_histogram(
     ax.hist(val_scores[val_labels == 0], bins=60, alpha=0.5, label="Val — normal", density=True)
     if val_labels.sum() > 0:
         ax.hist(val_scores[val_labels == 1], bins=60, alpha=0.5, label="Val — fault", density=True)
-    ax.axvline(threshold, color="red", linestyle="--", linewidth=1.5, label=f"Threshold={threshold:.3f}")
+    ax.axvline(
+        threshold, color="red", linestyle="--", linewidth=1.5, label=f"Threshold={threshold:.3f}"
+    )
     ax.set_xlabel("Anomaly score (−decision_function)")
     ax.set_ylabel("Density")
     ax.set_title("Anomaly Score Distribution — One-Class SVM")
@@ -156,7 +255,9 @@ def _save_score_timeline(
     fig, ax = plt.subplots(figsize=(12, 4))
     colors = np.where(test_labels == 1, "red", "steelblue")
     ax.scatter(np.arange(len(test_scores)), test_scores, c=colors, s=2, alpha=0.5, rasterized=True)
-    ax.axhline(threshold, color="orange", linestyle="--", linewidth=1.5, label=f"Threshold={threshold:.3f}")
+    ax.axhline(
+        threshold, color="orange", linestyle="--", linewidth=1.5, label=f"Threshold={threshold:.3f}"
+    )
     ax.set_xlabel("Test sample index")
     ax.set_ylabel("Anomaly score")
     ax.set_title("Score Timeline (Test) — One-Class SVM  |  blue=normal  red=fault")
@@ -190,7 +291,8 @@ def run_one_class_svm(config: dict | None = None) -> None:
     # HPO search space = everything except fixed scalars like 'degree'
     search_space = {k: v for k, v in kernel_space.items() if k != "degree"}
 
-    max_train_samples: int = args.max_train_samples or int(ocsvm_cfg.get("max_train_samples", 20000))
+    _cfg_cap = ocsvm_cfg.get("max_train_samples")  # null in YAML → None → no cap
+    max_train_samples: int | None = args.max_train_samples or (int(_cfg_cap) if _cfg_cap else None)
     n_trials: int = args.n_trials or int(hpo_cfg.get("n_trials_phase1", 20))
     seed: int = args.seed
 
@@ -220,13 +322,17 @@ def run_one_class_svm(config: dict | None = None) -> None:
 
     non_normal_in_train = int((y_train != 0).sum())
     if non_normal_in_train:
-        logger.warning(f"Train contains {non_normal_in_train} non-normal rows — expected all-normal for semisup.")
+        logger.warning(
+            f"Train contains {non_normal_in_train} non-normal rows — expected all-normal for semisup."
+        )
 
     logger.info(
         f"Rows — train: {len(x_train):,}  val: {len(x_val):,} (faults: {y_val_bin.sum():,})  "
         f"test: {len(x_test):,} (faults: {y_test_bin.sum():,})"
     )
-    logger.info(f"Features: {len(features)} | Subsample cap: {max_train_samples:,}")
+    logger.info(
+        f"Features: {len(features)} | Subsample cap: {max_train_samples or 'none (all rows)'}"
+    )
 
     # ── Scale ─────────────────────────────────────────────────────────────────
     scaler = StandardScaler()
@@ -235,13 +341,30 @@ def run_one_class_svm(config: dict | None = None) -> None:
     x_test_scaled = scaler.transform(x_test)
 
     # Training subsample for SVM fit
-    rng = np.random.default_rng(seed)
-    if len(x_train_scaled) > max_train_samples:
-        idx = rng.choice(len(x_train_scaled), size=max_train_samples, replace=False)
+    sampling_meta: dict = {
+        "strategy": "all_rows",
+        "group_col": None,
+        "n_groups": 0,
+        "n_selected": int(len(x_train_scaled)),
+    }
+    if max_train_samples and len(x_train_scaled) > max_train_samples:
+        idx, sampling_meta = _subsample_train_indices(
+            train_df=train_df,
+            n_target=max_train_samples,
+            seed=seed,
+            split_path=args.split_path,
+        )
         x_fit = x_train_scaled[idx]
     else:
         x_fit = x_train_scaled
-    logger.info(f"SVM fit on {len(x_fit):,} samples (from {len(x_train_scaled):,} train rows)")
+    logger.info(
+        "SVM fit on {:,} samples (from {:,} train rows) | sampling={} group_col={} groups={}",
+        len(x_fit),
+        len(x_train_scaled),
+        sampling_meta.get("strategy"),
+        sampling_meta.get("group_col"),
+        sampling_meta.get("n_groups"),
+    )
 
     # ── HPO ───────────────────────────────────────────────────────────────────
     def objective(trial: optuna.Trial) -> float:
@@ -265,9 +388,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
             seed=seed,
             sampler_name=str(hpo_cfg.get("sampler", "tpe")),
             pruner_name=str(hpo_cfg.get("pruner", "none")),
-            study_name=(
-                f"{hpo_cfg.get('study_name_prefix', 'anomaly_ml')}_ocsvm_{kernel}"
-            ),
+            study_name=(f"{hpo_cfg.get('study_name_prefix', 'anomaly_ml')}_ocsvm_{kernel}"),
         )
         logger.info(f"Best params: {best_params} | Best val PR-AUC: {study.best_value:.4f}")
 
@@ -287,7 +408,9 @@ def run_one_class_svm(config: dict | None = None) -> None:
 
     # ── Threshold calibration ─────────────────────────────────────────────────
     threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, y_val_bin)
-    logger.info(f"Val — threshold={threshold:.4f} F1={val_f1:.4f} Prec={val_prec:.4f} Rec={val_rec:.4f}")
+    logger.info(
+        f"Val — threshold={threshold:.4f} F1={val_f1:.4f} Prec={val_prec:.4f} Rec={val_rec:.4f}"
+    )
 
     # ── Metrics ───────────────────────────────────────────────────────────────
     val_pr_auc = float(average_precision_score(y_val_bin, val_scores))
@@ -314,6 +437,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
         "test_recall_at_threshold": test_rec_val,
         "n_train_total": int(len(x_train)),
         "n_train_used_for_fit": int(len(x_fit)),
+        "sampling_groups": int(sampling_meta.get("n_groups", 0)),
         "n_support_vectors": n_sv,
         "fit_time_s": round(fit_time, 2),
     }
@@ -327,9 +451,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
     if args.artifacts_dir:
         artifacts_dir = Path(args.artifacts_dir)
     else:
-        artifacts_dir = (
-            get_experiments_root() / "anomaly" / "one_class_svm" / f"{kernel}_{ts}"
-        )
+        artifacts_dir = get_experiments_root() / "anomaly" / "one_class_svm" / f"{kernel}_{ts}"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     metrics_path = Path(args.metrics_path) if args.metrics_path else artifacts_dir / "metrics.json"
@@ -352,27 +474,41 @@ def run_one_class_svm(config: dict | None = None) -> None:
         init_tracking("anomaly")
         run_name = f"anomaly_one_class_svm_{kernel}_{ts}"
         with mlflow.start_run(run_name=run_name):
-            mlflow.set_tags({
-                "task": args.task,
-                "dataset": args.dataset,
-                "split_path": args.split_path,
-                "profile": str(args.profile),
-                "model": "one_class_svm",
-                "kernel": kernel,
-            })
-            mlflow.log_params({
-                **best_params,
-                "kernel": kernel,
-                "max_train_samples_cap": max_train_samples,
-                "n_train_used_for_fit": len(x_fit),
-                "n_features": len(features),
-                "scaling": ocsvm_cfg.get("scaling", "standard"),
-                "no_optuna": args.no_optuna,
-                "n_optuna_trials": n_trials if not args.no_optuna else 0,
-                "seed": seed,
-            })
+            mlflow.set_tags(
+                {
+                    "task": args.task,
+                    "dataset": args.dataset,
+                    "split_path": args.split_path,
+                    "profile": str(args.profile),
+                    "model": "one_class_svm",
+                    "kernel": kernel,
+                }
+            )
+            mlflow.log_params(
+                {
+                    **best_params,
+                    "kernel": kernel,
+                    "max_train_samples_cap": max_train_samples,
+                    "n_train_used_for_fit": len(x_fit),
+                    "sampling_strategy": str(sampling_meta.get("strategy")),
+                    "sampling_group_col": str(sampling_meta.get("group_col")),
+                    "sampling_n_groups": int(sampling_meta.get("n_groups", 0)),
+                    "n_features": len(features),
+                    "scaling": ocsvm_cfg.get("scaling", "standard"),
+                    "no_optuna": args.no_optuna,
+                    "n_optuna_trials": n_trials if not args.no_optuna else 0,
+                    "seed": seed,
+                }
+            )
             mlflow.log_metrics(metrics)
-            for p in (metrics_path, model_path, scaler_path, pr_curve_path, histogram_path, timeline_path):
+            for p in (
+                metrics_path,
+                model_path,
+                scaler_path,
+                pr_curve_path,
+                histogram_path,
+                timeline_path,
+            ):
                 if p.exists():
                     mlflow.log_artifact(str(p))
             mlflow.log_dict(manifest, "features_manifest.json")
@@ -395,6 +531,9 @@ def run_one_class_svm(config: dict | None = None) -> None:
                 "n_features": len(features),
                 "max_train_samples_cap": max_train_samples,
                 "n_train_used_for_fit": int(len(x_fit)),
+                "sampling_strategy": str(sampling_meta.get("strategy")),
+                "sampling_group_col": str(sampling_meta.get("group_col")),
+                "sampling_n_groups": int(sampling_meta.get("n_groups", 0)),
                 "n_support_vectors": n_sv,
                 "fit_time_s": round(fit_time, 2),
                 "threshold": threshold,
