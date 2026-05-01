@@ -1,0 +1,75 @@
+{
+  "timestamp_utc": "2026-05-01T14:48:53.654084+00:00",
+  "task": "anomaly_semisup",
+  "dataset": "costa",
+  "split_path": "path_a",
+  "model": "matrix_profile",
+  "feature_profile": "baseline_raw",
+  "feature_run_id": "baseline_raw",
+  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\anomaly_semisup\\runs\\baseline_raw",
+  "signal_column": "pdc",
+  "window_size": 30,
+  "threshold": 3.1095725399137915,
+  "best_val_f1": 0.26300446978039776,
+  "metrics": {
+    "train": {
+      "pr_auc": NaN,
+      "accuracy": 0.7768633475461918,
+      "f1": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "positive_rate": 0.2231366524538082,
+      "confusion_matrix": [
+        [
+          148673,
+          42703
+        ],
+        [
+          0,
+          0
+        ]
+      ]
+    },
+    "val": {
+      "pr_auc": 0.6738166396630438,
+      "accuracy": 0.298274830536178,
+      "f1": 0.26300446978039776,
+      "precision": 0.6260215252721497,
+      "recall": 0.1664712201602388,
+      "positive_rate": 0.20000740151360955,
+      "confusion_matrix": [
+        [
+          28059,
+          12127
+        ],
+        [
+          101643,
+          20300
+        ]
+      ]
+    },
+    "test": {
+      "pr_auc": 0.43232964364242205,
+      "accuracy": 0.43027829587634575,
+      "f1": 0.20236997457663636,
+      "precision": 0.37543567934000577,
+      "recall": 0.1385172600929662,
+      "positive_rate": 0.192504909112174,
+      "confusion_matrix": [
+        [
+          58159,
+          19532
+        ],
+        [
+          73021,
+          11741
+        ]
+      ]
+    }
+  },
+  "figures": {
+    "val_pr_curve": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\experiments\\figures\\anomaly\\matrix_profile\\val_pr_curve.png",
+    "val_score_hist": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\experiments\\figures\\anomaly\\matrix_profile\\val_score_hist.png",
+    "val_scores_timeline": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\experiments\\figures\\anomaly\\matrix_profile\\val_scores_timeline.png"
+  }
+}

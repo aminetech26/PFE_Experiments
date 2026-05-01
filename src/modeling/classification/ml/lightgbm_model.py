@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -170,6 +171,11 @@ def _resolve_threading(config: dict, args: argparse.Namespace) -> dict:
 
 
 def run_lightgbm(config: dict | None = None) -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Train Task B classification model (LightGBM + Optuna + MLflow)"
     )
