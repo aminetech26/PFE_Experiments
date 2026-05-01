@@ -13,6 +13,15 @@ CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
 
 TASKS = ("anomaly_semisup", "anomaly_supervised", "classification")
 SPLIT_PATHS = ("path_a", "path_b")
+ALL_PATHS_EXCLUDED_PROFILES = {"plus_differential"}
+PATH_A_EXCLUDED_PROFILES = {
+    "plus_all",
+    "plus_windowed",
+    "plus_multiscale",
+    "plus_wpd",
+    "plus_ceemdan",
+    "plus_wpd_ceemdan",
+}
 
 
 def _load_config() -> dict:
@@ -24,7 +33,15 @@ def _all_profiles(config: dict) -> list[str]:
     profiles = config.get("feature_engineering", {}).get("profiles", {})
     if not isinstance(profiles, dict) or not profiles:
         raise ValueError("No feature_engineering.profiles found in configs/data_config.yaml")
-    return [name for name in profiles.keys() if name != "plus_differential"]
+    return [name for name in profiles.keys() if name not in ALL_PATHS_EXCLUDED_PROFILES]
+
+
+def _profile_allowed_for_split(profile: str, split_path: str) -> bool:
+    if profile in ALL_PATHS_EXCLUDED_PROFILES:
+        return False
+    if split_path == "path_a" and profile in PATH_A_EXCLUDED_PROFILES:
+        return False
+    return True
 
 
 def _features_root(dataset: str, split_path: str) -> Path:
@@ -75,6 +92,13 @@ def _generate_feature_runs(
     for split_path in split_paths:
         for task in tasks:
             for profile in profiles:
+                if not _profile_allowed_for_split(profile, split_path):
+                    logger.info(
+                        "Skipping profile '{}' for split '{}' (path policy)", profile, split_path
+                    )
+                    skipped += 1
+                    continue
+
                 run_dir = _canonical_run_dir(dataset, split_path, task, profile)
                 if run_dir.exists() and not force:
                     logger.info("Skipping existing run: {}", run_dir)
