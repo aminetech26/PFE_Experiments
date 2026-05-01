@@ -473,10 +473,8 @@ def extract_window_statistics(x: np.ndarray) -> np.ndarray:
     """
     Collapse windows to statistical features.
     Input: (n_windows, window_size, n_features)
-    Output: (n_windows, n_features * 8)
+    Output: (n_windows, n_features * 6)
     """
-    from scipy.stats import kurtosis, skew
-
     n, w, f = x.shape
     features = []
     for i in range(f):
@@ -485,8 +483,6 @@ def extract_window_statistics(x: np.ndarray) -> np.ndarray:
         features.append(ch.std(axis=1))
         features.append(ch.min(axis=1))
         features.append(ch.max(axis=1))
-        features.append(skew(ch, axis=1))
-        features.append(kurtosis(ch, axis=1))
         features.append(np.sqrt((ch**2).mean(axis=1)))
         zcr = ((np.diff(np.sign(ch), axis=1) != 0).sum(axis=1)) / max(w - 1, 1)
         features.append(zcr)
@@ -572,7 +568,7 @@ def add_multiscale_window_features(
         logger.warning("No windows produced — check window_size vs segment lengths.")
         return pd.DataFrame(), []
 
-    stat_names = ["mean", "std", "min", "max", "skew", "kurtosis", "rms", "zcr"]
+    stat_names = ["mean", "std", "min", "max", "rms", "zcr"]
     parts: list[np.ndarray] = []
     col_names: list[str] = []
 
