@@ -4,18 +4,21 @@ import argparse
 from pathlib import Path
 
 BASE_DIR = Path("/content/drive/MyDrive/PV-FDD/optuna")
+ARTIFACTS_ROOT = BASE_DIR / "artifacts"
 
 
 def ensure_colab_tracking_dirs() -> dict[str, Path]:
     targets = {
         "db": BASE_DIR / "db",
-        "artifacts": BASE_DIR / "artifacts",
-        "ml_models": BASE_DIR / "artifacts" / "ml_models",
-        "dl_models": BASE_DIR / "artifacts" / "dl_models",
-        "metrics": BASE_DIR / "artifacts" / "metrics",
-        "plots": BASE_DIR / "artifacts" / "plots",
-        "logs": BASE_DIR / "artifacts" / "logs",
-        "checkpoints": BASE_DIR / "artifacts" / "checkpoints",
+        "artifacts": ARTIFACTS_ROOT,
+        "ml_models": ARTIFACTS_ROOT / "ml_models",
+        "dl_models": ARTIFACTS_ROOT / "dl_models",
+        "metrics": ARTIFACTS_ROOT / "metrics",
+        "plots": ARTIFACTS_ROOT / "plots",
+        "logs": ARTIFACTS_ROOT / "logs",
+        "checkpoints": ARTIFACTS_ROOT / "checkpoints",
+        "anomaly_ocsvm": ARTIFACTS_ROOT / "anomaly" / "one_class_svm",
+        "anomaly_iforest": ARTIFACTS_ROOT / "anomaly" / "isolation_forest",
     }
     for path in targets.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -32,6 +35,8 @@ def main() -> None:
 
     ensure_colab_tracking_dirs()
     print(f"Initialized tracking folders under: {BASE_DIR}")
+    print("\nAdd to your notebook to redirect all writes to Drive:")
+    print(f"  import os; os.environ['PFE_ARTIFACTS_ROOT'] = '{ARTIFACTS_ROOT}'")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import yaml
 
+from src.modeling.anomaly_detection.ml.one_class_svm_model import run_one_class_svm
+
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
 
@@ -40,10 +42,13 @@ def main() -> None:
     config = _load_model_config()
     active_model = str(known_args.model or _resolve_active_model(config))
 
-    if active_model in {"isolation_forest", "one_class_svm", "xgboost", "switching_kalman", "bocd"}:
+    if active_model == "one_class_svm":
+        run_one_class_svm(config=config)
+        return
+
+    if active_model in {"isolation_forest", "xgboost", "switching_kalman", "bocd"}:
         raise NotImplementedError(
-            "Anomaly ML baselines are currently scaffolded but not implemented: "
-            "isolation_forest, one_class_svm, xgboost, switching_kalman, bocd."
+            f"Anomaly ML baseline '{active_model}' is scaffolded but not yet implemented."
         )
 
     raise ValueError(f"Unsupported anomaly_detection ml model: {active_model}")

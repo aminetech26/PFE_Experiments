@@ -26,19 +26,26 @@ from src.modeling.common.hyperparameter_optimizer import (
     suggest_params_from_space,
 )
 from src.modeling.common.system_resources import compute_thread_budget, detect_cpu_resources
+from src.utils.paths import get_experiments_root
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
-DEFAULT_METRICS_PATH = PROJECT_ROOT / "experiments" / "metrics" / "classification_results.json"
-DEFAULT_LEAKAGE_REPORT_PATH = (
-    PROJECT_ROOT / "experiments" / "metrics" / "classification_leakage_report.json"
-)
-DEFAULT_COMPARISON_RECORDS_PATH = (
-    PROJECT_ROOT / "experiments" / "metrics" / "classification_comparison_records.jsonl"
-)
-DEFAULT_MODEL_PATH = (
-    PROJECT_ROOT / "experiments" / "checkpoints" / "classification" / "lightgbm_model.pkl"
-)
+
+
+def _default_metrics_path() -> Path:
+    return get_experiments_root() / "metrics" / "classification_results.json"
+
+
+def _default_leakage_report_path() -> Path:
+    return get_experiments_root() / "metrics" / "classification_leakage_report.json"
+
+
+def _default_comparison_records_path() -> Path:
+    return get_experiments_root() / "metrics" / "classification_comparison_records.jsonl"
+
+
+def _default_model_path() -> Path:
+    return get_experiments_root() / "checkpoints" / "classification" / "lightgbm_model.pkl"
 
 
 def _load_model_config() -> dict:
@@ -200,21 +207,21 @@ def run_lightgbm(config: dict | None = None) -> None:
     )
     parser.add_argument(
         "--metrics-path",
-        default=str(DEFAULT_METRICS_PATH),
+        default=str(_default_metrics_path()),
         help="Where to write metrics json",
     )
     parser.add_argument(
         "--leakage-report-path",
-        default=str(DEFAULT_LEAKAGE_REPORT_PATH),
+        default=str(_default_leakage_report_path()),
         help="Where to write leakage report json",
     )
     parser.add_argument(
         "--comparison-records-path",
-        default=str(DEFAULT_COMPARISON_RECORDS_PATH),
+        default=str(_default_comparison_records_path()),
         help="Where to append comparison record jsonl",
     )
     parser.add_argument(
-        "--model-path", default=str(DEFAULT_MODEL_PATH), help="Where to persist trained model"
+        "--model-path", default=str(_default_model_path()), help="Where to persist trained model"
     )
     parser.add_argument(
         "--no-optuna", action="store_true", help="Disable Optuna and use midpoint baseline params"
@@ -503,7 +510,7 @@ def run_lightgbm(config: dict | None = None) -> None:
             logger.info("Optuna complete | best_val_f1_weighted={:.6f}", float(study.best_value))
 
             trials_artifact = (
-                PROJECT_ROOT / "experiments" / "metrics" / "classification_optuna_trials.csv"
+                get_experiments_root() / "metrics" / "classification_optuna_trials.csv"
             )
             trials_artifact.parent.mkdir(parents=True, exist_ok=True)
             study.trials_dataframe().to_csv(trials_artifact, index=False)
@@ -631,7 +638,7 @@ def run_lightgbm(config: dict | None = None) -> None:
                                 f"final_{label}_{curve_metric}", vals[step], step=step
                             )
                 curves_artifact_path = (
-                    PROJECT_ROOT / "experiments" / "metrics" / "classification_training_curves.json"
+                    get_experiments_root() / "metrics" / "classification_training_curves.json"
                 )
                 curves_artifact_path.parent.mkdir(parents=True, exist_ok=True)
                 curves_artifact_path.write_text(
