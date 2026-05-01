@@ -42,7 +42,7 @@ stages:
       - data/processed/preprocessed/${active_dataset}/classification/
       - configs/data_config.yaml
     outs:
-      - data/processed/features/latest_runs.json
+      - data/processed/features/${active_dataset}/
 
   # Stage 3: active dataset Task B classification baseline
   train_classification:
@@ -58,7 +58,7 @@ stages:
       - src/modeling/common/hyperparameter_optimizer.py
       - src/modeling/common/system_resources.py
       - configs/model_config.yaml
-      - data/processed/features/latest_runs.json
+      - data/processed/features/${active_dataset}/latest_runs.json
     metrics:
       - experiments/metrics/classification_results.json:
           cache: false
