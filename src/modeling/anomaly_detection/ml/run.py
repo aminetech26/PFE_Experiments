@@ -6,8 +6,6 @@ from pathlib import Path
 
 import yaml
 
-from src.modeling.anomaly_detection.ml.matrix_profile_model import run_matrix_profile
-
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
 
@@ -42,13 +40,10 @@ def main() -> None:
     config = _load_model_config()
     active_model = str(known_args.model or _resolve_active_model(config))
 
-    if active_model == "matrix_profile":
-        run_matrix_profile(config=config)
-        return
-
     if active_model in {"isolation_forest", "one_class_svm", "xgboost", "switching_kalman", "bocd"}:
         raise NotImplementedError(
-            f"Anomaly ML model '{active_model}' is scaffolded but not implemented yet."
+            "Anomaly ML baselines are currently scaffolded but not implemented: "
+            "isolation_forest, one_class_svm, xgboost, switching_kalman, bocd."
         )
 
     raise ValueError(f"Unsupported anomaly_detection ml model: {active_model}")

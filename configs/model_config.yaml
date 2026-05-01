@@ -13,13 +13,13 @@ experiment:
 anomaly_detection:
   # Runtime decomposition: ml and dl (no baseline namespace)
   ml:
-    active_model: matrix_profile
+    active_model: isolation_forest
     hpo:
       direction: maximize
       validation_mode: holdout
       sampler: tpe
       pruner: none
-      study_name_prefix: anomaly_matrix_profile
+      study_name_prefix: anomaly_ml
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
       n_trials_phase1: 20
       timeout_seconds: null
@@ -30,8 +30,6 @@ anomaly_detection:
       one_class_svm:
         kernel: [rbf]
         nu: [0.03, 0.05, 0.10]
-      matrix_profile:
-        window_size: [30, 60, 120]
       bocd:
         hazard_lambda: [100, 500]
       switching_kalman:
