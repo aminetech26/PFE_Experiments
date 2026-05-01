@@ -69,7 +69,7 @@ def get_active_dataset(config: dict) -> str:
 
 
 def resolve_profile(config: dict, profile_name: str | None) -> tuple[dict, dict, dict, str | None]:
-    """Resolve effective flags, selection, and tsfresh settings from base + profile overrides."""
+    """Resolve base feature-engineering config (without profile overrides)."""
     fe_cfg = config.get("feature_engineering", {})
     flags = dict(fe_cfg.get("flags", {}))
     selection = dict(fe_cfg.get("selection", {}))
@@ -79,13 +79,33 @@ def resolve_profile(config: dict, profile_name: str | None) -> tuple[dict, dict,
         profile = fe_cfg.get("profiles", {}).get(profile_name)
         if profile is None:
             raise ValueError(f"Unknown feature engineering profile: {profile_name}")
-        for key, value in profile.items():
-            if key.startswith("enable_") or key in PROFILE_FLAG_KEYS:
-                flags[key] = value
-            elif key == "tsfresh_mode":
-                tsfresh_cfg["mode"] = value
 
     return flags, selection, tsfresh_cfg, profile_name
+
+
+def _apply_profile_overrides(
+    config: dict,
+    profile_name: str | None,
+    flags: dict,
+    tsfresh_cfg: dict,
+) -> tuple[dict, dict]:
+    if not profile_name:
+        return flags, tsfresh_cfg
+
+    fe_cfg = config.get("feature_engineering", {})
+    profile = fe_cfg.get("profiles", {}).get(profile_name)
+    if profile is None:
+        raise ValueError(f"Unknown feature engineering profile: {profile_name}")
+
+    eff_flags = dict(flags)
+    eff_tsfresh = dict(tsfresh_cfg)
+    for key, value in profile.items():
+        if key.startswith("enable_") or key in PROFILE_FLAG_KEYS:
+            eff_flags[key] = value
+        elif key == "tsfresh_mode":
+            eff_tsfresh["mode"] = value
+
+    return eff_flags, eff_tsfresh
 
 
 def get_base_feature_columns(df: pd.DataFrame) -> list[str]:
@@ -317,7 +337,11 @@ def _resolve_run_dir(base_run_dir: Path) -> Path:
     return base_run_dir.with_name(f"{base_run_dir.name}__{stamp}")
 
 
-def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, list[str]]:
+def add_optional_features(
+    df: pd.DataFrame,
+    flags: dict,
+    base_feature_cols: list[str] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
     """Apply enabled feature generators and return added feature names."""
     out = df.copy()
     added: list[str] = []
@@ -349,7 +373,10 @@ def add_optional_features(df: pd.DataFrame, flags: dict) -> tuple[pd.DataFrame, 
             added.append(c)
 
     if flags.get("enable_rolling_stats", False):
-        rolling_source_cols = infer_base_feature_columns(out)
+        if base_feature_cols:
+            rolling_source_cols = [c for c in base_feature_cols if c in out.columns]
+        else:
+            rolling_source_cols = infer_base_feature_columns(out)
         out, rolling_added = add_rolling_statistics_features(
             out,
             feature_cols=rolling_source_cols,
@@ -440,6 +467,7 @@ def main() -> None:
         base_tsfresh_cfg,
         task_directives,
     )
+    flags, tsfresh_cfg = _apply_profile_overrides(config, profile_name, flags, tsfresh_cfg)
 
     # Path-level admissibility guards.
     if args.split_path == "path_a":
@@ -547,7 +575,9 @@ def main() -> None:
 
     generated_cols: dict[str, list[str]] = {}
     for subset in ("train", "val", "test"):
-        split_frames[subset], added = add_optional_features(split_frames[subset], flags)
+        split_frames[subset], added = add_optional_features(
+            split_frames[subset], flags, base_feature_cols=base_cols
+        )
         generated_cols[subset] = added
 
     windowing_meta: dict = {"enabled": False}

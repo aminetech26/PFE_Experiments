@@ -362,11 +362,12 @@ feature_engineering:
   # ABLATION PROFILES
   # Named feature sets for systematic ablation experiments.
   # Additive layers: baseline_raw < plus_physics < plus_temporal
-    #   row-aligned track:  < plus_rolling < plus_wavelet / plus_differential < plus_all
+    #   row-aligned track:  < plus_rolling
     #   windowed track:     < plus_windowed < plus_multiscale
     #                       < plus_wpd (Path B only)
     #                       < plus_ceemdan (Path B only, slow)
     #                       < plus_wpd_ceemdan (Path B only, hybrid)
+    #                       < plus_all (Path B richest combined profile)
   # Run: uv run python -m src.data.featurize_pipeline --profile <name> --task <task>
   # ---------------------------------------------------------------------------
   profiles:
@@ -377,6 +378,11 @@ feature_engineering:
       enable_dV_dt:               false
       enable_dI_dt:               false
       enable_Vg_normalized:       false
+      enable_power_imbalance:     false
+      enable_current_imbalance:   false
+      enable_voltage_imbalance:   false
+      enable_string_share:        false
+      enable_temp_power_correction: false
       enable_corr_pruning:        false
       enable_vif_pruning:         false
       enable_wavelet:             false
@@ -417,23 +423,17 @@ feature_engineering:
       enable_dV_dt:               true
       enable_dI_dt:               true
       enable_Vg_normalized:       true
+      enable_power_imbalance:     true
+      enable_current_imbalance:   true
+      enable_voltage_imbalance:   true
+      enable_temp_power_correction: true
+      temp_ref_c:                 25.0
+      gamma_pmax_pct_per_c:       -0.40
+      temp_power_eps:             1e-8
+      irr_norm_floor:             1.0
       enable_corr_pruning:        false
       enable_vif_pruning:         false
       enable_wavelet:             false
-      wavelet_threshold_strategy: per_segment
-      enable_differential_signal: false
-      tsfresh_mode:               "off"
-
-    plus_wavelet:
-      enable_hour_cyclic:         true
-      enable_delta_temp:          true
-      enable_dP_dt:               true
-      enable_dV_dt:               true
-      enable_dI_dt:               true
-      enable_Vg_normalized:       true
-      enable_corr_pruning:        false
-      enable_vif_pruning:         false
-      enable_wavelet:             true
       wavelet_threshold_strategy: per_segment
       enable_differential_signal: false
       tsfresh_mode:               "off"
@@ -474,7 +474,7 @@ feature_engineering:
       enable_differential_signal: false
       enable_rolling_stats:       true
       rolling_windows:            [5, 10, 30]
-      rolling_stats:              [mean, std, min, max, skew, kurtosis, rms, zcr]
+      rolling_stats:              [mean, std, min, max, rms, zcr]
       tsfresh_mode:               "off"
 
     plus_windowed:
@@ -553,9 +553,9 @@ feature_engineering:
       enable_differential_signal: false
       enable_rolling_stats:       false
       enable_explicit_windowing:  true
+      window_size:                60
       window_step:                30
-      enable_multiscale:          true
-      multiscale_window_sizes:    [60, 30, 10]
+      enable_multiscale:          false
       enable_wpd:                 true    # Path B only — WPD subband energies
       wpd_level:                  3
       wpd_wavelet:                db4
@@ -585,9 +585,9 @@ feature_engineering:
       enable_differential_signal: false
       enable_rolling_stats:       false
       enable_explicit_windowing:  true
+      window_size:                60
       window_step:                30
-      enable_multiscale:          true
-      multiscale_window_sizes:    [60, 30, 10]
+      enable_multiscale:          false
       enable_wpd:                 false
       wpd_level:                  3
       wpd_wavelet:                db4
@@ -619,9 +619,9 @@ feature_engineering:
       enable_differential_signal: false
       enable_rolling_stats:       false
       enable_explicit_windowing:  true
+      window_size:                60
       window_step:                30
-      enable_multiscale:          true
-      multiscale_window_sizes:    [60, 30, 10]
+      enable_multiscale:          false
       enable_wpd:                 true    # Path B only — fixed-basis branch
       wpd_level:                  3
       wpd_wavelet:                db4
@@ -648,11 +648,22 @@ feature_engineering:
       irr_norm_floor:             1.0
       enable_corr_pruning:        false
       enable_vif_pruning:         false
-      enable_wavelet:             true
+      enable_wavelet:             false
       wavelet_threshold_strategy: per_segment
-      enable_differential_signal: true
-      enable_rolling_stats:       true
+      enable_differential_signal: false
+      enable_rolling_stats:       false
       rolling_windows:            [5, 10, 30]
-      rolling_stats:              [mean, std, min, max, skew, kurtosis, rms, zcr]
-      enable_explicit_windowing:  false   # rolling stats and windowing are exclusive
+      rolling_stats:              [mean, std, min, max, rms, zcr]
+      enable_explicit_windowing:  true
+      window_size:                60
+      window_step:                30
+      enable_multiscale:          true
+      multiscale_window_sizes:    [60, 30, 10]
+      enable_wpd:                 true
+      wpd_level:                  3
+      wpd_wavelet:                db4
+      enable_ceemdan:             true
+      ceemdan_n_imfs:             3
+      ceemdan_n_ensemble:         20
+      spectral_min_fs:            0.5
       tsfresh_mode:               "off"

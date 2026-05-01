@@ -16,6 +16,7 @@ SPLIT_PATHS = ("path_a", "path_b")
 ALL_PATHS_EXCLUDED_PROFILES = {"plus_differential"}
 PATH_A_EXCLUDED_PROFILES = {
     "plus_all",
+    "plus_temporal",
     "plus_windowed",
     "plus_multiscale",
     "plus_wpd",

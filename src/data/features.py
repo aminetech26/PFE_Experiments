@@ -11,6 +11,7 @@ This module provides:
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import Iterable
 
 import numpy as np
@@ -132,6 +133,7 @@ def add_rolling_statistics_features(
         original_index = None
 
     added: list[str] = []
+    generated_cols: dict[str, pd.Series] = {}
     grouped = out.groupby(segment_col, sort=False) if segment_col in out.columns else None
     for col in usable_cols:
         base_series = out[col]
@@ -179,11 +181,14 @@ def add_rolling_statistics_features(
             for stat_name, values in stats_data.items():
                 col_name = f"{col}_roll{w}_{stat_name}"
                 if grouped is not None:
-                    out[col_name] = values.reset_index(level=0, drop=True)
+                    series = values.reset_index(level=0, drop=True)
                 else:
-                    out[col_name] = values
-                out[col_name] = out[col_name].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    series = values
+                generated_cols[col_name] = series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
                 added.append(col_name)
+
+    if generated_cols:
+        out = pd.concat([out, pd.DataFrame(generated_cols, index=out.index)], axis=1)
 
     if original_index is not None:
         out = out.loc[original_index]
@@ -681,22 +686,53 @@ def extract_ceemdan_features(
     n_wins, _, n_feats = x.shape
     results = []
     ceemdan = CEEMDAN(trials=n_ensemble)
+    min_energy = 1e-12
+    min_std = 1e-8
+    skipped_flat = 0
+    skipped_nonfinite = 0
+    failed_decomp = 0
+
     for i in range(n_feats):
         ch = x[:, :, i]
         imf_energies = np.zeros((n_wins, n_imfs), dtype=np.float32)
         for w in range(n_wins):
             signal = np.nan_to_num(ch[w].astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-            total_energy = float(np.sum(signal**2)) + 1e-10
+            if not np.all(np.isfinite(signal)):
+                skipped_nonfinite += 1
+                continue
+
+            total_energy = float(np.sum(signal**2))
+            if total_energy <= min_energy or float(np.std(signal)) <= min_std:
+                skipped_flat += 1
+                continue
+
             try:
-                imfs = np.asarray(ceemdan.ceemdan(signal, max_imf=n_imfs), dtype=np.float64)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    imfs = np.asarray(ceemdan.ceemdan(signal, max_imf=n_imfs), dtype=np.float64)
+
                 if imfs.ndim != 2 or imfs.shape[0] == 0:
                     continue
+
+                imfs = np.nan_to_num(imfs, nan=0.0, posinf=0.0, neginf=0.0)
                 usable_imfs = imfs[:-1] if imfs.shape[0] > 1 else imfs
                 for k in range(min(n_imfs, usable_imfs.shape[0])):
                     imf_energies[w, k] = float(np.sum(usable_imfs[k] ** 2)) / total_energy
             except Exception as e:
+                failed_decomp += 1
                 logger.debug(f"CEEMDAN failed for window {w}, feature {i}: {e}")
         results.append(imf_energies)
+
+    total_pairs = n_wins * n_feats
+    if skipped_flat or skipped_nonfinite or failed_decomp:
+        logger.info(
+            "CEEMDAN guards: skipped_flat={} skipped_nonfinite={} failed_decomp={} total_pairs={}",
+            skipped_flat,
+            skipped_nonfinite,
+            failed_decomp,
+            total_pairs,
+        )
+
     return np.hstack(results).astype(np.float32)
 
 
