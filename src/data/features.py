@@ -804,7 +804,9 @@ def apply_hygiene_pruning(
     if {"pdc", "pdc1", "pdc2"}.issubset(keep_set):
         lhs = train_df["pdc"].to_numpy(dtype=np.float64)
         rhs = (train_df["pdc1"] + train_df["pdc2"]).to_numpy(dtype=np.float64)
-        if np.allclose(lhs, rhs, equal_nan=True, atol=1e-9, rtol=1e-9):
+        close_mask = np.isclose(lhs, rhs, equal_nan=True, atol=1e-9, rtol=1e-9)
+        close_ratio = float(np.mean(close_mask)) if close_mask.size else 0.0
+        if np.all(close_mask):
             keep = [c for c in keep if c != "pdc"]
             dropped_log.append(
                 {
@@ -812,6 +814,11 @@ def apply_hygiene_pruning(
                     "paired_with": "pdc1+pdc2",
                     "reason": "deterministic_alias",
                 }
+            )
+        else:
+            logger.info(
+                "Hygiene alias check kept 'pdc': equivalence with pdc1+pdc2 holds for {:.2%} rows",
+                close_ratio,
             )
 
     keep_extra = [c for c in train_df.columns if c not in feature_cols]
@@ -846,7 +853,12 @@ def apply_mrmr_selection(
         logger.warning("mRMR skipped: missing label column")
         return train_df, val_df, test_df, cols, []
 
-    if k <= 0 or k >= len(cols):
+    if k <= 0:
+        logger.info("mRMR skipped: k={} is non-positive", k)
+        return train_df, val_df, test_df, cols, []
+
+    if k >= len(cols):
+        logger.info("mRMR skipped: k={} >= available feature count {}", k, len(cols))
         return train_df, val_df, test_df, cols, []
 
     x_df = train_df[cols].replace([np.inf, -np.inf], np.nan)

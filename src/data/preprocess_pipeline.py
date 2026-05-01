@@ -46,10 +46,29 @@ def get_active_dataset(config: dict) -> str:
 def get_feature_cols(config: dict, dataset: str) -> list[str]:
     """Resolve dataset-aware base feature columns used by preprocessing."""
     dataset_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
+    preprocess_sensor_cols = dataset_cfg.get("preprocessing", {}).get("sensor_columns")
+    if preprocess_sensor_cols:
+        return list(preprocess_sensor_cols)
+
     sensor_cols = dataset_cfg.get("feature_engineering", {}).get("sensor_columns")
     if sensor_cols:
         return list(sensor_cols)
     return list(DEFAULT_BASE_FEATURE_COLUMNS)
+
+
+def _restore_costa_power_channels(df: pd.DataFrame, dataset: str) -> pd.DataFrame:
+    """Restore Costa power-channel invariants from cleaned primary sensors."""
+    if dataset != "costa":
+        return df
+    required = {"vdc1", "vdc2", "idc1", "idc2"}
+    if not required.issubset(df.columns):
+        return df
+
+    out = df.copy()
+    out["pdc1"] = out["vdc1"] * out["idc1"]
+    out["pdc2"] = out["vdc2"] * out["idc2"]
+    out["pdc"] = out["pdc1"] + out["pdc2"]
+    return out
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -116,7 +135,7 @@ def _sanity_check_subset(
     errors: list[str] = []
 
     # 1. Label integrity
-    if df[label_col].isna().any():
+    if bool(df[label_col].isna().any()):
         errors.append(f"{tag} label column contains NaN after preprocessing")
     if len(df) == 0:
         errors.append(f"{tag} output is empty — all rows dropped")
@@ -232,6 +251,7 @@ def preprocess_split(
     input_dir: Path,
     output_dir: Path,
     split_name: str,
+    dataset: str,
     feature_cols: list[str],
     preprocess_config: dict,
     label_col: str = "Fault",
@@ -244,6 +264,7 @@ def preprocess_split(
         input_dir: Directory containing train.parquet, val.parquet, test.parquet
         output_dir: Output directory for preprocessed files
         split_name: Name of the split for logging
+        dataset: Dataset name
         feature_cols: Feature columns to preprocess
         preprocess_config: Preprocessing configuration dict
         label_col: Label column name
@@ -309,6 +330,8 @@ def preprocess_split(
             outlier_reference_bounds=train_bounds if subset != "train" else None,
         )
 
+        df_processed = _restore_costa_power_channels(df_processed, dataset)
+
         total_output_rows += len(df_processed)
 
         # Sanity checks before saving
@@ -360,7 +383,13 @@ def create_manifest(
         "created_at": datetime.now(UTC).isoformat(),
         # Only include explicit preprocessing config (exclude physics_normalization);
         # physics_normalization is a feature-engineering concern now.
-        "config_used": (lambda c: {k: v for k, v in (c.get("preprocessing") or {}).items() if k != "physics_normalization"})(config),
+        "config_used": (
+            lambda c: {
+                k: v
+                for k, v in (c.get("preprocessing") or {}).items()
+                if k != "physics_normalization"
+            }
+        )(config),
         "split_path": config.get("split_path", "path_a"),
         "splits": split_stats,
         "features_created": [],
@@ -432,6 +461,7 @@ def main() -> None:
             input_dir=input_dir,
             output_dir=output_dir,
             split_name=split_name,
+            dataset=args.dataset,
             feature_cols=feature_cols,
             preprocess_config=preprocess_config,
             label_col=label_col,

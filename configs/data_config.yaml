@@ -129,6 +129,7 @@ paths:
         missing_values:
           enabled: false
         physics_normalization: null
+        sensor_columns: [vdc1, vdc2, idc1, idc2, irr, pvt]
 
       feature_engineering:
         sensor_columns: [vdc1, vdc2, idc1, idc2, pdc1, pdc2, pdc, irr, pvt]
