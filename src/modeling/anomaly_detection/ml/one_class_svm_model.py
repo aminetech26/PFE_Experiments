@@ -15,6 +15,7 @@ import pandas as pd
 import yaml
 from loguru import logger
 from sklearn.metrics import (
+    accuracy_score,
     average_precision_score,
     f1_score,
     precision_recall_curve,
@@ -419,7 +420,10 @@ def run_one_class_svm(config: dict | None = None) -> None:
     test_roc_auc = float(roc_auc_score(y_test_bin, test_scores))
 
     test_preds = (test_scores >= threshold).astype(int)
+    val_preds = (val_scores >= threshold).astype(int)
+    val_acc = float(accuracy_score(y_val_bin, val_preds))
     test_f1 = float(f1_score(y_test_bin, test_preds, zero_division=0))
+    test_acc = float(accuracy_score(y_test_bin, test_preds))
     test_prec_val = float(precision_score(y_test_bin, test_preds, zero_division=0))
     test_rec_val = float(recall_score(y_test_bin, test_preds, zero_division=0))
 
@@ -427,12 +431,14 @@ def run_one_class_svm(config: dict | None = None) -> None:
         "val_pr_auc": val_pr_auc,
         "val_roc_auc": val_roc_auc,
         "val_f1_at_threshold": val_f1,
+        "val_accuracy_at_threshold": val_acc,
         "val_precision_at_threshold": val_prec,
         "val_recall_at_threshold": val_rec,
         "threshold": threshold,
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "test_f1_at_threshold": test_f1,
+        "test_accuracy_at_threshold": test_acc,
         "test_precision_at_threshold": test_prec_val,
         "test_recall_at_threshold": test_rec_val,
         "n_train_total": int(len(x_train)),
@@ -442,7 +448,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
         "fit_time_s": round(fit_time, 2),
     }
     logger.info(
-        f"Test — PR-AUC={test_pr_auc:.4f}  ROC-AUC={test_roc_auc:.4f}  "
+        f"Test — PR-AUC={test_pr_auc:.4f}  ROC-AUC={test_roc_auc:.4f}  ACC@thr={test_acc:.4f}  "
         f"F1@thr={test_f1:.4f}  Prec={test_prec_val:.4f}  Rec={test_rec_val:.4f}"
     )
 
@@ -540,8 +546,10 @@ def run_one_class_svm(config: dict | None = None) -> None:
                 "val_pr_auc": val_pr_auc,
                 "val_roc_auc": val_roc_auc,
                 "val_f1_at_threshold": val_f1,
+                "val_accuracy_at_threshold": val_acc,
                 "test_pr_auc": test_pr_auc,
                 "test_roc_auc": test_roc_auc,
+                "test_accuracy_at_threshold": test_acc,
                 "test_f1_at_threshold": test_f1,
                 "test_precision_at_threshold": test_prec_val,
                 "test_recall_at_threshold": test_rec_val,
