@@ -273,8 +273,8 @@ feature_engineering:
     gamma_pmax_pct_per_c:      -0.40
     temp_power_eps:            1e-8
     irr_norm_floor:            1.0
-    enable_hygiene_pruning:    false
-    enable_mrmr_selection:     false
+    enable_hygiene_pruning:    true
+    enable_mrmr_selection:     true
     mrmr_k:                    64
     enable_corr_pruning:       false
     enable_vif_pruning:        false
@@ -384,6 +384,8 @@ feature_engineering:
       enable_voltage_imbalance:   false
       enable_string_share:        false
       enable_temp_power_correction: false
+      enable_hygiene_pruning:     false
+      enable_mrmr_selection:      false
       enable_corr_pruning:        false
       enable_vif_pruning:         false
       enable_wavelet:             false
