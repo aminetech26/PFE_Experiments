@@ -65,14 +65,23 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=20, help="Epochs per grid search trial")
     parser.add_argument("--test-split", type=float, default=0.2, help="Train/Test split ratio for healthy data")
+    
+    # Optional parameters to bypass grid search and run a single model
+    parser.add_argument("--lstm-units", type=int, default=None, help="LSTM units (bypasses grid search)")
+    parser.add_argument("--latent-dim", type=int, default=None, help="Latent dim (bypasses grid search)")
+    parser.add_argument("--learning-rate", type=float, default=None, help="Learning rate (bypasses grid search)")
+    parser.add_argument("--lookback", type=int, default=None, help="Sequence lookback (bypasses grid search)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (bypasses grid search)")
+    
     args = parser.parse_args()
 
-    # Grid Search space expanded
-    lstm_units_grid = [16, 32]
-    latent_dim_grid = [8, 16]
-    lr_grid = [0.01, 0.001]
-    lookback_grid = [10, 20]
-    batch_size_grid = [64, 128]
+    # Determine Grid Search Space 
+    # If a specific argument corresponds is provided, it turns into a single-item list
+    lstm_units_grid = [args.lstm_units] if args.lstm_units else [16, 32]
+    latent_dim_grid = [args.latent_dim] if args.latent_dim else [8, 16]
+    lr_grid = [args.learning_rate] if args.learning_rate else [0.01, 0.001]
+    lookback_grid = [args.lookback] if args.lookback else [10, 20]
+    batch_size_grid = [args.batch_size] if args.batch_size else [64, 128]
     
     # Check physical paths
     parquet_path = Path(args.parquet_path)
