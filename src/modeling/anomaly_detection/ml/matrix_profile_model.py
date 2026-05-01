@@ -7,7 +7,8 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-os.environ.setdefault("MPLBACKEND", "Agg")
+# Colab notebooks export an inline backend that is not always available inside uv's venv.
+os.environ["MPLBACKEND"] = "Agg"
 
 import matplotlib.pyplot as plt
 import mlflow
