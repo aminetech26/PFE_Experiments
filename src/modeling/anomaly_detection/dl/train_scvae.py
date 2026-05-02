@@ -66,19 +66,32 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--window-size", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--h-dim", type=int, default=64)
+    parser.add_argument("--z-dim", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--no-grid", action="store_true", help="Train a single config instead of grid search")
     args = parser.parse_args()
 
     train_loader, val_loader = load_and_prepare_data(args.parquet_path, args.window_size, args.batch_size)
     
-    # Hyperparameters to search over
-    param_grid = {
-        'h_dim': [32, 64],
-        'z_dim': [8, 16],
-        'lr': [1e-3, 5e-4]
-    }
-    
-    keys, values = zip(*param_grid.items())
-    combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    if args.no_grid:
+        combinations = [
+            {
+                "h_dim": args.h_dim,
+                "z_dim": args.z_dim,
+                "lr": args.lr,
+            }
+        ]
+    else:
+        # Hyperparameters to search over
+        param_grid = {
+            "h_dim": [32, 64],
+            "z_dim": [8, 16],
+            "lr": [1e-3, 5e-4],
+        }
+
+        keys, values = zip(*param_grid.items())
+        combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
     
     best_loss = float('inf')
     best_params = None
