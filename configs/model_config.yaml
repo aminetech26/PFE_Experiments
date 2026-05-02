@@ -21,7 +21,7 @@ anomaly_detection:
       pruner: none
       study_name_prefix: anomaly_ml
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
-      n_trials_phase1: 30
+      n_trials_phase1: 50
       timeout_seconds: null
     models:
       isolation_forest:
@@ -35,8 +35,8 @@ anomaly_detection:
         tol: 1.0e-3
         kernels:
           rbf:
-            nu: {type: float, low: 0.01, high: 0.20, log: true}
-            gamma: {type: categorical, choices: [scale, auto, 0.01, 0.1, 1.0]}
+            nu: {type: float, low: 0.003, high: 0.12, log: true}
+            gamma: {type: float, low: 0.003, high: 0.3, log: true}
           poly:
             degree: 3              # cubic — fixed
             nu: {type: float, low: 0.01, high: 0.20, log: true}

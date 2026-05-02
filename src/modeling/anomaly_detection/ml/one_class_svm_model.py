@@ -534,6 +534,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
                 "feature_run_dir": str(resolved_run_dir),
                 "optuna_enabled": not args.no_optuna,
                 "optuna_n_trials_requested": n_trials if not args.no_optuna else 0,
+                "best_params": best_params,
                 "n_features": len(features),
                 "max_train_samples_cap": max_train_samples,
                 "n_train_used_for_fit": int(len(x_fit)),
