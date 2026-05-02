@@ -112,3 +112,16 @@ stages:
           cache: false
     outs:
       - experiments/checkpoints/lstmvae/lstmvae_best.keras
+
+  # Stage 8: SCVAE Anomaly Detection
+  train_scvae:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_scvae
+    deps:
+      - src/modeling/anomaly_detection/dl/scvae_model.py
+      - src/modeling/anomaly_detection/dl/train_scvae.py
+      - data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
+    metrics:
+      - experiments/metrics/scvae_results.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/scvae/scvae_best.pth
