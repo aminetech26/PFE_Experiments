@@ -203,6 +203,7 @@ def _save_pr_curve(
     test_scores: np.ndarray,
     test_labels: np.ndarray,
     path: Path,
+    model_name: str = "Anomaly Model",
 ) -> None:
     fig, ax = plt.subplots(figsize=(7, 5))
     for scores, labels, split in [
@@ -214,7 +215,7 @@ def _save_pr_curve(
         ax.plot(rec, prec, label=f"{split} (PR-AUC={auc:.3f})")
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.set_title("PR Curve — One-Class SVM")
+    ax.set_title(f"PR Curve — {model_name}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -228,6 +229,7 @@ def _save_score_histogram(
     val_labels: np.ndarray,
     threshold: float,
     path: Path,
+    model_name: str = "Anomaly Model",
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.hist(train_scores, bins=80, alpha=0.5, label="Train (normal)", density=True)
@@ -239,7 +241,7 @@ def _save_score_histogram(
     )
     ax.set_xlabel("Anomaly score (−decision_function)")
     ax.set_ylabel("Density")
-    ax.set_title("Anomaly Score Distribution — One-Class SVM")
+    ax.set_title(f"Anomaly Score Distribution — {model_name}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -252,6 +254,7 @@ def _save_score_timeline(
     test_labels: np.ndarray,
     threshold: float,
     path: Path,
+    model_name: str = "Anomaly Model",
 ) -> None:
     fig, ax = plt.subplots(figsize=(12, 4))
     colors = np.where(test_labels == 1, "red", "steelblue")
@@ -261,7 +264,7 @@ def _save_score_timeline(
     )
     ax.set_xlabel("Test sample index")
     ax.set_ylabel("Anomaly score")
-    ax.set_title("Score Timeline (Test) — One-Class SVM  |  blue=normal  red=fault")
+    ax.set_title(f"Score Timeline (Test) — {model_name}  |  blue=normal  red=fault")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -470,9 +473,29 @@ def run_one_class_svm(config: dict | None = None) -> None:
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     joblib.dump(final_model, model_path)
     joblib.dump(scaler, scaler_path)
-    _save_pr_curve(val_scores, y_val_bin, test_scores, y_test_bin, pr_curve_path)
-    _save_score_histogram(train_scores, val_scores, y_val_bin, threshold, histogram_path)
-    _save_score_timeline(test_scores, y_test_bin, threshold, timeline_path)
+    _save_pr_curve(
+        val_scores,
+        y_val_bin,
+        test_scores,
+        y_test_bin,
+        pr_curve_path,
+        model_name="One-Class SVM",
+    )
+    _save_score_histogram(
+        train_scores,
+        val_scores,
+        y_val_bin,
+        threshold,
+        histogram_path,
+        model_name="One-Class SVM",
+    )
+    _save_score_timeline(
+        test_scores,
+        y_test_bin,
+        threshold,
+        timeline_path,
+        model_name="One-Class SVM",
+    )
     logger.info(f"Artifacts saved → {artifacts_dir}")
 
     # ── MLflow ────────────────────────────────────────────────────────────────

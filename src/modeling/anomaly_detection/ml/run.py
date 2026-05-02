@@ -6,6 +6,7 @@ from pathlib import Path
 
 import yaml
 
+from src.modeling.anomaly_detection.ml.isolation_forest_model import run_isolation_forest
 from src.modeling.anomaly_detection.ml.one_class_svm_model import run_one_class_svm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -46,7 +47,11 @@ def main() -> None:
         run_one_class_svm(config=config)
         return
 
-    if active_model in {"isolation_forest", "xgboost", "switching_kalman", "bocd"}:
+    if active_model == "isolation_forest":
+        run_isolation_forest(config=config)
+        return
+
+    if active_model in {"xgboost", "switching_kalman", "bocd"}:
         raise NotImplementedError(
             f"Anomaly ML baseline '{active_model}' is scaffolded but not yet implemented."
         )
