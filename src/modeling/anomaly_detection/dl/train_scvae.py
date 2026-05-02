@@ -51,6 +51,7 @@ def load_and_prepare_data(data_path, window_size, batch_size):
     val_data = windows[split_idx:]
 
     # Expand dims to match architecture requirement: (batch, seq_len, feature_dim, input_dim)
+    train_data = train_data.copy()
     train_tensor = torch.from_numpy(train_data).unsqueeze(2)
     val_tensor = torch.from_numpy(val_data).unsqueeze(2)
     

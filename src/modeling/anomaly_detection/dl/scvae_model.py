@@ -98,7 +98,7 @@ class SCVAE(nn.Module):
         nll_loss = 0
 
         for t in range(len(self.h_chain)):
-            normal_t = Normal(self.Xr_mean[t], self.Xr_std[t])
+            normal_t = Normal(self.Xr_mean[t], self.Xr_std[t] + 1e-4) # Added epsilon to prevent variance collapse
             # Avoid nan in KLD
             kld_loss += self._kld_gauss(self.Z_mean[t], self.Z_std[t] + 1e-8, self.pZ_mean[t], self.pZ_std[t] + 1e-8)
             nll_loss -= normal_t.log_prob(X[t] + 1e-8).sum()
