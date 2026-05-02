@@ -79,6 +79,7 @@ def _build_model_params(cfg: dict, seed: int, scale_pos_weight: float) -> dict:
         "random_state": seed,
         "verbosity": 0,
         "scale_pos_weight": scale_pos_weight,
+        "early_stopping_rounds": int(cfg.get("early_stopping_rounds", 50)),
     }
 
 
@@ -153,9 +154,17 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
     )
     base_params = _build_model_params(xgb_cfg, seed=seed, scale_pos_weight=spw)
 
+    def _merge_trial_params(raw_params: dict) -> tuple[dict, float]:
+        spw_mul = float(raw_params.pop("scale_pos_weight_multiplier", 1.0))
+        return raw_params, spw_mul
+
     def objective(trial: optuna.Trial) -> float:
         trial_params = suggest_params_from_space(trial, search_space)
-        model = XGBClassifier(**base_params, **trial_params)
+        trial_params, spw_mul = _merge_trial_params(dict(trial_params))
+        model = XGBClassifier(
+            **_build_model_params(xgb_cfg, seed=seed, scale_pos_weight=spw * spw_mul),
+            **trial_params,
+        )
         model.fit(x_fit, y_fit, eval_set=[(x_val, y_val)], verbose=False)
         scores = model.predict_proba(x_val)[:, 1]
         return float(average_precision_score(y_val, scores))
@@ -174,8 +183,14 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
             study_name=f"{hpo_cfg.get('study_name_prefix', 'anomaly_ml')}_xgboost",
         )
 
+    best_params, best_spw_mul = _merge_trial_params(dict(best_params))
+    effective_spw = spw * best_spw_mul
+
     t0 = time.perf_counter()
-    final_model = XGBClassifier(**base_params, **best_params)
+    final_model = XGBClassifier(
+        **_build_model_params(xgb_cfg, seed=seed, scale_pos_weight=effective_spw),
+        **best_params,
+    )
     final_model.fit(x_fit, y_fit, eval_set=[(x_val, y_val)], verbose=False)
     fit_time = time.perf_counter() - t0
 
@@ -214,7 +229,8 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
         "n_train_used_for_fit": int(len(x_fit)),
         "n_train_positive": n_pos_fit,
         "n_train_negative": n_neg_fit,
-        "scale_pos_weight": spw,
+        "scale_pos_weight": effective_spw,
+        "scale_pos_weight_multiplier": best_spw_mul,
         "fit_time_s": round(fit_time, 2),
         "best_iteration": int(getattr(final_model, "best_iteration", -1) or -1),
     }
@@ -234,9 +250,29 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
 
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     joblib.dump(final_model, model_path)
-    _save_pr_curve(val_scores, y_val, test_scores, y_test, pr_curve_path)
-    _save_score_histogram(train_scores, val_scores, y_val, threshold, histogram_path)
-    _save_score_timeline(test_scores, y_test, threshold, timeline_path)
+    _save_pr_curve(
+        val_scores,
+        y_val,
+        test_scores,
+        y_test,
+        pr_curve_path,
+        model_name="XGBoost",
+    )
+    _save_score_histogram(
+        train_scores,
+        val_scores,
+        y_val,
+        threshold,
+        histogram_path,
+        model_name="XGBoost",
+    )
+    _save_score_timeline(
+        test_scores,
+        y_test,
+        threshold,
+        timeline_path,
+        model_name="XGBoost",
+    )
 
     try:
         init_tracking("anomaly")
@@ -259,7 +295,8 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
                     "sampling_strategy": sampling_meta.get("strategy"),
                     "n_features": len(features),
                     "seed": seed,
-                    "scale_pos_weight": spw,
+                    "scale_pos_weight": effective_spw,
+                    "scale_pos_weight_multiplier": best_spw_mul,
                 }
             )
             mlflow.log_metrics(metrics)

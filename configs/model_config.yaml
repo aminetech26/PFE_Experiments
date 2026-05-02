@@ -32,9 +32,9 @@ anomaly_detection:
         bootstrap: false
         warm_start: false
         search_space:
-          n_estimators: {type: int, low: 400, high: 1000, step: 100}
-          max_samples: {type: categorical, choices: [1024, 2048, 4096, auto]}
-          max_features: {type: float, low: 0.4, high: 0.8, step: 0.1}
+          n_estimators: {type: int, low: 200, high: 600, step: 100}
+          max_samples: {type: categorical, choices: [512, 1024, 2048, auto]}
+          max_features: {type: float, low: 0.5, high: 1.0, step: 0.1}
       one_class_svm:
         scaling: standard          # StandardScaler fitted on train only
         max_train_samples: 20000   
@@ -50,6 +50,26 @@ anomaly_detection:
             nu: {type: float, low: 0.01, high: 0.20, log: true}
             gamma: {type: categorical, choices: [scale, auto, 0.01, 0.1]}
             coef0: {type: float, low: 0.0, high: 1.0}
+      xgboost:
+        scaling: none
+        max_train_samples: null
+        objective: binary:logistic
+        eval_metric: aucpr
+        tree_method: hist
+        n_jobs: -1
+        early_stopping_rounds: 50
+        auto_scale_pos_weight: true
+        search_space:
+          n_estimators: {type: int, low: 400, high: 2000, step: 100}
+          learning_rate: {type: float, low: 0.02, high: 0.08, log: true}
+          max_depth: {type: int, low: 3, high: 6}
+          min_child_weight: {type: float, low: 1.0, high: 32.0, log: true}
+          subsample: {type: float, low: 0.5, high: 0.9}
+          colsample_bytree: {type: float, low: 0.4, high: 0.9}
+          gamma: {type: categorical, choices: [0.0, 0.001, 0.01, 0.1, 0.3, 1.0, 3.0]}
+          reg_alpha: {type: categorical, choices: [0.0, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0]}
+          reg_lambda: {type: float, low: 1.0e-6, high: 100.0, log: true}
+          scale_pos_weight_multiplier: {type: categorical, choices: [0.25, 0.5, 1.0, 2.0]}
       bocd:
         hazard_lambda: [100, 500]
       switching_kalman:

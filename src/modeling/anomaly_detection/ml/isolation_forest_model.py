@@ -175,8 +175,8 @@ def run_isolation_forest(config: dict | None = None) -> None:
 
     if args.no_optuna or not search_space:
         best_params = midpoint_params_from_space(search_space) if search_space else {}
-        study = None
         logger.info("HPO skipped — using midpoint params: {}", best_params)
+        study = None
     else:
         logger.info("Running Optuna HPO: {} trials", n_trials)
         best_params, study = run_optuna(
