@@ -303,6 +303,7 @@ feature_engineering:
     corr_threshold: 0.95
     vif_threshold:  10.0
     max_vif_rows:   50000
+    max_mrmr_rows:  30000
     near_constant_std: 1e-10
     # anchor_features: overridden per dataset (dataset has the right column names)
     anchor_features: [dP_dt, dV_dt, dI_dt]   # safe global default

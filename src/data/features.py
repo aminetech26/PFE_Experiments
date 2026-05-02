@@ -842,6 +842,8 @@ def apply_mrmr_selection(
     feature_cols: list[str],
     label_col: str,
     k: int,
+    max_rows: int | None = 30000,
+    seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], list[dict]]:
     """Greedy mRMR (MID criterion): maximize relevance - redundancy."""
     from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
@@ -861,15 +863,97 @@ def apply_mrmr_selection(
         logger.info("mRMR skipped: k={} >= available feature count {}", k, len(cols))
         return train_df, val_df, test_df, cols, []
 
-    x_df = train_df[cols].replace([np.inf, -np.inf], np.nan)
-    x_df = x_df.fillna(x_df.median(numeric_only=True))
-    x = x_df.to_numpy(dtype=np.float64)
-
     y_raw = train_df[label_col]
     y_codes, _ = pd.factorize(y_raw, sort=True)
     if len(np.unique(y_codes)) <= 1:
         logger.warning("mRMR skipped: single-class train target")
         return train_df, val_df, test_df, cols, []
+
+    x_df = train_df[cols].replace([np.inf, -np.inf], np.nan)
+    x_df = x_df.fillna(x_df.median(numeric_only=True))
+
+    if max_rows and len(x_df) > max_rows:
+
+        def _proportional_quotas(counts: dict[int, int], total: int) -> dict[int, int]:
+            total_count = sum(counts.values())
+            raw = {k: (v / total_count) * total for k, v in counts.items()}
+            q = {k: int(np.floor(v)) for k, v in raw.items()}
+            rem = total - sum(q.values())
+            if rem > 0:
+                order = sorted(counts.keys(), key=lambda k: raw[k] - q[k], reverse=True)
+                for k in order[:rem]:
+                    q[k] += 1
+            return q
+
+        def _pick_group_col(df: pd.DataFrame) -> str | None:
+            for c in ("episode_id", "segment_id", "operating_day_id"):
+                if c in df.columns and bool(df[c].notna().any()):
+                    return c
+            return None
+
+        rng = np.random.default_rng(seed)
+        y_arr = np.asarray(y_codes)
+        cls_counts = {int(c): int(np.sum(y_arr == c)) for c in np.unique(y_arr)}
+        cls_quota = _proportional_quotas(cls_counts, int(max_rows))
+        group_col = _pick_group_col(train_df)
+        sampled_idx: list[int] = []
+
+        for cls, quota in cls_quota.items():
+            cls_idx = np.flatnonzero(y_arr == cls)
+            if quota <= 0 or len(cls_idx) == 0:
+                continue
+            if quota >= len(cls_idx):
+                sampled_idx.extend(cls_idx.tolist())
+                continue
+
+            if group_col is None:
+                sampled_idx.extend(rng.choice(cls_idx, size=quota, replace=False).tolist())
+                continue
+
+            groups = train_df.iloc[cls_idx][group_col].fillna("__NA__")
+            grp_counts = groups.value_counts().to_dict()
+            grp_quota = _proportional_quotas(
+                {i: int(v) for i, v in enumerate(grp_counts.values())}, quota
+            )
+            grp_keys = list(grp_counts.keys())
+
+            for gi, gval in enumerate(grp_keys):
+                g_rows = cls_idx[np.flatnonzero(groups.to_numpy() == gval)]
+                gq = int(grp_quota.get(gi, 0))
+                if gq <= 0:
+                    continue
+                if gq >= len(g_rows):
+                    sampled_idx.extend(g_rows.tolist())
+                else:
+                    # Temporal spacing within group to reduce autocorrelation.
+                    g_rows_sorted = np.array(sorted(g_rows), dtype=np.int64)
+                    pos = np.linspace(0, len(g_rows_sorted) - 1, num=gq, dtype=int)
+                    sampled_idx.extend(g_rows_sorted[pos].tolist())
+
+        sampled_idx = sorted(set(int(i) for i in sampled_idx))
+        if len(sampled_idx) < max_rows:
+            remaining = np.setdiff1d(
+                np.arange(len(x_df), dtype=np.int64), np.array(sampled_idx, dtype=np.int64)
+            )
+            top_up = rng.choice(remaining, size=max_rows - len(sampled_idx), replace=False)
+            sampled_idx.extend(int(i) for i in top_up.tolist())
+            sampled_idx = sorted(set(sampled_idx))
+        elif len(sampled_idx) > max_rows:
+            sampled_idx = sorted(
+                rng.choice(
+                    np.array(sampled_idx, dtype=np.int64), size=max_rows, replace=False
+                ).tolist()
+            )
+
+        x_df = x_df.iloc[sampled_idx]
+        y_codes = y_codes[sampled_idx]
+        logger.info(
+            "mRMR row cap applied: sampled {} / {} rows (strategy=proportional stratified group-aware)",
+            len(sampled_idx),
+            len(train_df),
+        )
+
+    x = x_df.to_numpy(dtype=np.float64)
 
     relevance_arr = mutual_info_classif(x, y_codes, random_state=42)
     relevance = {c: float(relevance_arr[i]) for i, c in enumerate(cols)}
@@ -905,6 +989,8 @@ def apply_mrmr_selection(
             break
         selected.append(best_col)
         remaining.remove(best_col)
+        if len(selected) % 5 == 0 or len(selected) == k:
+            logger.info("mRMR progress: selected {}/{} features", len(selected), k)
 
     dropped_log = [
         {"dropped": c, "reason": "mrmr_not_selected", "relevance": relevance.get(c, 0.0)}

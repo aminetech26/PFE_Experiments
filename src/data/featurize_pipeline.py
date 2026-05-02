@@ -682,6 +682,8 @@ def main() -> None:
             selected_features,
             label_col=label_col,
             k=int(flags.get("mrmr_k", 64)),
+            max_rows=int(selection_effective.get("max_mrmr_rows", 30000)),
+            seed=42,
         )
 
     if flags.get("enable_corr_pruning", False) and selected_features:
