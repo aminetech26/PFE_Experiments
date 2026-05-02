@@ -92,8 +92,9 @@ def main():
     lookback = metrics["best_parameters"]["lookback"]
     logger.info(f"Loaded Lookback: {lookback}. Available threshold methods: {list(thresholds_dict.keys())}")
 
+    from src.modeling.anomaly_detection.dl.lstm_vae_model import Sampling
     logger.info(f"Loading model from {args.model_path}")
-    model = tf.keras.models.load_model(args.model_path)
+    model = tf.keras.models.load_model(args.model_path, custom_objects={'Sampling': Sampling})
 
     logger.info(f"Loading dataset from {args.dataset_path}")
     df = pd.read_parquet(args.dataset_path)

@@ -3,6 +3,7 @@ from tensorflow.keras.layers import RepeatVector, TimeDistributed, Input, LSTM, 
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 
+@tf.keras.utils.register_keras_serializable()
 class Sampling(Layer):
     """Uses (z_mean, z_log_var) to sample z, the vector encoding the latent representation."""
     def call(self, inputs):
