@@ -10,6 +10,13 @@ class Sampling(Layer):
         batch = tf.shape(z_mean)[0]
         dim = tf.shape(z_mean)[1]
         epsilon = tf.keras.backend.random_normal(shape=(batch, dim))
+        
+        # Add KL Divergence loss during the forward pass
+        kl_loss = -0.5 * tf.reduce_mean(
+            z_log_var - tf.square(z_mean) - tf.exp(z_log_var) + 1
+        )
+        self.add_loss(kl_loss)
+        
         return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
 def build_lstm_vae_model(
@@ -33,7 +40,7 @@ def build_lstm_vae_model(
     z_mean = Dense(latent_dim, name='z_mean')(x)
     z_log_var = Dense(latent_dim, name='z_log_var')(x)
     
-    # VAE: Sampling layer
+    # VAE: Sampling layer (adds KL loss automatically)
     z = Sampling(name='sampling')([z_mean, z_log_var])
     
     # Decoder
@@ -51,12 +58,6 @@ def build_lstm_vae_model(
     
     # Create model
     model = Model(encoder_input, decoder_output, name='LSTM_VAE_FaultDetection')
-
-    # KL Divergence Loss Calculation
-    kl_loss = -0.5 * tf.reduce_mean(
-        z_log_var - tf.square(z_mean) - tf.exp(z_log_var) + 1
-    )
-    model.add_loss(kl_loss)
 
     # Compile model (Reconstruction Loss + Added KL Loss)
     model.compile(
