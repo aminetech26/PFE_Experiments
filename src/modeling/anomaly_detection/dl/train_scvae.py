@@ -21,11 +21,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def create_windows(data, window_size):
     """Creates overlapping sliding windows from the time series data."""
-    chunks = []
-    for t in range(data.shape[0] - window_size + 1):
-        chunks.append(data[t : t + window_size, :])
-    # output shape: (seq_len, batch_size, input_dim) to match SCVAE expected shape
-    return np.stack(chunks).swapaxes(0, 1)
+    if data.shape[0] < window_size:
+        raise ValueError("window_size is larger than the number of samples")
+
+    # Shape: (num_windows, window_size, input_dim)
+    windows = np.lib.stride_tricks.sliding_window_view(data, (window_size, data.shape[1]))
+    windows = windows.reshape(-1, window_size, data.shape[1])
+    return windows
 
 def load_and_prepare_data(data_path, window_size, batch_size):
     logger.info(f"Loading data from {data_path}")
@@ -38,19 +40,19 @@ def load_and_prepare_data(data_path, window_size, batch_size):
     
     # Scale data
     data = (data - np.nanmin(data, axis=0)) / (np.nanmax(data, axis=0) - np.nanmin(data, axis=0) + 1e-8)
-    data = np.nan_to_num(data)
+    data = np.nan_to_num(data).astype(np.float32, copy=False)
     
-    # Create windows
+    # Create windows: (num_windows, seq_len, input_dim)
     windows = create_windows(data, window_size)
-    
-    # Split Train/Val (80/20)
-    split_idx = int(windows.shape[1] * 0.8)
-    train_data = windows[:, :split_idx, :]
-    val_data = windows[:, split_idx:, :]
-    
-    # Expand dims to match architecture requirement: (seq_len, Batch, feature_dim, input_dim) 
-    train_tensor = torch.tensor(train_data, dtype=torch.float32).unsqueeze(2)
-    val_tensor = torch.tensor(val_data, dtype=torch.float32).unsqueeze(2)
+
+    # Split Train/Val (80/20) by window index
+    split_idx = int(windows.shape[0] * 0.8)
+    train_data = windows[:split_idx]
+    val_data = windows[split_idx:]
+
+    # Expand dims to match architecture requirement: (batch, seq_len, feature_dim, input_dim)
+    train_tensor = torch.from_numpy(train_data).unsqueeze(2)
+    val_tensor = torch.from_numpy(val_data).unsqueeze(2)
     
     # We use X as both input and target for autoencoder
     train_loader = DataLoader(TensorDataset(train_tensor, train_tensor), batch_size=batch_size, shuffle=True)
