@@ -1,0 +1,74 @@
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1777635874.924878   58460 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1777635876.568604   58460 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2026-05-01 11:44:38,111 [INFO] Loading metrics and settings from /content/PFE_Experiments/experiments/metrics/lstmae_results.json
+2026-05-01 11:44:38,111 [INFO] Loaded Lookback: 20. Available threshold methods: ['90th_percentile', '95th_percentile', '99th_percentile', 'max', 'mean_plus_3std']
+2026-05-01 11:44:38,111 [INFO] Loading model from /content/PFE_Experiments/experiments/checkpoints/lstmae/lstmae_best.keras
+2026-05-01 11:44:39,793 [INFO] Loading dataset from /content/PFE_Experiments/data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
+2026-05-01 11:44:39,876 [WARNING] 'fault_label' column missing, defaulting class splits to 'label' column directly.
+2026-05-01 11:44:39,876 [INFO] Creating sequences...
+2026-05-01 11:44:48,938 [INFO] Filtered down to 212300 purely faulty sequences.
+2026-05-01 11:44:48,939 [INFO] Running inference...
+830/830 ━━━━━━━━━━━━━━━━━━━━ 3s 3ms/step
+2026-05-01 11:44:53,467 [INFO] Calculating statistics for each feature threshold method...
+2026-05-01 11:44:53,467 [INFO] 
+>>>> EVALUATING THRESHOLD METHOD: 90TH_PERCENTILE <<<<
+2026-05-01 11:44:53,477 [INFO] ============================================================
+2026-05-01 11:44:53,477 [INFO] Class    | Total     | Detected (TP)  | Missed (FN)  | Recall 
+2026-05-01 11:44:53,477 [INFO] ------------------------------------------------------------
+2026-05-01 11:44:53,478 [INFO] 1        | 6097      | 6097           | 0            | 1.0000 
+2026-05-01 11:44:53,478 [INFO] 2        | 10490     | 10490          | 0            | 1.0000 
+2026-05-01 11:44:53,479 [INFO] 3        | 6141      | 6141           | 0            | 1.0000 
+2026-05-01 11:44:53,479 [INFO] 4        | 189572    | 163657         | 25915        | 0.8633 
+2026-05-01 11:44:53,479 [INFO] ============================================================
+2026-05-01 11:44:53,479 [INFO] ALL      | 212300    | 186385         | 25915        | 0.8779 
+2026-05-01 11:44:53,479 [INFO] ============================================================
+2026-05-01 11:44:53,480 [INFO] 
+>>>> EVALUATING THRESHOLD METHOD: 95TH_PERCENTILE <<<<
+2026-05-01 11:44:53,489 [INFO] ============================================================
+2026-05-01 11:44:53,489 [INFO] Class    | Total     | Detected (TP)  | Missed (FN)  | Recall 
+2026-05-01 11:44:53,489 [INFO] ------------------------------------------------------------
+2026-05-01 11:44:53,490 [INFO] 1        | 6097      | 6097           | 0            | 1.0000 
+2026-05-01 11:44:53,490 [INFO] 2        | 10490     | 10490          | 0            | 1.0000 
+2026-05-01 11:44:53,491 [INFO] 3        | 6141      | 6141           | 0            | 1.0000 
+2026-05-01 11:44:53,491 [INFO] 4        | 189572    | 150389         | 39183        | 0.7933 
+2026-05-01 11:44:53,491 [INFO] ============================================================
+2026-05-01 11:44:53,491 [INFO] ALL      | 212300    | 173117         | 39183        | 0.8154 
+2026-05-01 11:44:53,491 [INFO] ============================================================
+2026-05-01 11:44:53,491 [INFO] 
+>>>> EVALUATING THRESHOLD METHOD: 99TH_PERCENTILE <<<<
+2026-05-01 11:44:53,501 [INFO] ============================================================
+2026-05-01 11:44:53,501 [INFO] Class    | Total     | Detected (TP)  | Missed (FN)  | Recall 
+2026-05-01 11:44:53,501 [INFO] ------------------------------------------------------------
+2026-05-01 11:44:53,502 [INFO] 1        | 6097      | 6097           | 0            | 1.0000 
+2026-05-01 11:44:53,502 [INFO] 2        | 10490     | 10490          | 0            | 1.0000 
+2026-05-01 11:44:53,503 [INFO] 3        | 6141      | 6141           | 0            | 1.0000 
+2026-05-01 11:44:53,503 [INFO] 4        | 189572    | 128043         | 61529        | 0.6754 
+2026-05-01 11:44:53,503 [INFO] ============================================================
+2026-05-01 11:44:53,503 [INFO] ALL      | 212300    | 150771         | 61529        | 0.7102 
+2026-05-01 11:44:53,503 [INFO] ============================================================
+2026-05-01 11:44:53,503 [INFO] 
+>>>> EVALUATING THRESHOLD METHOD: MAX <<<<
+2026-05-01 11:44:53,513 [INFO] ============================================================
+2026-05-01 11:44:53,513 [INFO] Class    | Total     | Detected (TP)  | Missed (FN)  | Recall 
+2026-05-01 11:44:53,513 [INFO] ------------------------------------------------------------
+2026-05-01 11:44:53,514 [INFO] 1        | 6097      | 719            | 5378         | 0.1179 
+2026-05-01 11:44:53,515 [INFO] 2        | 10490     | 318            | 10172        | 0.0303 
+2026-05-01 11:44:53,515 [INFO] 3        | 6141      | 6141           | 0            | 1.0000 
+2026-05-01 11:44:53,516 [INFO] 4        | 189572    | 8081           | 181491       | 0.0426 
+2026-05-01 11:44:53,516 [INFO] ============================================================
+2026-05-01 11:44:53,516 [INFO] ALL      | 212300    | 15259          | 197041       | 0.0719 
+2026-05-01 11:44:53,516 [INFO] ============================================================
+2026-05-01 11:44:53,516 [INFO] 
+>>>> EVALUATING THRESHOLD METHOD: MEAN_PLUS_3STD <<<<
+2026-05-01 11:44:53,525 [INFO] ============================================================
+2026-05-01 11:44:53,525 [INFO] Class    | Total     | Detected (TP)  | Missed (FN)  | Recall 
+2026-05-01 11:44:53,525 [INFO] ------------------------------------------------------------
+2026-05-01 11:44:53,526 [INFO] 1        | 6097      | 6097           | 0            | 1.0000 
+2026-05-01 11:44:53,527 [INFO] 2        | 10490     | 10269          | 221          | 0.9789 
+2026-05-01 11:44:53,527 [INFO] 3        | 6141      | 6141           | 0            | 1.0000 
+2026-05-01 11:44:53,528 [INFO] 4        | 189572    | 130444         | 59128        | 0.6881 
+2026-05-01 11:44:53,528 [INFO] ============================================================
+2026-05-01 11:44:53,528 [INFO] ALL      | 212300    | 152951         | 59349        | 0.7204 
+2026-05-01 11:44:53,528 [INFO] ============================================================

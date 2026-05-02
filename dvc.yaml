@@ -99,3 +99,16 @@ stages:
           cache: false
     outs:
       - experiments/checkpoints/lstmae/lstmae_best.keras
+
+  # Stage 7: LSTM-VAE Anomaly Detection
+  train_lstmvae:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_lstmvae
+    deps:
+      - src/modeling/anomaly_detection/dl/lstm_vae_model.py
+      - src/modeling/anomaly_detection/dl/train_lstmvae.py
+      - data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
+    metrics:
+      - experiments/metrics/lstmvae_results.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/lstmvae/lstmvae_best.keras
