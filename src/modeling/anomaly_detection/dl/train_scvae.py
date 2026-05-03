@@ -1,185 +1,307 @@
+# -*- coding: utf-8 -*-
 import argparse
-import os
-import json
-import torch
-import torch.optim as optim
-import pandas as pd
-import numpy as np
-import itertools
 from pathlib import Path
-from loguru import logger
-from torch.utils.data import DataLoader, TensorDataset
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import TensorDataset
+from torch.utils.data import DataLoader
+
 from src.modeling.anomaly_detection.dl.scvae_model import SCVAE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_scvae" / "scvae_preprocessed.parquet"
-DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "experiments" / "checkpoints" / "scvae"
-DEFAULT_METRICS_DIR = PROJECT_ROOT / "experiments" / "metrics"
-DEFAULT_INPUT_COLS = ["pvt", "irr", "pdc1", "pdc2"]
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "experiments" / "checkpoints" / "scvae" / "scvae_best.pth"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TIMESTAMP_COL = "timestamp"
+INPUT_FEATURES = ["pvt", "irr"]
+OUTPUT_FEATURES = ["pdc1", "pdc2"]
 
-def create_windows(data, window_size):
-    """Creates overlapping sliding windows from the time series data."""
-    if data.shape[0] < window_size:
-        raise ValueError("window_size is larger than the number of samples")
 
-    # Shape: (num_windows, window_size, input_dim)
-    windows = np.lib.stride_tricks.sliding_window_view(data, (window_size, data.shape[1]))
-    windows = windows.reshape(-1, window_size, data.shape[1])
-    return windows
+def _resolve_device(device_str: str) -> torch.device:
+    if device_str.startswith("cuda") and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(device_str)
 
-def load_and_prepare_data(data_path, window_size, batch_size):
-    logger.info(f"Loading data from {data_path}")
-    df = pd.read_parquet(data_path)
-    
-    # Filter ONLY healthy data for training the VAE (label == 0) if applicable
-    # The data is already preprocessed (z-score standardized) in preprocess_scvae.py
-    data = df[DEFAULT_INPUT_COLS].values
-    
-    data = np.nan_to_num(data).astype(np.float32, copy=False)
-    
-    # Create windows: (num_windows, seq_len, input_dim)
-    windows = create_windows(data, window_size)
 
-    # Split Train/Val (80/20) by window index
-    split_idx = int(windows.shape[0] * 0.8)
-    train_data = windows[:split_idx]
-    val_data = windows[split_idx:]
+def load_daily_sequences(parquet_path: str | Path, expected_steps: int | None = None) -> tuple[np.ndarray, int]:
+    df = pd.read_parquet(parquet_path)
+    if "label" in df.columns:
+        df = df[df["label"] == 0].copy()
 
-    # Expand dims to match architecture requirement: (batch, seq_len, feature_dim, input_dim)
-    train_data = train_data.copy()
-    train_tensor = torch.from_numpy(train_data).unsqueeze(2)
-    val_tensor = torch.from_numpy(val_data).unsqueeze(2)
-    
-    # We use X as both input and target for autoencoder
-    train_loader = DataLoader(TensorDataset(train_tensor, train_tensor), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(TensorDataset(val_tensor, val_tensor), batch_size=batch_size, shuffle=False)
-    
-    return train_loader, val_loader
+    feature_cols = INPUT_FEATURES + OUTPUT_FEATURES
+    missing = [col for col in feature_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in parquet: {missing}")
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--parquet-path", type=str, default=str(DEFAULT_DATA_PATH))
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--window-size", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--h-dim", type=int, default=64)
-    parser.add_argument("--z-dim", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--no-grid", action="store_true", help="Train a single config instead of grid search")
-    args = parser.parse_args()
+    if TIMESTAMP_COL not in df.columns:
+        raise ValueError(f"Missing timestamp column '{TIMESTAMP_COL}' in parquet")
 
-    train_loader, val_loader = load_and_prepare_data(args.parquet_path, args.window_size, args.batch_size)
-    
-    if args.no_grid:
-        combinations = [
-            {
-                "h_dim": args.h_dim,
-                "z_dim": args.z_dim,
-                "lr": args.lr,
-            }
-        ]
-    else:
-        # Hyperparameters to search over
-        param_grid = {
-            "h_dim": [32, 64],
-            "z_dim": [8, 16],
-            "lr": [1e-3, 5e-4],
-        }
+    df = df.dropna(subset=[TIMESTAMP_COL] + feature_cols).copy()
+    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True, errors="coerce")
+    df = df.dropna(subset=[TIMESTAMP_COL])
+    df = df.sort_values(TIMESTAMP_COL)
 
-        keys, values = zip(*param_grid.items())
-        combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
-    
-    best_loss = float('inf')
-    best_params = None
-    best_model_state = None
-    results_history = []
-    
-    logger.info(f"Starting Grid Search securely on {DEVICE}...")
+    df["date"] = df[TIMESTAMP_COL].dt.floor("D")
+    counts = df.groupby("date").size()
+    if expected_steps is None:
+        expected_steps = int(counts.mode().iloc[0])
 
-    for idx, params in enumerate(combinations):
-        logger.info(f"Testing Combo {idx + 1}/{len(combinations)}: {params}")
-        
-        # Initialize Model
-        model = SCVAE(
-            x_dim=1,                 # post-embedding dimension
-            label_dim=1,             # post-embedding dimension
-            h_dim=params['h_dim'],
-            z_dim=params['z_dim'],
-            input_dim=len(DEFAULT_INPUT_COLS),
-            device=DEVICE
-        ).to(DEVICE)
-        
-        optimizer = optim.Adam(model.parameters(), lr=params['lr'])
-        
-        # Training Loop
-        for epoch in range(args.epochs):
-            model.train()
-            train_loss_total = 0
-            
-            for X_batch, Y_batch in train_loader:
-                X_batch = X_batch.permute(1, 0, 2, 3).to(DEVICE)
-                Y_batch = Y_batch.permute(1, 0, 2, 3).to(DEVICE)
-                
-                optimizer.zero_grad()
-                kld_loss, nll_loss = model(X_batch, Y_batch)
-                loss = kld_loss + nll_loss
-                
-                loss.backward()
-                optimizer.step()
-                train_loss_total += loss.item()
-                
-            # Validation
-            model.eval()
-            val_loss_total = 0
-            with torch.no_grad():
-                for X_batch, Y_batch in val_loader:
-                    X_batch = X_batch.permute(1, 0, 2, 3).to(DEVICE)
-                    Y_batch = Y_batch.permute(1, 0, 2, 3).to(DEVICE)
-                    kld, nll = model(X_batch, Y_batch)
-                    val_loss_total += (kld + nll).item()
-                    
-            val_loss_avg = val_loss_total / len(val_loader)
-            train_loss_avg = train_loss_total / len(train_loader)
-            
-            logger.info(f"  Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss_avg:.4f} | Val Loss: {val_loss_avg:.4f}")
-        
-        trial_result = {**params, "val_loss": val_loss_avg, "train_loss": train_loss_avg}
-        results_history.append(trial_result)
+    valid_dates = counts[counts == expected_steps].index
+    filtered = df[df["date"].isin(valid_dates)]
 
-        if val_loss_avg < best_loss:
-            best_loss = val_loss_avg
-            best_params = params
-            best_model_state = model.state_dict()
-            
-    logger.success(f"Grid Search Complete! Best Val Loss: {best_loss:.4f} with config: {best_params}")
-    
-    # Checkpoint Dir
-    checkpoint_dir = Path(DEFAULT_CHECKPOINT_DIR)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_model_path = checkpoint_dir / "scvae_best.pth"
-    
-    # Save best model
-    torch.save(best_model_state, str(best_model_path))
-    logger.success(f"Best model weights saved to {best_model_path}")
+    sequences = []
+    for _, group in filtered.groupby("date"):
+        group = group.sort_values(TIMESTAMP_COL)
+        values = group[feature_cols].to_numpy(dtype=np.float32)
+        if values.shape[0] != expected_steps:
+            continue
+        sequences.append(values)
 
-    # Metrics Dir
-    metrics_dir = Path(DEFAULT_METRICS_DIR)
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = metrics_dir / "scvae_results.json"
-    
-    metrics_payload = {
-        "model": "SCVAE",
-        "dataset": "Costa PV Fault Dataset",
-        "input_features": DEFAULT_INPUT_COLS,
-        "grid_search_history": results_history,
-        "best_parameters": best_params,
-        "best_val_loss": best_loss
-    }
-    
-    metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
-    logger.success(f"Metrics saved to {metrics_path}")
+    if not sequences:
+        raise ValueError("No complete days found after filtering. Check timestamp resolution or expected_steps.")
+
+    per_day = np.stack(sequences, axis=0)
+    per_day = np.nan_to_num(per_day).astype(np.float32, copy=False)
+    return per_day, expected_steps
+
+
+def test_one_epoch(dataloader, model, reg, mode, device):
+    num_batches = len(dataloader)
+    test_loss = 0
+    with torch.no_grad():
+        for _, (data, y_data) in enumerate(dataloader):
+            data = data.permute(1, 0, 3, 2).to(device)
+            y_data = y_data.permute(1, 0, 3, 2).to(device)
+            model(data, y_data)
+            if mode == 0:
+                loss = model.kld_loss + model.nll_loss + reg * model.smooth_loss
+            elif mode == 1:
+                loss = model.kld_loss + model.nll_loss + reg * model.smooth_loss + \
+                    model.nll_loss_prior + 0 * model.smooth_loss_prior
+            elif mode == 2:
+                loss = model.kld_loss + model.nll_loss + reg * model.smooth_loss + \
+                    model.kld_loss_predict + model.nll_loss_predict
+            test_loss += loss.item()
+        test_loss /= num_batches
+    print(f"Test Error: \n , Avg loss: {test_loss:>8f} \n")
+    return test_loss
+
+
+def predict_one_epoch(dataloader, model, reg, device, batch_size):
+    num_batches = len(dataloader)
+    predict_loss = 0
+    reconstruct_loss = 0
+    prior_loss = 0
+    with torch.no_grad():
+        for _, (data, y_data) in enumerate(dataloader):
+            data = data.permute(1, 0, 3, 2).to(device)
+            y_data = y_data.permute(1, 0, 3, 2).to(device)
+            model(data, y_data)
+            loss_predict = model.nll_loss_predict
+            loss_reconstruct = model.nll_loss
+            loss_prior = model.nll_loss_prior
+
+            predict_loss += loss_predict.item()
+            reconstruct_loss += loss_reconstruct.item()
+            prior_loss += loss_prior.item()
+        predict_loss /= num_batches * batch_size
+        reconstruct_loss /= num_batches * batch_size
+        prior_loss /= num_batches * batch_size
+
+    print(
+        f"predict Error: \n , Avg loss: {predict_loss:>8f} \n reconstruct Error: \n , Avg loss: {reconstruct_loss:>8f} \n prior Error: \n , Avg loss: {prior_loss:>8f} \n")
+
+
+def train_one_epoch(dataloader, model, optimizer, reg, mode, device):
+    train_loss = 0
+    for batch_idx, (data, y_data) in enumerate(dataloader):
+        data = data.permute(1, 0, 3, 2).to(device)
+        y_data = y_data.permute(1, 0, 3, 2).to(device)
+        optimizer.zero_grad()
+        model(data, y_data)
+        if mode == 0:
+            loss = model.kld_loss + model.nll_loss + \
+                reg * model.smooth_loss
+        elif mode == 1:
+            loss = model.kld_loss + model.nll_loss + reg * model.smooth_loss + \
+                model.nll_loss_prior + 0 * model.smooth_loss_prior
+        if mode == 2:
+            loss = model.kld_loss + model.nll_loss + reg * model.smooth_loss + \
+                model.kld_loss_predict + model.nll_loss_predict
+        train_loss += loss.item()
+        loss.backward()
+        optimizer.step()
+
+        if batch_idx % 2 == 0:
+            size = len(data)
+            loss, current = loss.item(), batch_idx * size
+            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+
+
+def train(train_loader, test_loader, model, optimizer, reg, mode, model_path, device, n_epochs, batch_size):
+    best_test_loss = 0
+    for t in range(n_epochs):
+        print(f"Epoch {t+1}\n-------------------------------")
+        model.train()
+        train_one_epoch(train_loader, model, optimizer, reg, mode, device)
+        model.eval()
+        test_loss = test_one_epoch(test_loader, model, reg, mode, device)
+        print("test predict")
+        predict_one_epoch(test_loader, model, reg, device, batch_size)
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), model_path)
+            print("Saved PyTorch Model State to model.pth")
+    print("Done!")
+
+
+def reconstruct(model, dataloader, device):
+    print("*"*20+"reconstruct results")
+    with torch.no_grad():
+        mus, stds, scores = [], [], []
+        for _, (data, y_data) in enumerate(dataloader):
+            data = data.permute(1, 0, 3, 2).to(device)
+            y_data = y_data.permute(1, 0, 3, 2).to(device)
+            mu, std, score = model.reconstruct(data, y_data, is_prior=False)
+            mu = np.transpose(mu, (1, 0, 2))
+            std = np.transpose(std, (1, 0, 2))
+            score = np.transpose(score, (1, 0, 2))
+
+            mus.append(mu)
+            stds.append(std)
+            scores.append(score)
+        mus = np.concatenate(mus, axis=0)
+        stds = np.concatenate(stds, axis=0)
+        scores = np.concatenate(scores, axis=0)
+        print("scores.shape", scores.shape)
+        return mus, stds, scores
+
+
+def predict_withLabel(model, dataloader, device):
+    print("*"*20+"predict result")
+    with torch.no_grad():
+        mus, stds, scores = [], [], []
+        for _, (data, y_data) in enumerate(dataloader):
+            data = data.permute(1, 0, 3, 2).to(device)
+            y_data = y_data.permute(1, 0, 3, 2).to(device)
+            mu, std, score = model.predict_withLabel(data, y_data)
+            mu = np.transpose(mu, (1, 0, 2))
+            std = np.transpose(std, (1, 0, 2))
+            score = np.transpose(score, (1, 0, 2))
+
+            mus.append(mu)
+            stds.append(std)
+            scores.append(score)
+        mus = np.concatenate(mus, axis=0)
+        stds = np.concatenate(stds, axis=0)
+        scores = np.concatenate(scores, axis=0)
+        print("scores.shape", scores.shape)
+
+        return mus, stds, scores
+
+
+def predict(model, dataloader, device):
+    print("*"*20+"predict result")
+    with torch.no_grad():
+        mus, stds = [], []
+        for _, (data, y_data) in enumerate(dataloader):
+            data = data.permute(1, 0, 3, 2).to(device)
+            mu, std = model.predict(data)
+            mu = np.transpose(mu, (1, 0, 2))
+            std = np.transpose(std, (1, 0, 2))
+
+            mus.append(mu)
+            stds.append(std)
+        mus = np.concatenate(mus, axis=0)
+        stds = np.concatenate(stds, axis=0)
+        print("mu shape", mus.shape)
+
+        return mus, stds
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--parquet_path", type=str, default=str(DEFAULT_DATA_PATH),
+                        help="Path to SCVAE preprocessed parquet")
+    parser.add_argument("--model_path", type=str, default=str(DEFAULT_MODEL_PATH),
+                        help="saved model path")
+    parser.add_argument("--reg", type=float, default=0,
+                        help="smooth canonical intensity")
+    parser.add_argument("--batch_size", type=int,
+                        default=256, help="batch size")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="device, e.g. cpu, cuda:0, cuda:1")
+    parser.add_argument("--learning_rate", type=float,
+                        default=1e-5, help="learning_rate")
+    parser.add_argument("--print_every", type=int, default=1,
+                        help="the number of iterations between printing the results")
+    parser.add_argument("--n_epochs", type=int, default=100000,
+                        help="Maximum number of iterations")
+    parser.add_argument("--h_dim", type=int, default=512,
+                        help="Neural network hidden layer dimension")
+    parser.add_argument("--z_dim", type=int, default=128,
+                        help="hidden variable dimension of VAEs")
+    parser.add_argument("--mode", type=int, default=2,
+                        help="the mode when train")
+    parser.add_argument("--test_ratio", type=float,
+                        default=0.25, help="the test ratio in data_set")
+    parser.add_argument("--expected_steps", type=int, default=None,
+                        help="Override the expected samples per day")
+    opt = parser.parse_args()
+
+    device = _resolve_device(opt.device)
+
+    per_day, seq_len = load_daily_sequences(opt.parquet_path, opt.expected_steps)
+
+    x_pvt = per_day[..., 0:1]
+    x_irr = per_day[..., 1:2]
+    y_pdc1 = per_day[..., 2:3]
+    y_pdc2 = per_day[..., 3:4]
+
+    if opt.test_ratio != 1:
+        x_train1, x_test1, x_train2, x_test2, y_train1, y_test1, y_train2, y_test2 = train_test_split(
+            x_pvt, x_irr, y_pdc1, y_pdc2, test_size=opt.test_ratio, random_state=42)
+    else:
+        x_train1 = x_test1 = x_pvt
+        x_train2 = x_test2 = x_irr
+        y_train1 = y_test1 = y_pdc1
+        y_train2 = y_test2 = y_pdc2
+
+    multi_x_train = np.stack([x_train1, x_train2], axis=3)
+    multi_x_test = np.stack([x_test1, x_test2], axis=3)
+    multi_y_train = np.stack([y_train1, y_train2], axis=3)
+    multi_y_test = np.stack([y_test1, y_test2], axis=3)
+
+    x_dim = multi_x_train.shape[-1]
+    y_dim = multi_y_train.shape[-1]
+    input_dim = multi_x_train.shape[-2]
+    h_dim = opt.h_dim
+    z_dim = opt.z_dim
+    n_epochs = opt.n_epochs
+    learning_rate = opt.learning_rate
+    batch_size = opt.batch_size
+    model_path = Path(opt.model_path)
+
+    chunk_torch = torch.FloatTensor(multi_x_train)
+    test_torch = torch.FloatTensor(multi_x_test)
+
+    train_loader_ordered = DataLoader(TensorDataset(
+        chunk_torch, torch.FloatTensor(multi_y_train)), batch_size=batch_size, shuffle=False)
+    test_loader_ordered = DataLoader(TensorDataset(
+        test_torch, torch.FloatTensor(multi_y_test)), batch_size=batch_size, shuffle=False)
+
+    model = SCVAE(x_dim, y_dim, h_dim, z_dim, input_dim, 1,
+                  device=device, is_prior=False).to(device)
+
+    torch.cuda.empty_cache()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    reg = opt.reg
+
+    # Train
+    train(train_loader_ordered, test_loader_ordered, model, optimizer, reg, opt.mode, model_path, device, n_epochs, batch_size)
