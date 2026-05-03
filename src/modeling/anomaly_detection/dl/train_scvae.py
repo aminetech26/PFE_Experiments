@@ -11,6 +11,10 @@ from torch.utils.data import DataLoader
 
 from src.modeling.anomaly_detection.dl.scvae_model import SCVAE
 
+# Force TensorFlow to only log errors
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_scvae" / "scvae_preprocessed.parquet"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "experiments" / "checkpoints" / "scvae" / "scvae_best.pth"
