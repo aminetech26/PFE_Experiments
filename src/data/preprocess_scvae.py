@@ -25,6 +25,10 @@ def preprocess_for_scvae(input_parquet: str | Path, output_parquet: str | Path) 
 
     df = pd.read_parquet(input_parquet)
 
+    # Filter to only keep rows where label is 0 (healthy data)
+    if "label" in df.columns:
+        df = df[df["label"] == 0].copy()
+
     # 1. Divide powers by peak power
     for col in ["pdc1", "pdc2"]:
         if col in df.columns:
