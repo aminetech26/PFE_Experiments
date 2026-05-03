@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 import torch
 from torch import nn
-from torch.distributions import Normal, StudentT
+from torch.distributions import Normal
 from torch.autograd import Variable
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.stats import t as studentT
 import scipy.stats as stats
 
 
