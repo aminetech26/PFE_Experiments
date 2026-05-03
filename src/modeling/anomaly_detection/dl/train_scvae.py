@@ -19,7 +19,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_scvae" / "scvae_preprocessed.parquet"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "experiments" / "checkpoints" / "scvae" / "scvae_best.pth"
 
-TIMESTAMP_COL = "timestamp"
 INPUT_FEATURES = ["pvt", "irr"]
 OUTPUT_FEATURES = ["pdc1", "pdc2"]
 
@@ -30,7 +29,15 @@ def _resolve_device(device_str: str) -> torch.device:
     return torch.device(device_str)
 
 
-def load_daily_sequences(parquet_path: str | Path, expected_steps: int | None = None) -> tuple[np.ndarray, int]:
+def create_windows(data: np.ndarray, window_size: int) -> np.ndarray:
+    if data.shape[0] < window_size:
+        raise ValueError("window_size is larger than the number of samples")
+
+    windows = np.lib.stride_tricks.sliding_window_view(data, (window_size, data.shape[1]))
+    return windows.reshape(-1, window_size, data.shape[1])
+
+
+def load_window_sequences(parquet_path: str | Path, window_size: int) -> np.ndarray:
     df = pd.read_parquet(parquet_path)
     if "label" in df.columns:
         df = df[df["label"] == 0].copy()
@@ -40,36 +47,18 @@ def load_daily_sequences(parquet_path: str | Path, expected_steps: int | None = 
     if missing:
         raise ValueError(f"Missing required columns in parquet: {missing}")
 
-    if TIMESTAMP_COL not in df.columns:
-        raise ValueError(f"Missing timestamp column '{TIMESTAMP_COL}' in parquet")
+    timestamp_col = "timestamp"
+    if timestamp_col in df.columns:
+        df = df.dropna(subset=[timestamp_col] + feature_cols).copy()
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True, errors="coerce")
+        df = df.dropna(subset=[timestamp_col])
+        df = df.sort_values(timestamp_col)
+    else:
+        df = df.dropna(subset=feature_cols).copy()
 
-    df = df.dropna(subset=[TIMESTAMP_COL] + feature_cols).copy()
-    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True, errors="coerce")
-    df = df.dropna(subset=[TIMESTAMP_COL])
-    df = df.sort_values(TIMESTAMP_COL)
-
-    df["date"] = df[TIMESTAMP_COL].dt.floor("D")
-    counts = df.groupby("date").size()
-    if expected_steps is None:
-        expected_steps = int(counts.mode().iloc[0])
-
-    valid_dates = counts[counts == expected_steps].index
-    filtered = df[df["date"].isin(valid_dates)]
-
-    sequences = []
-    for _, group in filtered.groupby("date"):
-        group = group.sort_values(TIMESTAMP_COL)
-        values = group[feature_cols].to_numpy(dtype=np.float32)
-        if values.shape[0] != expected_steps:
-            continue
-        sequences.append(values)
-
-    if not sequences:
-        raise ValueError("No complete days found after filtering. Check timestamp resolution or expected_steps.")
-
-    per_day = np.stack(sequences, axis=0)
-    per_day = np.nan_to_num(per_day).astype(np.float32, copy=False)
-    return per_day, expected_steps
+    data = df[feature_cols].to_numpy(dtype=np.float32)
+    data = np.nan_to_num(data).astype(np.float32, copy=False)
+    return create_windows(data, window_size)
 
 
 def test_one_epoch(dataloader, model, reg, mode, device):
@@ -253,23 +242,26 @@ if __name__ == "__main__":
                         help="the mode when train")
     parser.add_argument("--test_ratio", type=float,
                         default=0.25, help="the test ratio in data_set")
-    parser.add_argument("--expected_steps", type=int, default=None,
-                        help="Override the expected samples per day")
+    parser.add_argument("--window_size", type=int, default=50,
+                        help="Sequence length for sliding windows")
     opt = parser.parse_args()
 
     device = _resolve_device(opt.device)
 
-    per_day, seq_len = load_daily_sequences(opt.parquet_path, opt.expected_steps)
+    windows = load_window_sequences(opt.parquet_path, opt.window_size)
 
-    x_pvt = per_day[..., 0:1]
-    x_irr = per_day[..., 1:2]
-    y_pdc1 = per_day[..., 2:3]
-    y_pdc2 = per_day[..., 3:4]
+    x_pvt = windows[..., 0:1]
+    x_irr = windows[..., 1:2]
+    y_pdc1 = windows[..., 2:3]
+    y_pdc2 = windows[..., 3:4]
 
-    if opt.test_ratio != 1:
+    num_windows = windows.shape[0]
+    if opt.test_ratio != 1 and num_windows >= 2:
         x_train1, x_test1, x_train2, x_test2, y_train1, y_test1, y_train2, y_test2 = train_test_split(
             x_pvt, x_irr, y_pdc1, y_pdc2, test_size=opt.test_ratio, random_state=42)
     else:
+        if num_windows < 2 and opt.test_ratio != 1:
+            print("Only one window available; using all data for both train and test. Set --test_ratio 1 to silence this warning.")
         x_train1 = x_test1 = x_pvt
         x_train2 = x_test2 = x_irr
         y_train1 = y_test1 = y_pdc1
