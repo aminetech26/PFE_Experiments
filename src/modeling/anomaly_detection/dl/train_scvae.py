@@ -12,10 +12,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.modeling.anomaly_detection.dl.scvae_model import SCVAE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_lstmae" / "lstmae_preprocessed.parquet"
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_scvae" / "scvae_preprocessed.parquet"
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "experiments" / "checkpoints" / "scvae"
 DEFAULT_METRICS_DIR = PROJECT_ROOT / "experiments" / "metrics"
-DEFAULT_INPUT_COLS = ["irr", "idc1", "idc2", "vdc1", "vdc2", "pdc1", "pdc2", "clearness_index", "pvt"]
+DEFAULT_INPUT_COLS = ["pvt", "irr", "pdc1", "pdc2"]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -34,12 +34,9 @@ def load_and_prepare_data(data_path, window_size, batch_size):
     df = pd.read_parquet(data_path)
     
     # Filter ONLY healthy data for training the VAE (label == 0) if applicable
-    # The current assumption from LSTM-AE logic is to train strictly on healthy.
-    # To keep your provided SCVAE purely as written:
+    # The data is already preprocessed (z-score standardized) in preprocess_scvae.py
     data = df[DEFAULT_INPUT_COLS].values
     
-    # Scale data
-    data = (data - np.nanmin(data, axis=0)) / (np.nanmax(data, axis=0) - np.nanmin(data, axis=0) + 1e-8)
     data = np.nan_to_num(data).astype(np.float32, copy=False)
     
     # Create windows: (num_windows, seq_len, input_dim)

@@ -87,6 +87,16 @@ stages:
     outs:
       - data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
 
+# Stage 5: LSTM-AE Preprocessing
+  preprocess_scvae:
+    cmd: uv run python -m src.data.preprocess_scvae
+    deps:
+      - src/data/preprocess_scvae.py
+      - data/interim/ingestion/costa/costa_merged.parquet
+    outs:
+      - data/processed/preprocessed/costa_scvae/scvae_preprocessed.parquet
+
+
   # Stage 6: LSTM-AE Anomaly Detection
   train_lstmae:
     cmd: uv run python -m src.modeling.anomaly_detection.dl.train_lstmae
@@ -119,7 +129,7 @@ stages:
     deps:
       - src/modeling/anomaly_detection/dl/scvae_model.py
       - src/modeling/anomaly_detection/dl/train_scvae.py
-      - data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet
+      - data/processed/preprocessed/costa_scvae/scvae_preprocessed.parquet
     metrics:
       - experiments/metrics/scvae_results.json:
           cache: false

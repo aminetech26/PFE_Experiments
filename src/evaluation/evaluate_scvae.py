@@ -121,7 +121,7 @@ def get_sequence_mae_scvae(model, X_seq_np):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, default=str(PROJECT_ROOT / "experiments/checkpoints/scvae/scvae_best.pth"))
-    parser.add_argument("--dataset-path", type=str, default=str(PROJECT_ROOT / "data/processed/preprocessed/costa_lstmae/lstmae_preprocessed.parquet"))
+    parser.add_argument("--dataset-path", type=str, default=str(PROJECT_ROOT / "data/processed/preprocessed/costa_scvae/scvae_preprocessed.parquet"))
     parser.add_argument("--metrics-path", type=str, default=str(PROJECT_ROOT / "experiments/metrics/scvae_results.json"))
     args = parser.parse_args()
 
@@ -155,12 +155,8 @@ def main():
     
     data_array = df[input_cols].values
     
-    # Needs to apply the EXACT SAME scaling offset as training to avoid massive MAE mismatch
-    # In train_scvae it was done this way:
-    data_min = np.nanmin(data_array, axis=0)
-    data_max = np.nanmax(data_array, axis=0)
-    data_scaled = (data_array - data_min) / (data_max - data_min + 1e-8)
-    data_scaled = np.nan_to_num(data_scaled)
+    # Already preprocessed via preprocess_scvae.py (z-score standardized)
+    data_scaled = np.nan_to_num(data_array).astype(np.float32, copy=False)
     
     labels_array = df["label"].values if "label" in df.columns else np.zeros(len(df))
     
