@@ -49,8 +49,8 @@ def load_and_prepare_data(data_path, window_size, batch_size):
 
     # Expand dims to match architecture requirement: (batch, seq_len, feature_dim, input_dim)
     train_data = train_data.copy()
-    train_tensor = torch.from_numpy(train_data).unsqueeze(3)
-    val_tensor = torch.from_numpy(val_data).unsqueeze(3)
+    train_tensor = torch.from_numpy(train_data).unsqueeze(2)
+    val_tensor = torch.from_numpy(val_data).unsqueeze(2)
     
     # We use X as both input and target for autoencoder
     train_loader = DataLoader(TensorDataset(train_tensor, train_tensor), batch_size=batch_size, shuffle=True)
@@ -119,8 +119,8 @@ def main():
             train_loss_total = 0
             
             for X_batch, Y_batch in train_loader:
-                X_batch = X_batch.permute(1, 0, 3, 2).to(DEVICE)
-                Y_batch = Y_batch.permute(1, 0, 3, 2).to(DEVICE)
+                X_batch = X_batch.permute(1, 0, 2, 3).to(DEVICE)
+                Y_batch = Y_batch.permute(1, 0, 2, 3).to(DEVICE)
                 
                 optimizer.zero_grad()
                 kld_loss, nll_loss = model(X_batch, Y_batch)
