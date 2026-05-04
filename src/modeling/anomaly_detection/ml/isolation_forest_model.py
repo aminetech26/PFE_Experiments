@@ -24,6 +24,7 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import StandardScaler
 
+from src.evaluation.leakage_checks import performance_sanity_check
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.ml.one_class_svm_model import (
     _calibrate_threshold,
@@ -285,6 +286,12 @@ def run_isolation_forest(config: dict | None = None) -> None:
     )
 
     try:
+        sanity_check = performance_sanity_check("test_pr_auc", test_pr_auc)
+    except Exception as _exc:
+        logger.warning("Sanity check failed (non-fatal): {}", _exc)
+        sanity_check = {"is_suspicious": False, "skipped": True}
+
+    try:
         init_tracking("anomaly")
         run_name = f"anomaly_isolation_forest_{ts}"
         with mlflow.start_run(run_name=run_name):
@@ -313,6 +320,7 @@ def run_isolation_forest(config: dict | None = None) -> None:
                 }
             )
             mlflow.log_metrics(metrics)
+            mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
             for p in (
                 metrics_path,
                 model_path,

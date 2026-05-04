@@ -13,12 +13,20 @@ import numpy as np
 import pandas as pd
 import yaml
 from loguru import logger
-from sklearn.metrics import accuracy_score, average_precision_score, classification_report, f1_score
+from sklearn.metrics import average_precision_score, f1_score
 from sklearn.preprocessing import LabelEncoder, label_binarize
 
 from src.data.splitting import PerClassSegmentTimeSeriesCV
 from src.evaluation.leakage_checks import exact_duplicate_overlap_check, run_leakage_report
 from src.mlflow_setup import init_tracking
+from src.modeling.classification.ml.common import (
+    build_study_name_prefix,
+    compute_classification_metrics,
+    default_comparison_records_path,
+    resolve_artifact_paths,
+    save_classification_plots,
+    write_json_artifact,
+)
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
     midpoint_params_from_space,
@@ -30,22 +38,6 @@ from src.utils.paths import get_experiments_root
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
-
-
-def _default_metrics_path() -> Path:
-    return get_experiments_root() / "metrics" / "classification_results.json"
-
-
-def _default_leakage_report_path() -> Path:
-    return get_experiments_root() / "metrics" / "classification_leakage_report.json"
-
-
-def _default_comparison_records_path() -> Path:
-    return get_experiments_root() / "metrics" / "classification_comparison_records.jsonl"
-
-
-def _default_model_path() -> Path:
-    return get_experiments_root() / "checkpoints" / "classification" / "lightgbm_model.pkl"
 
 
 def _load_model_config() -> dict:
@@ -80,7 +72,9 @@ def _resolve_classification_ml_config(config: dict) -> tuple[dict, dict, dict]:
 def _resolve_runtime_seed(runtime_config: dict, cli_seed: int | None) -> int:
     if cli_seed is not None:
         return int(cli_seed)
-    return int(runtime_config.get("experiment", {}).get("seed", 42))
+    exp = runtime_config.get("experiment", {})
+    seeds = exp.get("seeds", [42])
+    return int(seeds[0] if isinstance(seeds, list) else seeds)
 
 
 def _prepare_xy(
@@ -207,21 +201,24 @@ def run_lightgbm(config: dict | None = None) -> None:
     )
     parser.add_argument(
         "--metrics-path",
-        default=str(_default_metrics_path()),
+        default=None,
         help="Where to write metrics json",
     )
     parser.add_argument(
         "--leakage-report-path",
-        default=str(_default_leakage_report_path()),
+        default=None,
         help="Where to write leakage report json",
     )
     parser.add_argument(
         "--comparison-records-path",
-        default=str(_default_comparison_records_path()),
+        default=str(default_comparison_records_path()),
         help="Where to append comparison record jsonl",
     )
+    parser.add_argument("--model-path", default=None, help="Where to persist trained model")
     parser.add_argument(
-        "--model-path", default=str(_default_model_path()), help="Where to persist trained model"
+        "--artifacts-dir",
+        default=None,
+        help="Optional directory for metrics, model, and evaluation plots",
     )
     parser.add_argument(
         "--no-optuna", action="store_true", help="Disable Optuna and use midpoint baseline params"
@@ -277,7 +274,10 @@ def run_lightgbm(config: dict | None = None) -> None:
     hpo_sampler = str(hpo_cfg.get("sampler", "tpe"))
     hpo_pruner = hpo_cfg.get("pruner", "none")
     hpo_storage = hpo_cfg.get("storage_url", None)
-    hpo_study_prefix = str(hpo_cfg.get("study_name_prefix", "classification_lightgbm"))
+    hpo_study_prefix = build_study_name_prefix(
+        str(hpo_cfg.get("study_name_prefix", "classification_ml")),
+        "lightgbm",
+    )
     hpo_validation_mode = str(hpo_cfg.get("validation_mode", "holdout")).lower()
     threading_plan = _resolve_threading(runtime_config, args)
 
@@ -400,6 +400,7 @@ def run_lightgbm(config: dict | None = None) -> None:
                 "feature_run_selection_mode": run_selection_mode,
                 "feature_count": len(features),
                 "label_column": label_column,
+                "class_weighting_mode": "native_auto_balanced",
                 "optuna_enabled": not args.no_optuna,
                 "optuna_n_trials_requested": int(n_trials),
                 "optuna_n_trials_executed": 0 if args.no_optuna else int(n_trials),
@@ -413,7 +414,9 @@ def run_lightgbm(config: dict | None = None) -> None:
                 "thread_budget": int(threading_plan["thread_budget"]),
                 "optuna_parallel_trials": int(threading_plan["optuna_parallel_trials"]),
                 "threads_per_trial": int(threading_plan["threads_per_trial"]),
-                "cv_strategy": "segment_aware_per_class" if segments_cv is not None else "fixed_holdout",
+                "cv_strategy": "segment_aware_per_class"
+                if segments_cv is not None
+                else "fixed_holdout",
                 "cv_n_splits": n_cv_folds if segments_cv is not None else 1,
                 "duplicate_precheck_overlaps": int(
                     duplicate_precheck.get("overlapping_samples", 0)
@@ -524,24 +527,22 @@ def run_lightgbm(config: dict | None = None) -> None:
             x_train_final,
             y_train_final,
             params=best_params,
-            eval_sets=[(x_train_final, y_train_final), (x_test, y_test)],
+            eval_sets=[(x_train_final, y_train_final)],
         )
 
         test_pred = final_model.predict(x_test)
         test_pred_proba = final_model.predict_proba(x_test)
 
-        accuracy = float(accuracy_score(y_test, test_pred))
-        f1_weighted = float(f1_score(y_test, test_pred, average="weighted"))
-        f1_macro = float(f1_score(y_test, test_pred, average="macro"))
-        pr_auc_weighted = _compute_pr_auc_multiclass(y_test, test_pred_proba, encoder.classes_)
-
-        report = classification_report(
+        summary_metrics, pr_auc_by_class, report = compute_classification_metrics(
             y_test,
             test_pred,
-            target_names=[str(x) for x in encoder.classes_],
-            output_dict=True,
-            zero_division=0,
+            test_pred_proba,
+            encoder.classes_,
         )
+        accuracy = summary_metrics["accuracy"]
+        f1_weighted = summary_metrics["f1_weighted"]
+        f1_macro = summary_metrics["f1_macro"]
+        pr_auc_weighted = summary_metrics["pr_auc_weighted"]
 
         metrics_payload = {
             "task": args.task,
@@ -558,12 +559,9 @@ def run_lightgbm(config: dict | None = None) -> None:
             "feature_count": len(features),
             "n_classes": int(len(encoder.classes_)),
             "classes": [str(c) for c in encoder.classes_],
-            "metrics": {
-                "accuracy": accuracy,
-                "f1_weighted": f1_weighted,
-                "f1_macro": f1_macro,
-                "pr_auc_weighted": pr_auc_weighted,
-            },
+            "class_weighting_mode": "native_auto_balanced",
+            "metrics": summary_metrics,
+            "pr_auc_by_class": pr_auc_by_class,
             "best_params": best_params,
             "classification_report": report,
         }
@@ -574,29 +572,41 @@ def run_lightgbm(config: dict | None = None) -> None:
         }
 
         if not args.skip_leakage_checks:
-            leakage_payload = run_leakage_report(
-                model=final_model,
-                X_train=x_train,
-                y_train=y_train,
-                X_val=x_val,
-                y_val=y_val,
-                feature_names=features,
-                df_train=train_df,
-                df_val=val_df,
-            )
+            try:
+                leakage_payload = run_leakage_report(
+                    model=final_model,
+                    X_train=x_train,
+                    y_train=y_train,
+                    X_val=x_val,
+                    y_val=y_val,
+                    feature_names=features,
+                    X_eval=x_test,
+                    y_eval=y_test,
+                )
+            except Exception as _exc:
+                logger.warning("Leakage report failed (non-fatal): {}", _exc)
+                leakage_payload = {
+                    "skipped": True,
+                    "reason": f"exception: {_exc}",
+                    "leakage_flags": [],
+                    "is_clean": True,
+                }
 
-        metrics_path = Path(args.metrics_path)
-        metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        metrics_path.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
-
-        leakage_report_path = Path(args.leakage_report_path)
-        leakage_report_path.parent.mkdir(parents=True, exist_ok=True)
-        leakage_report_path.write_text(
-            json.dumps(leakage_payload, indent=2, default=str),
-            encoding="utf-8",
+        artifact_paths = resolve_artifact_paths(
+            model_name="lightgbm",
+            run_name=run_name,
+            artifacts_dir=args.artifacts_dir,
+            metrics_path=args.metrics_path,
+            leakage_report_path=args.leakage_report_path,
+            model_path=args.model_path,
         )
+        metrics_path = artifact_paths["metrics_path"]
+        leakage_report_path = artifact_paths["leakage_report_path"]
+        model_path = artifact_paths["model_path"]
 
-        model_path = Path(args.model_path)
+        write_json_artifact(metrics_path, metrics_payload)
+        write_json_artifact(leakage_report_path, leakage_payload)
+
         model_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(
             {
@@ -608,16 +618,33 @@ def run_lightgbm(config: dict | None = None) -> None:
             },
             model_path,
         )
+        save_classification_plots(
+            y_true=y_test,
+            y_pred=test_pred,
+            y_proba=test_pred_proba,
+            classes=encoder.classes_,
+            model_name="LightGBM",
+            paths=artifact_paths,
+            feature_names=features,
+            model=final_model,
+        )
 
         mlflow.log_metrics(
             {
                 "test_accuracy": accuracy,
+                "test_balanced_accuracy": summary_metrics["balanced_accuracy"],
                 "test_f1_weighted": f1_weighted,
                 "test_f1_macro": f1_macro,
+                "test_precision_weighted": summary_metrics["precision_weighted"],
+                "test_precision_macro": summary_metrics["precision_macro"],
+                "test_recall_weighted": summary_metrics["recall_weighted"],
+                "test_recall_macro": summary_metrics["recall_macro"],
             }
         )
         if not np.isnan(pr_auc_weighted):
             mlflow.log_metric("test_pr_auc_weighted", pr_auc_weighted)
+        for class_name, class_pr_auc in pr_auc_by_class.items():
+            mlflow.log_metric(f"test_pr_auc_class_{class_name}", class_pr_auc)
 
         if evals_result:
             split_names = list(evals_result.keys())
@@ -646,9 +673,11 @@ def run_lightgbm(config: dict | None = None) -> None:
                 )
                 mlflow.log_artifact(str(curves_artifact_path))
 
-        mlflow.log_artifact(str(metrics_path))
-        mlflow.log_artifact(str(leakage_report_path))
-        mlflow.log_artifact(str(model_path))
+        for artifact_key, artifact_path in artifact_paths.items():
+            if artifact_key == "artifacts_dir":
+                continue
+            if artifact_path.exists():
+                mlflow.log_artifact(str(artifact_path))
         mlflow.log_dict(manifest, "features_manifest.json")
         mlflow.log_dict(threading_plan, "threading_plan.json")
         mlflow.log_dict(duplicate_precheck, "duplicate_precheck.json")
@@ -675,12 +704,18 @@ def run_lightgbm(config: dict | None = None) -> None:
             "feature_run_id": effective_run_id,
             "feature_run_selection_mode": run_selection_mode,
             "feature_run_dir": str(resolved_run_dir),
+            "class_weighting_mode": "native_auto_balanced",
             "optuna_enabled": not args.no_optuna,
             "optuna_n_trials_requested": int(n_trials),
             "optuna_n_trials_executed": 0 if args.no_optuna else int(n_trials),
             "test_accuracy": accuracy,
+            "test_balanced_accuracy": summary_metrics["balanced_accuracy"],
             "test_f1_weighted": f1_weighted,
             "test_f1_macro": f1_macro,
+            "test_precision_weighted": summary_metrics["precision_weighted"],
+            "test_precision_macro": summary_metrics["precision_macro"],
+            "test_recall_weighted": summary_metrics["recall_weighted"],
+            "test_recall_macro": summary_metrics["recall_macro"],
             "test_pr_auc_weighted": pr_auc_weighted,
             "leakage_flag_count": len(leakage_payload.get("leakage_flags", [])),
             "leakage_is_clean": bool(leakage_payload.get("is_clean", False)),

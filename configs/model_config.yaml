@@ -2,7 +2,7 @@
 # Modify experiment params here; training code reads from this file.
 
 experiment:
-  seed: 42
+  seeds: [42, 777, 1234]              # multi-seed suite; first seed is the canonical single-run seed
   n_cv_folds: 5
   cv_gap: 5          # windows to drop between folds (temporal CV)
   mlflow_experiment: "PV-FDD-PFE-2026"
@@ -21,7 +21,7 @@ anomaly_detection:
       pruner: none
       study_name_prefix: anomaly_ml
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
-      n_trials_phase1: 50
+      n_trials_phase1: 30
       timeout_seconds: null
     models:
       isolation_forest:
@@ -127,18 +127,27 @@ classification:
         learning_rate: [0.03, 0.1]
         max_depth: [4, 8]
       catboost:
-        iterations: [300, 500]
-        depth: [6, 8]
-        learning_rate: [0.05, 0.1]
+        iterations: {type: int, low: 300, high: 1200, step: 100}
+        depth: {type: int, low: 4, high: 8}
+        learning_rate: {type: float, low: 0.02, high: 0.15, log: true}
+        l2_leaf_reg: {type: float, low: 1.0e-2, high: 20.0, log: true}
+        random_strength: {type: float, low: 1.0e-8, high: 5.0, log: true}
+        bagging_temperature: {type: float, low: 0.0, high: 5.0}
+        border_count: {type: categorical, choices: [64, 128, 254]}
       extra_trees:
-        n_estimators: [200, 500]
-        max_features: [sqrt, log2]
+        n_estimators: {type: int, low: 300, high: 1200, step: 100}
+        criterion: {type: categorical, choices: [gini, entropy, log_loss]}
+        max_depth: {type: categorical, choices: [null, 8, 12, 16, 24, 32]}
+        min_samples_split: {type: int, low: 2, high: 20}
+        min_samples_leaf: {type: int, low: 1, high: 10}
+        max_features: {type: categorical, choices: [sqrt, log2, 0.5, 0.8, 1.0]}
+        bootstrap: {type: categorical, choices: [false, true]}
     hpo:
       direction: maximize
       validation_mode: holdout      # holdout | segment_temporal_cv
       sampler: tpe                  # ML policy default
       pruner: none                  # ML policy: no pruner
-      study_name_prefix: classification_lightgbm
+      study_name_prefix: classification_ml
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
       n_trials_phase1: 50
       timeout_seconds: null

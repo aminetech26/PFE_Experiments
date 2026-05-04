@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from src.modeling.classification.ml.catboost_model import run_catboost
+from src.modeling.classification.ml.extra_trees_model import run_extra_trees
 from src.modeling.classification.ml.lightgbm_model import run_lightgbm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -44,7 +46,15 @@ def main() -> None:
         run_lightgbm(config=config)
         return
 
-    if active_model in {"xgboost", "catboost", "extra_trees"}:
+    if active_model == "catboost":
+        run_catboost(config=config)
+        return
+
+    if active_model == "extra_trees":
+        run_extra_trees(config=config)
+        return
+
+    if active_model == "xgboost":
         raise NotImplementedError(
             f"Classification ML model '{active_model}' is scaffolded but not implemented yet."
         )

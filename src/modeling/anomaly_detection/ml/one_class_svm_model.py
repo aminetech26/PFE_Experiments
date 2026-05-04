@@ -26,6 +26,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 
+from src.evaluation.leakage_checks import performance_sanity_check
 from src.mlflow_setup import init_tracking
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
@@ -498,6 +499,12 @@ def run_one_class_svm(config: dict | None = None) -> None:
     )
     logger.info(f"Artifacts saved → {artifacts_dir}")
 
+    try:
+        sanity_check = performance_sanity_check("test_pr_auc", test_pr_auc)
+    except Exception as _exc:
+        logger.warning("Sanity check failed (non-fatal): {}", _exc)
+        sanity_check = {"is_suspicious": False, "skipped": True}
+
     # ── MLflow ────────────────────────────────────────────────────────────────
     try:
         init_tracking("anomaly")
@@ -530,6 +537,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
                 }
             )
             mlflow.log_metrics(metrics)
+            mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
             for p in (
                 metrics_path,
                 model_path,

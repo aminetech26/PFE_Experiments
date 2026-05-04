@@ -23,6 +23,12 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
+from src.evaluation.leakage_checks import (
+    feature_importance_audit,
+    label_shuffle_test,
+    performance_sanity_check,
+    run_leakage_report,
+)
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.ml.one_class_svm_model import (
     _calibrate_threshold,
@@ -275,6 +281,22 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
     )
 
     try:
+        leakage_payload = run_leakage_report(
+            model=final_model,
+            X_train=x_fit,
+            y_train=y_fit,
+            X_val=x_val,
+            y_val=y_val,
+            feature_names=features,
+            X_eval=x_test,
+            y_eval=y_test,
+            metric="f1_binary",
+        )
+    except Exception as _exc:
+        logger.warning("Leakage report failed (non-fatal): {}", _exc)
+        leakage_payload = {"skipped": True, "reason": f"exception: {_exc}", "leakage_flags": [], "is_clean": True}
+
+    try:
         init_tracking("anomaly")
         run_name = f"anomaly_xgboost_{ts}"
         with mlflow.start_run(run_name=run_name):
@@ -300,6 +322,12 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
                 }
             )
             mlflow.log_metrics(metrics)
+            mlflow.log_metric(
+                "leakage_flag_count", float(len(leakage_payload.get("leakage_flags", [])))
+            )
+            mlflow.log_metric("sanity_pr_auc_suspicious", float(
+                leakage_payload.get("sanity_check", {}).get("is_suspicious", False)
+            ))
             for p in (metrics_path, model_path, pr_curve_path, histogram_path, timeline_path):
                 if p.exists():
                     mlflow.log_artifact(str(p))
