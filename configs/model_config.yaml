@@ -21,7 +21,7 @@ anomaly_detection:
       pruner: none
       study_name_prefix: anomaly_ml
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
-      n_trials_phase1: 30
+      n_trials_phase1: 50
       timeout_seconds: null
     models:
       isolation_forest:
