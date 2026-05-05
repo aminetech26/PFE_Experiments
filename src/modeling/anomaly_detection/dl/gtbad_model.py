@@ -4,9 +4,9 @@ import numpy as np
 
 
 class PositionalEncoding(nn.Module):
-    """Standard sinusoidal positional encoding + multi-period PE for daily/weekly cycles."""
+    """Standard sinusoidal positional encoding."""
 
-    def __init__(self, d_model, max_len=5000, daily_period=96, weekly_period=672):
+    def __init__(self, d_model, max_len=5000):
         super().__init__()
         # standard PE
         pe = torch.zeros(max_len, d_model)
@@ -19,33 +19,14 @@ class PositionalEncoding(nn.Module):
         pe = pe.unsqueeze(0)  # shape (1, max_len, d_model)
         self.register_buffer("pe", pe)
 
-        # multi-period feature (scalar per position, broadcast to d_model)
-        self.daily_period = daily_period
-        self.weekly_period = weekly_period
-
     def forward(self, x):
         """
         x: (batch, seq_len, d_model)
         Returns x with added PE.
         """
         seq_len = x.size(1)
-        # standard PE
         standard_pe = self.pe[:, :seq_len, :]
-        # multi-period PE
-        pos = torch.arange(seq_len, device=x.device).float()
-        pd = float(self.daily_period)
-        pw = float(self.weekly_period)
-        multi_period_pe = (
-            torch.sin(2 * np.pi * pos / pd)
-            + torch.cos(2 * np.pi * pos / pd)
-            + torch.sin(2 * np.pi * pos / pw)
-            + torch.cos(2 * np.pi * pos / pw)
-        )
-        # expand to (1, seq_len, 1) and repeat over d_model
-        multi_period_pe = (
-            multi_period_pe.unsqueeze(0).unsqueeze(-1).repeat(1, 1, x.size(-1))
-        )
-        return x + standard_pe + multi_period_pe
+        return x + standard_pe
 
 
 class GTBADModel(nn.Module):
@@ -62,8 +43,6 @@ class GTBADModel(nn.Module):
         num_encoder_layers=3,
         lstm_hidden=32,
         dropout=0.1,
-        daily_period=96,
-        weekly_period=672,
     ):
         """
         Args:
@@ -74,7 +53,6 @@ class GTBADModel(nn.Module):
             num_encoder_layers (int): number of transformer encoder layers
             lstm_hidden (int): hidden size of each LSTM direction
             dropout (float): dropout rate
-            daily_period, weekly_period: for multi-period positional encoding
         """
         super().__init__()
         self.input_dim = input_dim
@@ -82,9 +60,7 @@ class GTBADModel(nn.Module):
         self.d_model = d_model
 
         self.input_project = nn.Linear(input_dim, d_model)
-        self.pos_encoder = PositionalEncoding(
-            d_model, daily_period=daily_period, weekly_period=weekly_period
-        )
+        self.pos_encoder = PositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True
         )

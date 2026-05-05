@@ -17,8 +17,6 @@ class PVDataPreprocessor:
         self,
         window_len=10,
         stride=1,
-        daily_period=96,
-        weekly_period=672,
         power_col="pdc1",
         corr_threshold=0.85,
     ):
@@ -26,15 +24,11 @@ class PVDataPreprocessor:
         Args:
             window_len (int): sliding window length S (default 10)
             stride (int): sliding stride (default 1)
-            daily_period (int): number of time steps in one day (15-min -> 96)
-            weekly_period (int): number of time steps in one week (15-min -> 672)
             power_col (str): column name used as 'power' for correlation priority
             corr_threshold (float): absolute Pearson correlation threshold for feature selection
         """
         self.window_len = window_len
         self.stride = stride
-        self.daily_period = daily_period
-        self.weekly_period = weekly_period
         self.power_col = power_col
         self.corr_threshold = corr_threshold
 
@@ -97,7 +91,7 @@ class PVDataPreprocessor:
             )
         df_processed = df_smooth.copy()
 
-        # 5. Sliding window construction with daily/weekly phase-aligned windows
+        # 5. Sliding window construction
         n_total = len(df_processed)
         # build full sequence of selected features (n_total, n_selected)
         feat_array = df_processed.values  # shape (T, F)
@@ -105,25 +99,11 @@ class PVDataPreprocessor:
         target_windows = []
         mask_values = []
 
-        # Calculate valid start index considering lag for daily/weekly windows
-        max_lag = max(self.weekly_period, self.daily_period)
-        start = max_lag + self.window_len - 1
+        start = self.window_len - 1
         for i in range(start, n_total):
             # current window: i-window_len+1 : i
             cur_win = feat_array[i - self.window_len + 1 : i + 1, :]
-            # daily window: same clock time on previous day
-            daily_start = i - self.daily_period - self.window_len + 1
-            if daily_start < 0:
-                continue
-            daily_win = feat_array[daily_start : daily_start + self.window_len, :]
-            # weekly window: same clock time 7 days before
-            weekly_start = i - self.weekly_period - self.window_len + 1
-            if weekly_start < 0:
-                continue
-            weekly_win = feat_array[weekly_start : weekly_start + self.window_len, :]
-            # concatenate: shape (3*window_len, n_selected)
-            concat_win = np.concatenate([cur_win, daily_win, weekly_win], axis=0)
-            windows.append(concat_win)
+            windows.append(cur_win)
             # target is exactly the current window (for reconstruction)
             target_windows.append(cur_win)
 
@@ -135,23 +115,21 @@ class PVDataPreprocessor:
             else:
                 mask_values.append(1)
 
-        X_numeric = np.array(windows)  # (n_samples, 30, n_selected)
-        y_target = np.array(target_windows)  # (n_samples, 10, n_selected)
+        X_numeric = np.array(windows)  # (n_samples, window_len, n_selected)
+        y_target = np.array(target_windows)  # (n_samples, window_len, n_selected)
         mask = np.array(mask_values)  # (n_samples,)
         print(f"Generated {X_numeric.shape[0]} samples with mask sum={mask.sum()}")
 
         # 6. Add time encodings (hour, dayofweek, holiday)
-        # Need to extract timestamps for each time step in the concatenated window.
+        # Need to extract timestamps for each time step in the window.
         # We'll use the original timestamps from df.
         timestamps = pd.to_datetime(df[timestamp_col]).values
 
-        # For each sample, the times for the 30 positions:
+        # For each sample, the times for the positions:
         # Positions 0-9: cur_win (i-9 .. i)
-        # Positions 10-19: daily_win (i-daily_period-9 .. i-daily_period)
-        # Positions 20-29: weekly_win (i-weekly_period-9 .. i-weekly_period)
         n_samples = X_numeric.shape[0]
         time_feat_dim = 24 + 7 + 1  # hour one-hot + dayofweek one-hot + holiday binary
-        time_feats = np.zeros((n_samples, 30, time_feat_dim))
+        time_feats = np.zeros((n_samples, self.window_len, time_feat_dim))
 
         # Simple holiday detection: none (can be extended)
         is_holiday = np.zeros(n_total, dtype=bool)
@@ -159,10 +137,7 @@ class PVDataPreprocessor:
         for idx, i in enumerate(range(start, n_total)):
             # current window indices
             cur_idx = np.arange(i - self.window_len + 1, i + 1)
-            daily_idx = cur_idx - self.daily_period
-            weekly_idx = cur_idx - self.weekly_period
-            all_idx = np.concatenate([cur_idx, daily_idx, weekly_idx])
-            for j, t_idx in enumerate(all_idx):
+            for j, t_idx in enumerate(cur_idx):
                 ts = timestamps[t_idx]
                 hour = ts.hour
                 dow = ts.dayofweek  # Monday=0, Sunday=6
@@ -175,7 +150,7 @@ class PVDataPreprocessor:
         # Concatenate numerical and time features
         X_full = np.concatenate(
             [X_numeric, time_feats], axis=2
-        )  # (n_samples, 30, n_selected + time_feat_dim)
+        )  # (n_samples, window_len, n_selected + time_feat_dim)
         self.fitted = True
         self._mask = mask
         return X_full, y_target, mask, df_processed

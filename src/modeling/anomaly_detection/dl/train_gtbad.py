@@ -176,15 +176,8 @@ def train_lightweight(model, train_loader, val_loader, epochs=5, lr=1e-3, device
             mask_batch = mask_batch.to(device)
             optimizer.zero_grad()
             y_pred = model(x_batch)
-            # y_pred shape (batch, seq_len, output_dim), but y_batch is (batch, target_seq_len, output_dim) with target_seq_len=10.
-            # We predict the full 30-length sequence, but target is only 10 (current window). The paper reconstructs the full input window.
-            # Here we use a simplified approach: reconstruct full input and compute loss on all 30 steps.
-            # So we need y to be the full concatenated window, which is the numeric part of X_full.
-            # For fitness, we'll use the input numeric features as target (preprocessed, scaled).
-            # So we need to pass the full numeric window (30) as target.
-            # In the preprocessing above, we stored y_target as the current window (10). For lightweight training,
-            # we'll re-use X_numeric as target. Actually, we should pass the full sequence target.
-            # We'll adjust: in preprocess we also output X_full_numeric (30, n_selected) or simply use x_batch[:,:,:output_dim] as target.
+            # y_pred shape (batch, seq_len, output_dim), y_batch is (batch, seq_len, output_dim)
+            # We reconstruct the full input and compute loss on all steps.
             loss = criterion(y_pred, y_batch[:, :, :])  # assuming y_batch has same length as x
             if mask_batch is not None:
                 loss = (loss * mask_batch.float().unsqueeze(-1).unsqueeze(-1)).mean()
@@ -224,20 +217,16 @@ def main():
     preprocessor = PVDataPreprocessor(
         window_len=10,
         stride=1,
-        daily_period=96,
-        weekly_period=672,
         power_col="pdc1",
         corr_threshold=0.85,
     )
     X_full, y_target, mask, df_clean = preprocessor.fit_transform(df, TIMESTAMP_COL)
-    # X_full: (n_samples, 30, input_dim)  with input_dim = n_selected + 32
-    # y_target: (n_samples, 10, n_selected)  -> we need full target of length 30 for training.
-    # Actually, in preprocessing we only stored the current window as y_target.
+    # X_full: (n_samples, 10, input_dim)  with input_dim = n_selected + 32
+    # y_target: (n_samples, 10, n_selected)
     # To train with full sequence reconstruction, we should use the numeric part of X_full (first n_selected features) as target.
-    # Let's extract that.
     n_selected = len(preprocessor.selected_features)
     X_numeric_full = X_full[:, :, :n_selected].copy()
-    # Now X_numeric_full shape (n_samples, 30, n_selected) is both input and target.
+    # Now X_numeric_full shape (n_samples, 10, n_selected) is both input and target.
     # The input to model will be X_full (with time encodings), target is X_numeric_full.
 
     # Train/validation/test split
@@ -276,8 +265,6 @@ def main():
             num_encoder_layers=3,
             lstm_hidden=32,
             dropout=0.1,
-            daily_period=96,
-            weekly_period=672,
         ).to(DEVICE)
         val_loss = train_lightweight(
             model, train_loader, val_loader, epochs=5, lr=lr, device=DEVICE
@@ -305,8 +292,6 @@ def main():
         num_encoder_layers=3,
         lstm_hidden=32,
         dropout=0.1,
-        daily_period=96,
-        weekly_period=672,
     ).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
     criterion = nn.MSELoss()
