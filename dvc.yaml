@@ -78,6 +78,15 @@ stages:
     outs:
       - experiments/checkpoints/tgnn/tgnn_best.pt
 
+  # Stage 4.5: GTBAD Anomaly Detection
+  train_gtbad:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_gtbad
+    deps:
+      - src/modeling/anomaly_detection/dl/train_gtbad.py
+      - src/modeling/anomaly_detection/dl/gtbad_model.py
+      - src/data/preprocess_gtbad.py
+      - data/interim/ingestion/costa/costa_merged.parquet
+
   # Stage 5: LSTM-AE Preprocessing
   preprocess_lstmae:
     cmd: uv run python -m src.data.preprocess_lstmae
