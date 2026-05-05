@@ -50,6 +50,8 @@ class PVDataPreprocessor:
             )
 
         # 1. Copy and handle missing values (median fill)
+        if "label" in df.columns:
+            df = df[df["label"] == 0].copy()
         df_clean = df.copy()
         numeric_feats = [c for c in df.columns if c not in [timestamp_col, "anomaly"]]
         orig_missing = df_clean[numeric_feats].isna()  # record original missingness
