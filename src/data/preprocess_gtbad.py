@@ -123,7 +123,7 @@ class PVDataPreprocessor:
         # 6. Add time encodings (hour, dayofweek, holiday)
         # Need to extract timestamps for each time step in the window.
         # We'll use the original timestamps from df.
-        timestamps = pd.to_datetime(df[timestamp_col]).values
+        timestamps = pd.to_datetime(df[timestamp_col])
 
         # For each sample, the times for the positions:
         # Positions 0-9: cur_win (i-9 .. i)
@@ -138,7 +138,7 @@ class PVDataPreprocessor:
             # current window indices
             cur_idx = np.arange(i - self.window_len + 1, i + 1)
             for j, t_idx in enumerate(cur_idx):
-                ts = timestamps[t_idx]
+                ts = timestamps.iloc[t_idx]
                 hour = ts.hour
                 dow = ts.dayofweek  # Monday=0, Sunday=6
                 hol = 1 if is_holiday[t_idx] else 0
