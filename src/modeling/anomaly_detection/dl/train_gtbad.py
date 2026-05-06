@@ -232,8 +232,8 @@ def main():
     preprocessor = PVDataPreprocessor(
         window_len=10,
         stride=1,
-        power_col="pdc1",
-        corr_threshold=0.99,
+        power_col="pdc",
+        corr_threshold=1,
     )
     X_full, y_target, mask, df_clean = preprocessor.fit_transform(df, TIMESTAMP_COL)
     # X_full: (n_samples, 10, input_dim)  with input_dim = n_selected + 32
