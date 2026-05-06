@@ -7,11 +7,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 import warnings
+import argparse
+import pickle
+import json
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
+from loguru import logger
 from src.data.preprocess_gtbad import PVDataPreprocessor
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
+from src.modeling.common.experiment_tracker import log_experiment, setup_mlflow
 
 
 # -------------------  helper: GVSAO optimizer  -------------------
@@ -76,7 +82,7 @@ class GVSAO:
                 global_best = pop[i]
 
         if verbose:
-            print(f"Gen 0 Best Fitness: {global_best_fit:.6f}")
+            logger.info(f"Gen 0 Best Fitness: {global_best_fit:.6f}")
 
         FEs = self.pop_size
         FEs_max = self.pop_size * self.max_gen
@@ -136,7 +142,7 @@ class GVSAO:
 
             pop = new_pop
             if verbose:
-                print(f"Gen {gen} Best Fitness: {global_best_fit:.6f}")
+                logger.info(f"Gen {gen} Best Fitness: {global_best_fit:.6f}")
 
         best_lr, best_bs = self._decode(global_best)
         return best_lr, best_bs, global_best_fit
@@ -203,16 +209,23 @@ def train_lightweight(model, train_loader, val_loader, epochs=5, lr=1e-3, device
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train GTBAD model")
+    parser.add_argument("--skip-hpo", action="store_true", help="Skip hyperparameter optimization and use fixed values.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Fixed learning rate (used if --skip-hpo is set)")
+    parser.add_argument("--batch-size", type=int, default=32, help="Fixed batch size (used if --skip-hpo is set)")
+    args = parser.parse_args()
+
     # Configuration
+    setup_mlflow("Task_A_Anomaly")
     DATA_PATH = "data/interim/ingestion/costa/costa_merged.parquet"
     TIMESTAMP_COL = "timestamp"
     LABEL_COL = "label"  # if exists; otherwise ignore metrics
-    BATCH_SIZE = 32
     EPOCHS = 50
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {DEVICE}")
+    logger.info(f"Using device: {DEVICE}")
 
     # 1. Load and preprocess
+    logger.info(f"Loading data from {DATA_PATH}...")
     df = load_dataset(DATA_PATH, TIMESTAMP_COL, LABEL_COL)
     preprocessor = PVDataPreprocessor(
         window_len=10,
@@ -238,15 +251,21 @@ def main():
         X_train, y_train, mask_train, test_size=0.2, random_state=42, shuffle=False
     )
 
-    # 2. GVSAO hyperparameter optimization
+    # 2. Hyperparameter optimization or load fixed values
     input_dim = X_train.shape[2]
     output_dim = n_selected
 
-    def fitness_func(lr, bs):
-        bs = int(bs)
-        # Build lightweight loaders
-        train_dataset = TensorDataset(
-            torch.tensor(X_tr, dtype=torch.float32),
+    if args.skip_hpo:
+        logger.info(f"Skipping HPO, using provided hyperparameters: LR={args.lr}, Batch Size={args.batch_size}")
+        best_lr = args.lr
+        best_bs = args.batch_size
+    else:
+        logger.info("Starting GVSAO hyperparameter optimization...")
+        def fitness_func(lr, bs):
+            bs = int(bs)
+            # Build lightweight loaders
+            train_dataset = TensorDataset(
+                torch.tensor(X_tr, dtype=torch.float32),
             torch.tensor(y_tr, dtype=torch.float32),
             torch.tensor(mask_tr, dtype=torch.float32),
         )
@@ -272,11 +291,12 @@ def main():
         return val_loss
 
     bounds = [[np.log10(1e-5), np.log10(1e-1)], [16, 128]]  # lr in log, bs linear
-    optimizer_gvsao = GVSAO(dim=2, bounds=bounds, pop_size=20, max_gen=10)
-    best_lr, best_bs, best_fit = optimizer_gvsao.optimize(fitness_func)
-    print(f"Best LR: {best_lr:.6f}, Best batch size: {best_bs}, Fitness: {best_fit:.6f}")
+        optimizer_gvsao = GVSAO(dim=2, bounds=bounds, pop_size=20, max_gen=10)
+        best_lr, best_bs, best_fit = optimizer_gvsao.optimize(fitness_func)
+        logger.info(f"Best LR: {best_lr:.6f}, Best batch size: {best_bs}, Fitness: {best_fit:.6f}")
 
     # 3. Final training with best hyperparameters
+    logger.info(f"Starting final training with bs={best_bs}, lr={best_lr}")
     train_dataset = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.float32),
@@ -311,9 +331,12 @@ def main():
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch + 1}/{EPOCHS} Loss: {total_loss / len(train_loader):.6f}")
+        
+        avg_loss = total_loss / len(train_loader)
+        logger.info(f"Epoch {epoch + 1}/{EPOCHS} Loss: {avg_loss:.6f}")
 
     # 4. Evaluation (anomaly detection)
+    logger.info("Computing reconstruction errors to find anomaly threshold...")
     model.eval()
     # Compute reconstruction errors on training set to set threshold
     train_errors = []
@@ -326,9 +349,27 @@ def main():
             train_errors.extend(err.cpu().numpy().tolist())
     train_errors = np.array(train_errors)
     threshold = np.percentile(train_errors, 95)
-    print(f"Anomaly threshold (95th percentile): {threshold:.6f}")
+    logger.info(f"Anomaly threshold (95th percentile): {threshold:.6f}")
+
+    # --- Save Model and Preprocessor ---
+    checkpoint_dir = Path("experiments/checkpoints/gtbad")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    model_path = checkpoint_dir / "gtbad_best.pt"
+    torch.save(model.state_dict(), model_path)
+    
+    preprocessor_path = checkpoint_dir / "preprocessor.pkl"
+    with open(preprocessor_path, "wb") as f:
+        pickle.dump(preprocessor, f)
+        
+    threshold_path = checkpoint_dir / "threshold.json"
+    with open(threshold_path, "w") as f:
+        json.dump({"threshold": float(threshold), "input_dim": input_dim, "output_dim": output_dim}, f)
+        
+    logger.info(f"Model, preprocessor, and threshold saved to {checkpoint_dir}")
 
     # Test set errors
+    logger.info("Computing errors on test set...")
     test_dataset = TensorDataset(
         torch.tensor(X_test, dtype=torch.float32),
         torch.tensor(y_test, dtype=torch.float32),
@@ -352,9 +393,9 @@ def main():
         # The test set indices are after train_test_split; we can store the original sample indices during preprocessing.
         # For brevity, we assume df has anomaly labels aligned with timestamps and sliding window samples.
         # We will skip exact alignment here due to complexity; a complete implementation would track index mapping.
-        print("True labels available but alignment with sliding windows not implemented in this script.")
+        logger.warning("True labels available but alignment with sliding windows not implemented in this script.")
     else:
-        print("No true labels; anomaly scores saved as 'test_anomaly_scores.csv'")
+        logger.info("No true labels; anomaly scores saved as 'test_anomaly_scores.csv'")
         np.savetxt("test_anomaly_scores.csv", test_errors, delimiter=",")
 
 

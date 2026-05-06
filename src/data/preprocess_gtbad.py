@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from scipy.signal import savgol_filter
 from sklearn.preprocessing import MinMaxScaler
+from loguru import logger
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -51,9 +52,9 @@ class PVDataPreprocessor:
 
         # 1. Copy and handle missing values (median fill)
         if "label" in df.columns:
-            df = df[df["label"] == 0].copy()
+            df = df[df["label"] == 0].copy() #take only healthy data for fitting
         df_clean = df.copy()
-        numeric_feats = [c for c in df.columns if c not in [timestamp_col, "anomaly"]]
+        numeric_feats = [c for c in df.columns if c not in [timestamp_col, "label"]]
         orig_missing = df_clean[numeric_feats].isna()  # record original missingness
         for col in numeric_feats:
             median_val = df_clean[col].median()
@@ -80,7 +81,7 @@ class PVDataPreprocessor:
                     else:
                         to_drop.add(col_i)
         self.selected_features = [c for c in numeric_feats if c not in to_drop]
-        print(f"Selected {len(self.selected_features)} features: {self.selected_features}")
+        logger.info(f"Selected {len(self.selected_features)} features: {self.selected_features}")
 
         # 4. S-G smoothing on selected features
         df_smooth = df_scaled[self.selected_features].copy()
@@ -120,7 +121,7 @@ class PVDataPreprocessor:
         X_numeric = np.array(windows)  # (n_samples, window_len, n_selected)
         y_target = np.array(target_windows)  # (n_samples, window_len, n_selected)
         mask = np.array(mask_values)  # (n_samples,)
-        print(f"Generated {X_numeric.shape[0]} samples with mask sum={mask.sum()}")
+        logger.info(f"Generated {X_numeric.shape[0]} samples with mask sum={mask.sum()}")
 
         # 6. Add time encodings (hour, dayofweek, holiday)
         # Need to extract timestamps for each time step in the window.
@@ -156,6 +157,88 @@ class PVDataPreprocessor:
         self.fitted = True
         self._mask = mask
         return X_full, y_target, mask, df_processed
+
+    def transform(self, df, timestamp_col="timestamp"):
+        """
+        Apply the preprocessing pipeline to new data (already fitted).
+        """
+        if not self.fitted:
+            raise RuntimeError("Must fit before calling transform.")
+        
+        df_clean = df.copy()
+        numeric_feats = self.scaler.feature_names_in_
+        for col in numeric_feats:
+            if col in df_clean.columns:
+                df_clean[col].fillna(df_clean[col].median(), inplace=True)
+            else:
+                df_clean[col] = 0.0 # fallback
+
+        scaled_data = self.scaler.transform(df_clean[numeric_feats])
+        df_scaled = pd.DataFrame(scaled_data, columns=numeric_feats)
+
+        df_smooth = df_scaled[self.selected_features].copy()
+        for col in self.selected_features:
+            df_smooth[col] = savgol_filter(
+                df_smooth[col],
+                window_length=self.window_len,
+                polyorder=3,
+                mode="nearest",
+            )
+        df_processed = df_smooth.copy()
+
+        n_total = len(df_processed)
+        feat_array = df_processed.values
+        windows = []
+
+        start = self.window_len - 1
+        for i in range(start, n_total):
+            cur_win = feat_array[i - self.window_len + 1 : i + 1, :]
+            windows.append(cur_win)
+
+        X_numeric = np.array(windows)
+        
+        timestamps = pd.to_datetime(df[timestamp_col])
+        n_samples = X_numeric.shape[0]
+        time_feat_dim = 24 + 7 + 1
+        time_feats = np.zeros((n_samples, self.window_len, time_feat_dim))
+        is_holiday = np.zeros(n_total, dtype=bool)
+
+        for idx, i in enumerate(range(start, n_total)):
+            cur_idx = np.arange(i - self.window_len + 1, i + 1)
+            for j, t_idx in enumerate(cur_idx):
+                ts = timestamps.iloc[t_idx]
+                time_feats[idx, j, ts.hour] = 1.0
+                time_feats[idx, j, 24 + ts.dayofweek] = 1.0
+                time_feats[idx, j, -1] = 1 if is_holiday[t_idx] else 0
+
+        X_full = np.concatenate([X_numeric, time_feats], axis=2)
+        
+        # Also need labels aligned with windows (sliding)
+        labels_aligned = []
+        fault_labels_aligned = []
+        has_labels = "label" in df.columns
+        has_fault_labels = "fault_label" in df.columns
+        
+        for i in range(start, n_total):
+            idx_range = range(i - self.window_len + 1, i + 1)
+            
+            if has_labels:
+                win_l = df["label"].iloc[idx_range].values
+                labels_aligned.append(1 if np.any(win_l > 0) else 0)
+            
+            if has_fault_labels:
+                win_fl = df["fault_label"].iloc[idx_range].values
+                fl_only = win_fl[win_fl > 0]
+                if len(fl_only) > 0:
+                    vals, counts = np.unique(fl_only, return_counts=True)
+                    fault_labels_aligned.append(int(vals[np.argmax(counts)]))
+                else:
+                    fault_labels_aligned.append(0)
+
+        labels_aligned = np.array(labels_aligned) if has_labels else None
+        fault_labels_aligned = np.array(fault_labels_aligned) if has_fault_labels else None
+
+        return X_full, np.array(windows), labels_aligned, fault_labels_aligned
 
     def _feature_priority(self, col_a, col_b, df_scaled, orig_missing):
         """Return the column to keep based on: 1) correlation with power, 2) missing rate, 3) variance."""
