@@ -231,7 +231,7 @@ def main():
         window_len=10,
         stride=1,
         power_col="pdc1",
-        corr_threshold=0.85,
+        corr_threshold=0.97,
     )
     X_full, y_target, mask, df_clean = preprocessor.fit_transform(df, TIMESTAMP_COL)
     # X_full: (n_samples, 10, input_dim)  with input_dim = n_selected + 32
@@ -266,31 +266,31 @@ def main():
             # Build lightweight loaders
             train_dataset = TensorDataset(
                 torch.tensor(X_tr, dtype=torch.float32),
-            torch.tensor(y_tr, dtype=torch.float32),
-            torch.tensor(mask_tr, dtype=torch.float32),
-        )
-        val_dataset = TensorDataset(
-            torch.tensor(X_val, dtype=torch.float32),
-            torch.tensor(y_val, dtype=torch.float32),
-            torch.tensor(mask_val, dtype=torch.float32),
-        )
-        train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False)
-        model = GTBADModel(
-            input_dim=input_dim,
-            output_dim=output_dim,
-            d_model=64,
-            nhead=2,
-            num_encoder_layers=3,
-            lstm_hidden=32,
-            dropout=0.1,
-        ).to(DEVICE)
-        val_loss = train_lightweight(
-            model, train_loader, val_loader, epochs=5, lr=lr, device=DEVICE
-        )
-        return val_loss
+                torch.tensor(y_tr, dtype=torch.float32),
+                torch.tensor(mask_tr, dtype=torch.float32),
+            )
+            val_dataset = TensorDataset(
+                torch.tensor(X_val, dtype=torch.float32),
+                torch.tensor(y_val, dtype=torch.float32),
+                torch.tensor(mask_val, dtype=torch.float32),
+            )
+            train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False)
+            model = GTBADModel(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                d_model=64,
+                nhead=2,
+                num_encoder_layers=3,
+                lstm_hidden=32,
+                dropout=0.1,
+            ).to(DEVICE)
+            val_loss = train_lightweight(
+                model, train_loader, val_loader, epochs=5, lr=lr, device=DEVICE
+            )
+            return val_loss
 
-    bounds = [[np.log10(1e-5), np.log10(1e-1)], [16, 128]]  # lr in log, bs linear
+        bounds = [[np.log10(1e-5), np.log10(1e-1)], [16, 128]]  # lr in log, bs linear
         optimizer_gvsao = GVSAO(dim=2, bounds=bounds, pop_size=20, max_gen=10)
         best_lr, best_bs, best_fit = optimizer_gvsao.optimize(fitness_func)
         logger.info(f"Best LR: {best_lr:.6f}, Best batch size: {best_bs}, Fitness: {best_fit:.6f}")
