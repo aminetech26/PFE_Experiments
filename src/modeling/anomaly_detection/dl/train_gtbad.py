@@ -1,4 +1,8 @@
 import os
+
+# Fix matplotlib backend in headless/Colab environments
+os.environ['MPLBACKEND'] = 'Agg'
+
 import copy
 import numpy as np
 import pandas as pd

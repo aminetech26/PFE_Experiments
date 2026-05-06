@@ -5,6 +5,9 @@ from pathlib import Path
 import os
 import pickle
 
+# Fix matplotlib backend in headless/Colab environments
+os.environ['MPLBACKEND'] = 'Agg'
+
 import numpy as np
 import pandas as pd
 import torch
