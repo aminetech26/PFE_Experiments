@@ -87,26 +87,36 @@ def main():
     model.eval()
 
     logger.info(f"Loading dataset from {args.dataset_path}")
-    df = pd.read_parquet(args.dataset_path)
+    _, ext = os.path.splitext(args.dataset_path)
+    if ext.lower() == ".parquet":
+        df = pd.read_parquet(args.dataset_path)
+    else:
+        df = pd.read_csv(args.dataset_path)
+        
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
     
     if "fault_label" not in df.columns and "label" in df.columns:
         logger.warning("'fault_label' column missing, defaulting class splits to 'label' column directly.")
         df["fault_label"] = df["label"]
+
+    if "label" in df.columns:
+        logger.info("Filtering dataset to keep only anomalous rows (label > 0)...")
+        df = df[df["label"] > 0].copy()
+        df.reset_index(drop=True, inplace=True)
+    else:
+        logger.error("Dataset has no 'label' column, cannot evaluate performance.")
+        return
         
     # We apply transform to scale and build windows
     logger.info("Applying GTBAD preprocessing transform...")
     X_full, y_target, labels_seq, fault_labels_seq = preprocessor.transform(df, "timestamp")
 
-    if labels_seq is None:
-        logger.error("Dataset has no labels, cannot evaluate performance.")
-        return
-
-    # Filter to purely faulty sequences for this statistical evaluation
-    faulty_mask = (labels_seq == 1)
-    X_seq = X_full[faulty_mask]
-    Y_multi_seq = fault_labels_seq[faulty_mask]
+    # Already filtered the dataframe, so all resulting sequences are faulty
+    X_seq = X_full
+    Y_multi_seq = fault_labels_seq
     
-    logger.info(f"Filtered down to {len(X_seq)} purely faulty sequences.")
+    logger.info(f"Generated {len(X_seq)} purely faulty sequences after filtering.")
 
     logger.info("Running inference...")
     
