@@ -21,7 +21,6 @@ warnings.filterwarnings("ignore")
 from loguru import logger
 from src.data.preprocess_gtbad import PVDataPreprocessor
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
-from src.modeling.common.experiment_tracker import log_experiment, setup_mlflow
 
 
 # -------------------  helper: GVSAO optimizer  -------------------
@@ -220,7 +219,6 @@ def main():
     args = parser.parse_args()
 
     # Configuration
-    setup_mlflow("Task_A_Anomaly")
     DATA_PATH = "data/interim/ingestion/costa/costa_merged.parquet"
     TIMESTAMP_COL = "timestamp"
     LABEL_COL = "label"  # if exists; otherwise ignore metrics
