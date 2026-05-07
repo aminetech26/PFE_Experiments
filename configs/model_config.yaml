@@ -77,14 +77,14 @@ anomaly_detection:
         transition_stickiness: [0.90, 0.99]
 
   dl:
-    active_model: lstm_autoencoder
+    active_model: maat
     hpo:
       mode: auto_two_stage
       sampler: tpe
       pruner: hyperband
       validation_mode: holdout
       early_stopping: true
-      study_name_prefix: anomaly_dl
+      study_name_prefix: anomaly_dl_maat
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_dl.db"
       run_stage3: false
       trial_budget:
@@ -92,15 +92,41 @@ anomaly_detection:
         stage2_architecture: 40
         stage3_joint: 12
     models:
+      maat:
+        win_size: 30
+        block_size: 10
+        d_model: 64
+        n_heads: 4
+        e_layers: 2
+        d_ff: 128
+        dropout: 0.1
+        k: 3.0
+        temperature: 50
+        train_stride: 1
+        eval_stride: 1
+        score_reduction: center
+        scaling: standard
+        hpo_stage1:
+          learning_rate: {type: float, low: 1.0e-5, high: 3.0e-3, log: true}
+          weight_decay: {type: float, low: 1.0e-6, high: 1.0e-2, log: true}
+          dropout: {type: float, low: 0.0, high: 0.3}
+          k: {type: float, low: 0.5, high: 5.0}
+          temperature: {type: categorical, choices: [10, 25, 50, 75, 100]}
+          batch_size: {type: categorical, choices: [64, 128, 256]}
+          gradient_clip_val: {type: categorical, choices: [0.5, 1.0, 2.0]}
+        hpo_stage2:
+          win_size: {type: categorical, choices: [30, 60, 90]}
+          block_size: {type: categorical, choices: [5, 10, 15, 30]}
+          d_model: {type: categorical, choices: [32, 64, 128]}
+          n_heads: {type: categorical, choices: [2, 4, 8]}
+          e_layers: {type: int, low: 1, high: 3}
+          d_ff: {type: categorical, choices: [64, 128, 256, 512]}
       lstm_autoencoder:
         hidden_dim: [32, 64, 128]
         num_layers: [2, 3]
       seq2seq_autoencoder:
         hidden_dim: [64, 128]
         num_layers: [2, 3]
-      ssm:
-        d_model: [64, 128]
-        n_layers: [2, 4]
 
   primary_metric: pr_auc   # PR-AUC (not ROC) due to 97% normal class
   threshold_calibration: pr_curve  # use precision-recall to set alarm threshold
