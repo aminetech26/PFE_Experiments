@@ -230,7 +230,7 @@ def main():
     logger.info(f"Loading data from {DATA_PATH}...")
     df = load_dataset(DATA_PATH, TIMESTAMP_COL, LABEL_COL)
     preprocessor = PVDataPreprocessor(
-        window_len=1,
+        window_len=4,
         stride=1,
         power_col="pdc",
         corr_threshold=0.99,
