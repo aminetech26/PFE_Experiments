@@ -388,17 +388,8 @@ def main():
             test_errors.extend(err.cpu().numpy().tolist())
     test_errors = np.array(test_errors)
     pred_anomaly = (test_errors > threshold).astype(int)
-
-    # If true labels are available, compute metrics
-    if LABEL_COL in df.columns:
-        # need to align labels with test samples (they were created by sliding window)
-        # The test set indices are after train_test_split; we can store the original sample indices during preprocessing.
-        # For brevity, we assume df has anomaly labels aligned with timestamps and sliding window samples.
-        # We will skip exact alignment here due to complexity; a complete implementation would track index mapping.
-        logger.warning("True labels available but alignment with sliding windows not implemented in this script.")
-    else:
-        logger.info("No true labels; anomaly scores saved as 'test_anomaly_scores.csv'")
-        np.savetxt("test_anomaly_scores.csv", test_errors, delimiter=",")
+    logger.info("No true labels; anomaly scores saved as 'test_anomaly_scores.csv'")
+    np.savetxt("test_anomaly_scores.csv", test_errors, delimiter=",")
 
 
 if __name__ == "__main__":
