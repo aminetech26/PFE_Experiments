@@ -121,14 +121,8 @@ anomaly_detection:
           n_heads: {type: categorical, choices: [2, 4, 8]}
           e_layers: {type: int, low: 1, high: 3}
           d_ff: {type: categorical, choices: [64, 128, 256, 512]}
-      lstm_autoencoder:
-        hidden_dim: [32, 64, 128]
-        num_layers: [2, 3]
-      seq2seq_autoencoder:
-        hidden_dim: [64, 128]
-        num_layers: [2, 3]
 
-  primary_metric: pr_auc   # PR-AUC (not ROC) due to 97% normal class
+  primary_metric: pr_auc   # PR-AUC
   threshold_calibration: pr_curve  # use precision-recall to set alarm threshold
 
 # ============================================================================
