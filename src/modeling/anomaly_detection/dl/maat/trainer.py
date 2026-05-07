@@ -51,6 +51,7 @@ from src.utils.paths import get_experiments_root
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+torch.set_float32_matmul_precision("medium")  # use Tensor Cores on Ampere+
 
 
 def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
@@ -601,9 +602,9 @@ def run_maat(config: dict | None = None) -> None:
         ds_test = TimeSeriesDataset(
             test_df, features, label_col, cfg["win_size"], stride_eval, normal_only=False
         )
-        train_dl = DataLoader(ds_train, batch_size=bs, shuffle=True, drop_last=False, num_workers=0)
-        val_dl = DataLoader(ds_val, batch_size=bs, shuffle=False, drop_last=False, num_workers=0)
-        test_dl = DataLoader(ds_test, batch_size=bs, shuffle=False, drop_last=False, num_workers=0)
+        train_dl = DataLoader(ds_train, batch_size=bs, shuffle=True, drop_last=False, num_workers=4, persistent_workers=True)
+        val_dl = DataLoader(ds_val, batch_size=bs, shuffle=False, drop_last=False, num_workers=4, persistent_workers=True)
+        test_dl = DataLoader(ds_test, batch_size=bs, shuffle=False, drop_last=False, num_workers=4, persistent_workers=True)
         return train_dl, val_dl, test_dl
 
     train_dl, val_dl, test_dl = _make_dataloaders(maat_cfg, train_stride, eval_stride, batch_size)
