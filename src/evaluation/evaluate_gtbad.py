@@ -110,11 +110,11 @@ def main():
         
     # We apply transform to scale and build windows
     logger.info("Applying GTBAD preprocessing transform...")
-    X_full, y_target, labels_seq, fault_labels_seq = preprocessor.transform(df, "timestamp")
+    X_full, y_target, mask, df_processed = preprocessor.transform(df, "timestamp")
 
     # Already filtered the dataframe, so all resulting sequences are faulty
     X_seq = X_full
-    Y_multi_seq = fault_labels_seq
+    Y_multi_seq = y_target
     
     logger.info(f"Generated {len(X_seq)} purely faulty sequences after filtering.")
 
