@@ -159,10 +159,14 @@ class PVDataPreprocessor:
         return X_full, y_target, mask, df_processed
 
     def transform(self, df, timestamp_col="timestamp"):
+        """
+        Apply fitted preprocessing to new data (test/eval set).
+        Uses fitted scaler and selected features from fit_transform().
+        """
+        if not self.fitted:
+            raise RuntimeError("Preprocessor must be fitted first via fit_transform()")
         
         # 1. Copy and handle missing values (median fill)
-        if "label" in df.columns:
-            df = df[df["label"] > 0].copy() #take only faulty data
         df_clean = df.copy()
         numeric_feats = [c for c in df.columns if c not in [timestamp_col, "label"]]
         orig_missing = df_clean[numeric_feats].isna()  # record original missingness
@@ -170,28 +174,15 @@ class PVDataPreprocessor:
             median_val = df_clean[col].median()
             df_clean[col].fillna(median_val, inplace=True)
 
-        # 2. Min-Max scaling
-        scaled_data = self.scaler.fit_transform(df_clean[numeric_feats])
+        # 2. Apply fitted Min-Max scaling (NOT fit_transform)
+        scaled_data = self.scaler.transform(df_clean[numeric_feats])
         df_scaled = pd.DataFrame(scaled_data, columns=numeric_feats)
 
-        # 3. Pearson correlation-based feature selection
-        corr_matrix = df_scaled.corr().abs()
-        to_drop = set()
-        for i in range(len(numeric_feats)):
-            for j in range(i + 1, len(numeric_feats)):
-                col_i = numeric_feats[i]
-                col_j = numeric_feats[j]
-                if col_i in to_drop or col_j in to_drop:
-                    continue
-                if corr_matrix.loc[col_i, col_j] >= self.corr_threshold:
-                    # decide which to keep
-                    keep_i = self._feature_priority(col_i, col_j, df_scaled, orig_missing)
-                    if keep_i == col_i:
-                        to_drop.add(col_j)
-                    else:
-                        to_drop.add(col_i)
-        self.selected_features = [c for c in numeric_feats if c not in to_drop]
-        logger.info(f"Selected {len(self.selected_features)} features: {self.selected_features}")
+        # 3. Use fitted selected features (NOT recompute)
+        # Verify fitted features are available in current data
+        missing_feats = [f for f in self.selected_features if f not in df_scaled.columns]
+        if missing_feats:
+            raise ValueError(f"Features {missing_feats} not found in data. Data columns: {list(df_scaled.columns)}")
 
         # 4. S-G smoothing on selected features
         df_smooth = df_scaled[self.selected_features].copy()
@@ -264,8 +255,7 @@ class PVDataPreprocessor:
         X_full = np.concatenate(
             [X_numeric, time_feats], axis=2
         )  # (n_samples, window_len, n_selected + time_feat_dim)
-        self.fitted = True
-        self._mask = mask
+        # NOTE: Do NOT set self.fitted or self._mask in transform() - already fitted from fit_transform()
         return X_full, y_target, mask, df_processed
 
     def _feature_priority(self, col_a, col_b, df_scaled, orig_missing):

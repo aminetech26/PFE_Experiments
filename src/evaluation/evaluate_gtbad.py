@@ -20,12 +20,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
 
-def print_class_statistics(seq_multi, tp_mask, fn_mask):
+def print_class_statistics(labels, tp_mask, fn_mask):
     """
-    Prints recall and counts for each distinct fault_label class.
-    Only evaluates faulty sequences, so TN and FP are excluded.
+    Prints recall and counts for each distinct anomaly class (from labels column).
+    Only evaluates faulty sequences (label > 0), so TN and FP are excluded.
     """
-    unique_classes = [c for c in np.unique(seq_multi) if c != 0]
+    unique_classes = [c for c in np.unique(labels) if c != 0]
     
     logger.info("=" * 60)
     logger.info(f"{'Class':<8} | {'Total':<9} | {'Detected (TP)':<14} | {'Missed (FN)':<12} | {'Recall':<7}")
@@ -36,7 +36,7 @@ def print_class_statistics(seq_multi, tp_mask, fn_mask):
     global_total = global_tp + global_fn
     
     for cls in unique_classes:
-        cls_mask = (seq_multi == cls)
+        cls_mask = (labels == cls)
         
         c_tp = np.sum(tp_mask & cls_mask)
         c_fn = np.sum(fn_mask & cls_mask)
@@ -96,27 +96,47 @@ def main():
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
     
-    if "fault_label" not in df.columns and "label" in df.columns:
-        logger.warning("'fault_label' column missing, defaulting class splits to 'label' column directly.")
-        df["fault_label"] = df["label"]
-
-    if "label" in df.columns:
-        logger.info("Filtering dataset to keep only anomalous rows (label > 0)...")
-        df = df[df["label"] > 0].copy()
-        df.reset_index(drop=True, inplace=True)
-    else:
+    # Check for label column (actual anomaly labels in dataset)
+    if "label" not in df.columns:
         logger.error("Dataset has no 'label' column, cannot evaluate performance.")
         return
-        
+    
+    logger.info("Filtering dataset to keep only anomalous rows (label > 0) for evaluation...")
+    df_anomaly = df[df["label"] > 0].copy()
+    df_anomaly.reset_index(drop=True, inplace=True)
+    
+    if len(df_anomaly) == 0:
+        logger.warning("No anomalous samples found in dataset. Evaluation skipped.")
+        return
+    
+    # Get the original labels before preprocessing (to track anomaly classes)
+    original_labels = df_anomaly["label"].values
+    
     # We apply transform to scale and build windows
     logger.info("Applying GTBAD preprocessing transform...")
-    X_full, y_target, mask, df_processed = preprocessor.transform(df, "timestamp")
+    X_full, y_target, mask, df_processed = preprocessor.transform(df_anomaly, "timestamp")
 
-    # Already filtered the dataframe, so all resulting sequences are faulty
-    X_seq = X_full
-    Y_multi_seq = y_target
+    # Map sliding window indices back to original labels
+    # For each window, we track the maximum label value in that window (to classify the window as anomalous)
+    window_labels = []
+    window_len = preprocessor.window_len
+    n_samples = len(X_full)
     
-    logger.info(f"Generated {len(X_seq)} purely faulty sequences after filtering.")
+    for idx in range(n_samples):
+        # Each sample corresponds to window at position (window_len - 1 + idx)
+        window_end = window_len - 1 + idx
+        window_start = window_end - window_len + 1
+        
+        # Get the labels for this window
+        window_label_values = original_labels[window_start:window_end + 1]
+        # Use max label in window (if any value > 0, window is anomalous)
+        max_label = np.max(window_label_values) if len(window_label_values) > 0 else 0
+        window_labels.append(max_label)
+    
+    window_labels = np.array(window_labels)
+    
+    logger.info(f"Generated {len(X_full)} window samples from {len(df_anomaly)} anomalous timesteps.")
+    logger.info(f"Window label distribution: {np.unique(window_labels, return_counts=True)}")
 
     logger.info("Running inference...")
     
@@ -126,9 +146,10 @@ def main():
     all_errors = []
     
     with torch.no_grad():
-        for i in range(0, len(X_seq), batch_size):
-            x_b = torch.tensor(X_seq[i:i+batch_size], dtype=torch.float32).to(device)
-            y_b = torch.tensor(X_seq[i:i+batch_size, :, :output_dim], dtype=torch.float32).to(device)
+        for i in range(0, len(X_full), batch_size):
+            x_b = torch.tensor(X_full[i:i+batch_size], dtype=torch.float32).to(device)
+            # Target is the numeric features (first output_dim columns of X_full)
+            y_b = torch.tensor(X_full[i:i+batch_size, :, :output_dim], dtype=torch.float32).to(device)
             
             preds = model(x_b)
             # Reuses the exact reconstruction error function from training
@@ -140,10 +161,12 @@ def main():
     logger.info(f"Evaluating with global threshold: {threshold:.6f}")
     predicted_anomalies = (all_errors > threshold).astype(int)
 
-    tp_mask = (predicted_anomalies == 1)
-    fn_mask = (predicted_anomalies == 0)
+    # TP: predicted as anomaly and actually anomalous (label > 0)
+    # FN: predicted as normal but actually anomalous (label > 0)
+    tp_mask = (predicted_anomalies == 1) & (window_labels > 0)
+    fn_mask = (predicted_anomalies == 0) & (window_labels > 0)
 
-    print_class_statistics(Y_multi_seq, tp_mask, fn_mask)
+    print_class_statistics(window_labels, tp_mask, fn_mask)
 
 if __name__ == "__main__":
     main()
