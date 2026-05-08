@@ -125,21 +125,21 @@ anomaly_detection:
           d_ff: {type: categorical, choices: [64, 128, 256, 512]}
 
       dlssm:
-        win_size: 30
+        win_size: 60
         train_stride: 1
         eval_stride: 1
-        hidden_dim: 64
-        latent_dim: 16
-        encoder_dim: 128
-        decoder_dim: 128
+        hidden_dim: 128
+        latent_dim: 32
+        encoder_dim: 256
+        decoder_dim: 256
         n_gru_layers: 1
         dropout: 0.1
 
         beta_kl: 0.1
         kl_warmup_epochs: 5
-        free_bits: 0.0
+        free_bits: 0.05
 
-        lambda_phys: 0.05
+        lambda_phys: 0.1
         physics_components:
           string_power: true
           imbalance: true
@@ -153,7 +153,7 @@ anomaly_detection:
         # Semi-supervised paradigms — override via --one-class / --consistency CLI flags
         one_class: false                  # Deep SVDD-style latent compactness
         lambda_oc: 0.1                    # training loss weight
-        lambda_oc_score: 0.0              # scoring weight; keep 0.0 for clean ablation
+        lambda_oc_score: 0.1              # scoring weight
         oc_warmup_epochs: 3               # train pure ELBO first; then init c
 
         consistency: false                # consistency regularization on q_mu
@@ -163,17 +163,39 @@ anomaly_detection:
 
         alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
         lambda_kl_score: 0.1
-        lambda_phys_score: 0.0    # keep 0.0 for clean ablation; physics only in training, not scoring
-        lambda_pred_score: 0.0    # keep 0.0 for clean ablation; enable after base results confirmed
-        score_reduction: center
+        lambda_phys_score: 0.05
+        lambda_pred_score: 0.1
+        score_reduction: max
 
         batch_size: 256
-        max_epochs: 30
+        max_epochs: 60
         learning_rate: 1.0e-3
         weight_decay: 1.0e-5
         gradient_clip_val: 1.0
         accelerator: auto
         scaling: standard
+
+        hpo:
+          mode: single_stage
+          sampler: tpe
+          pruner: asha
+          n_trials: 80
+          timeout_seconds: 18000
+          search_space:
+            learning_rate:        {type: float, low: 1.0e-4, high: 3.0e-3, log: true}
+            weight_decay:         {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+            dropout:              {type: float, low: 0.0,    high: 0.3}
+            free_bits:            {type: categorical, choices: [0.0, 0.05, 0.1]}
+            lambda_phys:          {type: float, low: 0.02, high: 0.3, log: true}
+            lambda_oc:            {type: float, low: 0.02, high: 0.3, log: true}
+            lambda_cons:          {type: float, low: 0.02, high: 0.3, log: true}
+            lambda_kl_score:      {type: float, low: 0.05, high: 0.3, log: true}
+            lambda_pred_score:    {type: float, low: 0.0,  high: 0.3}
+            lambda_oc_score:      {type: float, low: 0.0,  high: 0.3}
+            lambda_phys_score:    {type: float, low: 0.0,  high: 0.2}
+            aug_noise_std:        {type: float, low: 0.02, high: 0.15}
+            aug_feature_dropout:  {type: float, low: 0.0,  high: 0.2}
+            score_reduction:      {type: categorical, choices: [center, mean, max]}
 
   primary_metric: pr_auc   # PR-AUC
   threshold_calibration: pr_curve  # use precision-recall to set alarm threshold

@@ -27,6 +27,11 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
+import optuna
+from optuna.pruners import SuccessiveHalvingPruner
+from optuna.samplers import TPESampler
+from pytorch_lightning.callbacks import Callback
+
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
@@ -42,6 +47,7 @@ from src.modeling.anomaly_detection.dl.dlssm.losses import (
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
 from src.modeling.common.feature_loader import load_features_for_task
+from src.modeling.common.hyperparameter_optimizer import suggest_params_from_space
 from src.utils.paths import get_experiments_root
 
 # trainer.py is under dl/dlssm/, so PROJECT_ROOT is 5 levels up
@@ -72,6 +78,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--self-paced", action="store_true", help="Enable self-paced curriculum weighting")
     p.add_argument("--one-class", action="store_true", help="Deep SVDD-style latent compactness loss")
     p.add_argument("--consistency", action="store_true", help="Consistency regularization on q_mu under PV-safe augmentation")
+    p.add_argument("--hpo", action="store_true", help="Run Optuna HPO sweep then retrain best config")
+    p.add_argument("--n-trials", type=int, default=None, help="Override number of HPO trials")
+    p.add_argument("--best-params", default=None, help="JSON string of best params to apply directly (skips HPO search)")
     return p.parse_args()
 
 
@@ -96,6 +105,138 @@ def _calibrate_threshold(
         float(prec[best_idx]),
         float(rec[best_idx]),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HPO helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _OptunaPruningCallback(Callback):
+    """Minimal ASHA pruning callback — no optuna-integration dependency."""
+
+    def __init__(self, trial: optuna.Trial, monitor: str = "val_pr_auc") -> None:
+        self._trial = trial
+        self._monitor = monitor
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.sanity_checking:
+            return
+        logged = trainer.callback_metrics.get(self._monitor)
+        if logged is None:
+            return
+        value = float(logged.detach().cpu().item()) if hasattr(logged, "detach") else float(logged)
+        self._trial.report(value, step=trainer.current_epoch)
+        if self._trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+def _run_hpo(
+    base_cfg: dict,
+    hpo_cfg: dict,
+    train_dl: "DataLoader",
+    val_dl: "DataLoader",
+    scaler_mean_t: torch.Tensor,
+    scaler_scale_t: torch.Tensor,
+    feature_idx: dict,
+    n_features: int,
+    physics_enabled: bool,
+    oc_enabled: bool,
+    consistency_enabled: bool,
+    self_paced_enabled: bool,
+    seed: int,
+    n_trials_override: int | None,
+) -> dict:
+    """Run Optuna TPE + ASHA sweep. Returns best params dict."""
+    search_space = hpo_cfg.get("search_space", {})
+    n_trials = n_trials_override or int(hpo_cfg.get("n_trials", 40))
+    timeout = hpo_cfg.get("timeout_seconds", None)
+    # HPO uses shorter max_epochs for speed; use 15 or half of full budget
+    hpo_epochs = max(10, int(base_cfg.get("max_epochs", 60)) // 4)
+    hpo_patience = max(5, hpo_epochs // 3)
+
+    def objective(trial: optuna.Trial) -> float:
+        suggested = suggest_params_from_space(trial, search_space)
+        cfg = {**base_cfg, **suggested}
+
+        hpo_model = DeepLatentStateSpaceModel(
+            n_features=n_features,
+            win_size=int(cfg["win_size"]),
+            hidden_dim=int(cfg.get("hidden_dim", 128)),
+            latent_dim=int(cfg.get("latent_dim", 32)),
+            encoder_dim=int(cfg.get("encoder_dim", 256)),
+            decoder_dim=int(cfg.get("decoder_dim", 256)),
+            n_gru_layers=int(cfg.get("n_gru_layers", 1)),
+            dropout=float(suggested.get("dropout", cfg.get("dropout", 0.1))),
+        )
+        physics_components = cfg.get("physics_components", {})
+        hpo_lit = DLSSMLightningModule(
+            model=hpo_model,
+            scaler_mean=scaler_mean_t,
+            scaler_scale=scaler_scale_t,
+            feature_idx=feature_idx,
+            learning_rate=float(suggested.get("learning_rate", cfg.get("learning_rate", 1e-3))),
+            weight_decay=float(suggested.get("weight_decay", cfg.get("weight_decay", 1e-5))),
+            gradient_clip_val=float(cfg.get("gradient_clip_val", 1.0)),
+            max_epochs=hpo_epochs,
+            beta_kl=float(cfg.get("beta_kl", 0.1)),
+            kl_warmup_epochs=int(cfg.get("kl_warmup_epochs", 5)),
+            lambda_phys=float(suggested.get("lambda_phys", cfg.get("lambda_phys", 0.1))),
+            enable_string_power=bool(physics_components.get("string_power", True)),
+            enable_imbalance=bool(physics_components.get("imbalance", True)),
+            physics_enabled=physics_enabled,
+            self_paced_enabled=self_paced_enabled,
+            tau_start=float(cfg.get("self_paced_tau_start", 0.1)),
+            tau_end=float(cfg.get("self_paced_tau_end", 1.0)),
+            w_min=float(cfg.get("self_paced_w_min", 0.2)),
+            lambda_kl_score=float(suggested.get("lambda_kl_score", cfg.get("lambda_kl_score", 0.1))),
+            lambda_phys_score=float(suggested.get("lambda_phys_score", cfg.get("lambda_phys_score", 0.0))),
+            alpha_pred=float(cfg.get("alpha_pred", 0.1)),
+            lambda_pred_score=float(suggested.get("lambda_pred_score", cfg.get("lambda_pred_score", 0.0))),
+            score_reduction=str(cfg.get("score_reduction", "max")),
+            free_bits=float(suggested.get("free_bits", cfg.get("free_bits", 0.05))),
+            oc_enabled=oc_enabled,
+            consistency_enabled=consistency_enabled,
+            lambda_oc=float(suggested.get("lambda_oc", cfg.get("lambda_oc", 0.1))),
+            lambda_oc_score=float(suggested.get("lambda_oc_score", cfg.get("lambda_oc_score", 0.0))),
+            oc_warmup_epochs=int(cfg.get("oc_warmup_epochs", 3)),
+            lambda_cons=float(suggested.get("lambda_cons", cfg.get("lambda_cons", 0.1))),
+            aug_noise_std=float(suggested.get("aug_noise_std", cfg.get("aug_noise_std", 0.05))),
+            aug_feature_dropout=float(suggested.get("aug_feature_dropout", cfg.get("aug_feature_dropout", 0.1))),
+            latent_dim=int(cfg.get("latent_dim", 32)),
+        )
+
+        hpo_trainer = pl.Trainer(
+            max_epochs=hpo_epochs,
+            callbacks=[
+                EarlyStopping(monitor="val_pr_auc", patience=hpo_patience, mode="max", verbose=False),
+                _OptunaPruningCallback(trial, monitor="val_pr_auc"),
+            ],
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            enable_checkpointing=False,
+            logger=False,
+            deterministic=False,
+            gradient_clip_val=float(cfg.get("gradient_clip_val", 1.0)),
+            accelerator=str(cfg.get("accelerator", "auto")),
+        )
+        try:
+            hpo_trainer.fit(hpo_lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
+        except optuna.exceptions.TrialPruned:
+            raise
+        return float(hpo_lit.best_val_pr_auc)
+
+    sampler = TPESampler(seed=seed)
+    pruner = SuccessiveHalvingPruner()
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
+
+    best = study.best_trial
+    n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    logger.info(
+        "HPO done: best val_pr_auc={:.4f} | completed={} total={} | params={}",
+        best.value, n_completed, len(study.trials), best.params,
+    )
+    return best.params, n_completed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -692,6 +833,37 @@ def run_dlssm(config: dict | None = None) -> None:
         len(train_dl.dataset), len(val_dl.dataset), len(test_dl.dataset),
     )
 
+    # Apply best params from --best-params JSON or from HPO sweep
+    hpo_params: dict = {}
+    _hpo_n_completed: int | None = None
+    if args.best_params:
+        hpo_params = json.loads(args.best_params)
+        logger.info("Applying best_params from CLI: {}", hpo_params)
+    elif getattr(args, "hpo", False):
+        hpo_cfg = dlssm_cfg.get("hpo", {})
+        logger.info("Starting HPO sweep ({} trials)...", args.n_trials or hpo_cfg.get("n_trials", 40))
+        hpo_params, _hpo_n_completed = _run_hpo(
+            base_cfg=dlssm_cfg,
+            hpo_cfg=hpo_cfg,
+            train_dl=train_dl,
+            val_dl=val_dl,
+            scaler_mean_t=scaler_mean_t,
+            scaler_scale_t=scaler_scale_t,
+            feature_idx=feature_idx,
+            n_features=n_features,
+            physics_enabled=physics_enabled,
+            oc_enabled=oc_enabled,
+            consistency_enabled=consistency_enabled,
+            self_paced_enabled=self_paced_enabled,
+            seed=seed,
+            n_trials_override=args.n_trials,
+        )
+        logger.info("HPO best params: {}", json.dumps(hpo_params, default=str))
+
+    # Merge hpo_params into dlssm_cfg (non-destructive — only affects this run)
+    if hpo_params:
+        dlssm_cfg = {**dlssm_cfg, **hpo_params}
+
     # Build model and Lightning module
     pl.seed_everything(seed, workers=True)
 
@@ -873,6 +1045,7 @@ def run_dlssm(config: dict | None = None) -> None:
 
     metrics_path = artifacts_dir / "metrics.json"
     params_path = artifacts_dir / "run_params.json"
+    hpo_params_path = artifacts_dir / "hpo_best_params.json"
     scaler_path = artifacts_dir / "scaler.joblib"
     manifest_path = artifacts_dir / "features_manifest.json"
     pr_curve_path = artifacts_dir / "pr_curve.png"
@@ -882,6 +1055,9 @@ def run_dlssm(config: dict | None = None) -> None:
 
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     params_path.write_text(json.dumps(run_params, indent=2, default=str), encoding="utf-8")
+    if hpo_params:
+        hpo_params_path.write_text(json.dumps(hpo_params, indent=2, default=str), encoding="utf-8")
+        logger.info("Best HPO params saved → {}  (pass with --best-params for multi-seed)", hpo_params_path)
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     joblib.dump(scaler, scaler_path)
 
@@ -921,7 +1097,7 @@ def run_dlssm(config: dict | None = None) -> None:
                 if not isinstance(v, (dict, list))
             })
             mlflow.log_metrics(metrics)
-            for p in (metrics_path, params_path, scaler_path, manifest_path,
+            for p in (metrics_path, params_path, hpo_params_path, scaler_path, manifest_path,
                       pr_curve_path, histogram_path, timeline_path, pred_residual_path):
                 if p.exists():
                     mlflow.log_artifact(str(p))
@@ -965,6 +1141,11 @@ def run_dlssm(config: dict | None = None) -> None:
                 "test_precision_at_threshold": test_prec,
                 "test_recall_at_threshold": test_rec,
                 "fit_time_s": round(fit_time, 2),
+                "hpo_enabled": bool(getattr(args, "hpo", False)),
+                "best_params_injected": bool(args.best_params),
+                "hpo_n_trials_requested": (args.n_trials or dlssm_cfg.get("hpo", {}).get("n_trials")) if getattr(args, "hpo", False) else None,
+                "hpo_n_trials_completed": _hpo_n_completed,
+                "hpo_best_params": json.dumps(hpo_params, default=str) if hpo_params else None,
                 "mlflow_run_id": mlflow.active_run().info.run_id if mlflow.active_run() else None,
             }
             records_path = Path(args.comparison_records_path)
