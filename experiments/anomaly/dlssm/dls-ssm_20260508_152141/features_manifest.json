@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "created_at": "2026-05-01T22:00:42.705352+00:00",
+  "profile": "plus_physics",
+  "config_fingerprint": "f62a7ed6332e",
+  "output_directory": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\anomaly_semisup\\runs\\plus_physics",
+  "source_task": "anomaly_semisup",
+  "split_path": "path_a",
+  "source_preprocessed_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\preprocessed\\costa\\anomaly_semisup",
+  "label_column": "label",
+  "active_flags": {
+    "enable_hour_cyclic": false,
+    "enable_delta_temp": true,
+    "enable_dP_dt": true,
+    "enable_dV_dt": true,
+    "enable_dI_dt": true,
+    "enable_Vg_normalized": true,
+    "enable_power_imbalance": true,
+    "enable_current_imbalance": true,
+    "enable_voltage_imbalance": true,
+    "enable_string_share": false,
+    "enable_temp_power_correction": true,
+    "temp_ref_c": 25.0,
+    "gamma_pmax_pct_per_c": -0.4,
+    "temp_power_eps": "1e-8",
+    "irr_norm_floor": 1.0,
+    "enable_hygiene_pruning": true,
+    "enable_mrmr_selection": true,
+    "mrmr_k": 64,
+    "enable_corr_pruning": false,
+    "enable_vif_pruning": false,
+    "enable_wavelet": false,
+    "wavelet_threshold_strategy": "per_segment",
+    "enable_rolling_stats": false,
+    "rolling_windows": [
+      5,
+      10,
+      30
+    ],
+    "rolling_stats": [
+      "mean",
+      "std",
+      "min",
+      "max"
+    ],
+    "enable_explicit_windowing": false,
+    "window_size": 60,
+    "window_step": 30,
+    "enable_multiscale": false,
+    "multiscale_window_sizes": [
+      60,
+      30,
+      10
+    ],
+    "enable_wpd": false,
+    "wpd_level": 3,
+    "wpd_wavelet": "db4",
+    "enable_ceemdan": false,
+    "ceemdan_n_imfs": 3,
+    "ceemdan_n_ensemble": 20,
+    "spectral_min_fs": 0.5,
+    "enable_differential_signal": false
+  },
+  "effective_generation_flags": {
+    "enable_hour_cyclic": false,
+    "enable_delta_temp": true,
+    "enable_dP_dt": true,
+    "enable_dV_dt": true,
+    "enable_dI_dt": true,
+    "enable_Vg_normalized": true,
+    "enable_power_imbalance": true,
+    "enable_current_imbalance": true,
+    "enable_voltage_imbalance": true,
+    "enable_string_share": false,
+    "enable_temp_power_correction": true,
+    "temp_ref_c": 25.0,
+    "gamma_pmax_pct_per_c": -0.4,
+    "temp_power_eps": "1e-8",
+    "irr_norm_floor": 1.0,
+    "enable_hygiene_pruning": true,
+    "enable_mrmr_selection": true,
+    "mrmr_k": 64,
+    "enable_corr_pruning": false,
+    "enable_vif_pruning": false,
+    "enable_wavelet": false,
+    "wavelet_threshold_strategy": "per_segment",
+    "enable_rolling_stats": false,
+    "rolling_windows": [
+      5,
+      10,
+      30
+    ],
+    "rolling_stats": [
+      "mean",
+      "std",
+      "min",
+      "max"
+    ],
+    "enable_explicit_windowing": false,
+    "window_size": 60,
+    "window_step": 30,
+    "enable_multiscale": false,
+    "multiscale_window_sizes": [
+      60,
+      30,
+      10
+    ],
+    "enable_wpd": false,
+    "wpd_level": 3,
+    "wpd_wavelet": "db4",
+    "enable_ceemdan": false,
+    "ceemdan_n_imfs": 3,
+    "ceemdan_n_ensemble": 20,
+    "spectral_min_fs": 0.5,
+    "enable_differential_signal": false
+  },
+  "task_directives_effective": {
+    "flags": {},
+    "selection": {},
+    "tsfresh": {},
+    "eda": {
+      "mi_top_key": "top_features_binary",
+      "use_mannwhitney": true
+    },
+    "tsfresh_label_strategy": "any_fault"
+  },
+  "selection": {
+    "enable_hygiene_pruning": true,
+    "enable_mrmr_selection": true,
+    "mrmr_k": 64,
+    "near_constant_std": 1e-10,
+    "corr_threshold": 0.95,
+    "vif_threshold": 10.0,
+    "anchor_features": [
+      "current_imbalance",
+      "dI_dt",
+      "dP_dt",
+      "dV_dt",
+      "idc1",
+      "idc2",
+      "pdc",
+      "pdc1",
+      "pdc2",
+      "pdc_temp_corrected_norm_irr",
+      "power_imbalance",
+      "vdc1",
+      "vdc2",
+      "voltage_imbalance"
+    ],
+    "use_eda_findings": true,
+    "eda_policy": {
+      "mi_top_key": "top_features_binary",
+      "use_mannwhitney": true
+    },
+    "eda_pre_drop_candidates": false,
+    "hygiene_dropped": [
+      {
+        "dropped": "pdc",
+        "paired_with": "pdc1+pdc2",
+        "reason": "deterministic_alias"
+      }
+    ],
+    "mrmr_dropped": [],
+    "corr_dropped": [],
+    "vif_dropped": []
+  },
+  "eda_findings": {
+    "enabled": true,
+    "path": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\interim\\eda\\costa\\eda_feature_findings.json",
+    "loaded": true,
+    "version": 1,
+    "created_at": "2026-04-28T20:56:31.792476+00:00"
+  },
+  "tsfresh": {
+    "mode": "off",
+    "selected": 0
+  },
+  "explicit_windowing": {
+    "enabled": false
+  },
+  "base_feature_count": 9,
+  "final_feature_count": 17,
+  "final_features": [
+    "current_imbalance",
+    "dI_dt",
+    "dP_dt",
+    "dV_dt",
+    "idc1",
+    "idc2",
+    "irr",
+    "pdc1",
+    "pdc2",
+    "pdc_temp_corrected",
+    "pdc_temp_corrected_norm_irr",
+    "power_imbalance",
+    "pvt",
+    "temp_loss_pmax",
+    "vdc1",
+    "vdc2",
+    "voltage_imbalance"
+  ]
+}

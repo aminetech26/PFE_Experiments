@@ -39,9 +39,14 @@ def main() -> None:
         run_maat(config=config)
         return
 
+    if active_model == "dlssm":
+        from src.modeling.anomaly_detection.dl.dlssm.trainer import run_dlssm  # noqa: PLC0415
+        run_dlssm(config=config)
+        return
+
     raise ValueError(
         f"Unsupported anomaly_detection dl model: '{active_model}'. "
-        f"Supported: maat"
+        f"Supported: maat, dlssm"
     )
 
 

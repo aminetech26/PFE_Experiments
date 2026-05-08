@@ -124,6 +124,46 @@ anomaly_detection:
           e_layers: {type: int, low: 1, high: 3}
           d_ff: {type: categorical, choices: [64, 128, 256, 512]}
 
+      dlssm:
+        win_size: 30
+        train_stride: 1
+        eval_stride: 1
+        hidden_dim: 64
+        latent_dim: 16
+        encoder_dim: 128
+        decoder_dim: 128
+        n_gru_layers: 1
+        dropout: 0.1
+
+        beta_kl: 0.1
+        kl_warmup_epochs: 5
+        free_bits: 0.0
+
+        lambda_phys: 0.05
+        physics_components:
+          string_power: true
+          imbalance: true
+          temperature_correction: false   # disabled until base is stable
+
+        self_paced: false                 # override via --self-paced CLI flag
+        self_paced_tau_start: 0.1
+        self_paced_tau_end: 1.0
+        self_paced_w_min: 0.2
+
+        alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
+        lambda_kl_score: 0.1
+        lambda_phys_score: 0.0    # keep 0.0 for clean ablation; physics only in training, not scoring
+        lambda_pred_score: 0.0    # keep 0.0 for clean ablation; enable after base results confirmed
+        score_reduction: center
+
+        batch_size: 256
+        max_epochs: 30
+        learning_rate: 1.0e-3
+        weight_decay: 1.0e-5
+        gradient_clip_val: 1.0
+        accelerator: auto
+        scaling: standard
+
   primary_metric: pr_auc   # PR-AUC
   threshold_calibration: pr_curve  # use precision-recall to set alarm threshold
 
