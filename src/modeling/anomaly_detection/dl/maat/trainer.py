@@ -561,10 +561,10 @@ def run_maat(config: dict | None = None) -> None:
     if args.best_params:
         raw = args.best_params.strip()
         try:
-            bp_path = Path(raw)
-            if bp_path.exists():
-                injected_params = json.loads(bp_path.read_text(encoding="utf-8"))
-                logger.info(f"Loaded best params from file: {bp_path}")
+            # Treat as a file path only if it doesn't start with '{' (i.e. not inline JSON).
+            if not raw.startswith("{") and Path(raw).exists():
+                injected_params = json.loads(Path(raw).read_text(encoding="utf-8"))
+                logger.info(f"Loaded best params from file: {raw}")
             else:
                 injected_params = json.loads(raw)
                 logger.info("Loaded best params from --best-params JSON string")
