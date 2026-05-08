@@ -755,8 +755,9 @@ def run_maat(config: dict | None = None) -> None:
         )
         logger.info(f"HPO best params: {best_params}")
     else:
-        best_params = {}
-        logger.info("HPO skipped — using config defaults")
+        if not injected_params:
+            best_params = {}
+            logger.info("HPO skipped — using config defaults")
 
     # ── Merge best params into final config ────────────────────────────────────
     final_maat_cfg = dict(maat_cfg)
