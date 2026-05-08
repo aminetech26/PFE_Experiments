@@ -94,6 +94,8 @@ class PVDataPreprocessor:
         for col in ["pdc1", "pdc2"]:
             if col in df_clean.columns:
                 df_clean[col] = df_clean[col] / PEAK_POWER
+        if "pdc" in df_clean.columns:
+            df_clean["pdc"] = df_clean["pdc"] / (PEAK_POWER*2)
         if "irr" in df_clean.columns:
             df_clean["irr"] = df_clean["irr"] / 1000.0
         if "pvt" in df_clean.columns:
@@ -238,6 +240,8 @@ class PVDataPreprocessor:
         for col in ["pdc1", "pdc2"]:
             if col in df_clean.columns:
                 df_clean[col] = df_clean[col] / PEAK_POWER
+        if "pdc" in df_clean.columns:
+            df_clean["pdc"] = df_clean["pdc"] / (PEAK_POWER*2)
         if "irr" in df_clean.columns:
             df_clean["irr"] = df_clean["irr"] / 1000.0
         if "pvt" in df_clean.columns and self.pvt_min is not None and self.pvt_max is not None:
