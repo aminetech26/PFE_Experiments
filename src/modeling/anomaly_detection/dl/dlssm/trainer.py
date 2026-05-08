@@ -30,8 +30,11 @@ from torch.utils.data import DataLoader
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
+    apply_pv_safe_augmentation,
     compute_anomaly_scores,
+    consistency_loss,
     kl_divergence,
+    one_class_loss,
     physics_consistency_loss,
     prediction_loss,
     reconstruction_loss,
@@ -67,6 +70,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--comparison-records-path", default=str(_default_comparison_records_path()))
     p.add_argument("--physics", action="store_true", help="Enable physics consistency loss")
     p.add_argument("--self-paced", action="store_true", help="Enable self-paced curriculum weighting")
+    p.add_argument("--one-class", action="store_true", help="Deep SVDD-style latent compactness loss")
+    p.add_argument("--consistency", action="store_true", help="Consistency regularization on q_mu under PV-safe augmentation")
     return p.parse_args()
 
 
@@ -130,6 +135,15 @@ class DLSSMLightningModule(pl.LightningModule):
         lambda_pred_score: float = 0.0,
         score_reduction: str = "center",
         free_bits: float = 0.0,
+        oc_enabled: bool = False,
+        consistency_enabled: bool = False,
+        lambda_oc: float = 0.1,
+        lambda_oc_score: float = 0.0,
+        oc_warmup_epochs: int = 3,
+        lambda_cons: float = 0.1,
+        aug_noise_std: float = 0.05,
+        aug_feature_dropout: float = 0.1,
+        latent_dim: int = 16,
     ) -> None:
         super().__init__()
         self.model = model
@@ -158,6 +172,21 @@ class DLSSMLightningModule(pl.LightningModule):
         self.score_reduction = score_reduction
         self.free_bits = free_bits
 
+        # One-class (Deep SVDD) and consistency regularization
+        self.oc_enabled = oc_enabled
+        self.consistency_enabled = consistency_enabled
+        self.lambda_oc = lambda_oc
+        self.lambda_oc_score = lambda_oc_score
+        self.oc_warmup_epochs = oc_warmup_epochs
+        self.lambda_cons = lambda_cons
+        self.aug_noise_std = aug_noise_std
+        self.aug_feature_dropout = aug_feature_dropout
+
+        # Normal latent center: initialized after oc_warmup_epochs from the
+        # mean of q_mu over the train set. Until then, OC loss stays at 0.
+        self.register_buffer("c", torch.zeros(latent_dim))
+        self.register_buffer("c_initialized", torch.tensor(False))
+
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
         self.best_val_pr_auc: float = 0.0
@@ -178,6 +207,56 @@ class DLSSMLightningModule(pl.LightningModule):
             enable_string_power=self.enable_string_power,
             enable_imbalance=self.enable_imbalance,
         )
+
+    @torch.no_grad()
+    def _init_one_class_center(self) -> None:
+        """Set self.c to mean(q_mu) over the train loader after warmup.
+
+        Anti-collapse: any |c_i| < 1e-3 is floored to ±1e-3 to avoid the
+        trivial c → 0, q_mu → 0 solution that Deep SVDD warns about.
+        """
+        try:
+            train_dl = self.trainer.train_dataloader
+        except Exception:
+            train_dl = None
+        if train_dl is None:
+            logger.warning("OC center init: no train dataloader available — skipping")
+            return
+
+        was_training = self.training
+        self.eval()
+        n_batches = 0
+        running = torch.zeros_like(self.c)
+        for batch in train_dl:
+            x = batch[0].to(self.device)
+            out = self.model(x)
+            running = running + out["q_mu"].mean(dim=(0, 1)).detach()
+            n_batches += 1
+        if n_batches == 0:
+            logger.warning("OC center init: zero batches seen — skipping")
+            if was_training:
+                self.train()
+            return
+        c_new = running / n_batches
+
+        # Anti-collapse floor
+        small = c_new.abs() < 1e-3
+        sign = torch.where(c_new == 0, torch.ones_like(c_new), torch.sign(c_new))
+        c_new = torch.where(small, sign * 1e-3, c_new)
+
+        self.c.copy_(c_new)
+        self.c_initialized.fill_(True)
+        if was_training:
+            self.train()
+        logger.info("Initialized one-class center | ||c||={:.4f}", float(self.c.norm()))
+
+    def on_train_epoch_start(self) -> None:
+        if (
+            self.oc_enabled
+            and not bool(self.c_initialized)
+            and self.current_epoch >= self.oc_warmup_epochs
+        ):
+            self._init_one_class_center()
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         x, _ = batch  # [B, W, F]
@@ -206,7 +285,33 @@ class DLSSMLightningModule(pl.LightningModule):
             w = torch.ones_like(recon_w)
 
         lambda_phys = self.lambda_phys if self.physics_enabled else 0.0
-        per_window = recon_w + self.alpha_pred * pred_w + beta * kl_w + lambda_phys * phys_w
+
+        # One-class compactness (only after c is initialized)
+        if self.oc_enabled and bool(self.c_initialized):
+            oc_w = one_class_loss(out["q_mu"], self.c)
+            lambda_oc_eff = self.lambda_oc
+        else:
+            oc_w = torch.zeros_like(recon_w)
+            lambda_oc_eff = 0.0
+
+        # Consistency regularization: extra forward pass on perturbed input
+        if self.consistency_enabled:
+            x_aug = apply_pv_safe_augmentation(x, self.aug_noise_std, self.aug_feature_dropout)
+            out_aug = self.model(x_aug)
+            cons_w = consistency_loss(out["q_mu"], out_aug["q_mu"])
+            lambda_cons_eff = self.lambda_cons
+        else:
+            cons_w = torch.zeros_like(recon_w)
+            lambda_cons_eff = 0.0
+
+        per_window = (
+            recon_w
+            + self.alpha_pred * pred_w
+            + beta * kl_w
+            + lambda_phys * phys_w
+            + lambda_oc_eff * oc_w
+            + lambda_cons_eff * cons_w
+        )
         loss = (w * per_window).mean()
 
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
@@ -214,6 +319,9 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("train_pred", pred_w.mean(), on_step=False, on_epoch=True)
         self.log("train_kl", kl_w.mean(), on_step=False, on_epoch=True)
         self.log("train_phys", phys_w.mean(), on_step=False, on_epoch=True)
+        self.log("train_oc", oc_w.mean(), on_step=False, on_epoch=True)
+        self.log("train_cons", cons_w.mean(), on_step=False, on_epoch=True)
+        self.log("train_c_norm", self.c.norm(), on_step=False, on_epoch=True)
         self.log("train_beta_kl", beta, on_step=False, on_epoch=True)
         self.log("train_tau", tau, on_step=False, on_epoch=True)
         self.log("train_w_mean", w.mean(), on_step=False, on_epoch=True)
@@ -239,6 +347,8 @@ class DLSSMLightningModule(pl.LightningModule):
             enable_imbalance=self.enable_imbalance,
             x_pred=out["x_pred"],
             lambda_pred_score=self.lambda_pred_score,
+            c=self.c if (self.oc_enabled and bool(self.c_initialized)) else None,
+            lambda_oc_score=self.lambda_oc_score,
         )
 
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
@@ -493,18 +603,22 @@ def run_dlssm(config: dict | None = None) -> None:
 
     physics_enabled: bool = args.physics or bool(dlssm_cfg.get("physics_enabled", False))
     self_paced_enabled: bool = args.self_paced or bool(dlssm_cfg.get("self_paced", False))
+    oc_enabled: bool = args.one_class or bool(dlssm_cfg.get("one_class", False))
+    consistency_enabled: bool = args.consistency or bool(dlssm_cfg.get("consistency", False))
 
     run_type = "smoke" if is_smoke else args.run_type
 
     # Derive a human-readable variant name for logging
-    if physics_enabled and self_paced_enabled:
-        variant = "PI-SP-DLS-SSM"
-    elif physics_enabled:
-        variant = "PI-DLS-SSM"
-    elif self_paced_enabled:
-        variant = "SP-DLS-SSM"
-    else:
-        variant = "DLS-SSM"
+    parts: list[str] = []
+    if physics_enabled:
+        parts.append("PI")
+    if oc_enabled:
+        parts.append("OC")
+    if consistency_enabled:
+        parts.append("Cons")
+    if self_paced_enabled:
+        parts.append("SP")
+    variant = ("-".join(parts) + "-DLS-SSM") if parts else "DLS-SSM"
 
     logger.info(
         "Loading features | task={} dataset={} split_path={} profile={}",
@@ -618,6 +732,15 @@ def run_dlssm(config: dict | None = None) -> None:
         lambda_pred_score=float(dlssm_cfg.get("lambda_pred_score", 0.0)),
         score_reduction=str(dlssm_cfg.get("score_reduction", "center")),
         free_bits=float(dlssm_cfg.get("free_bits", 0.0)),
+        oc_enabled=oc_enabled,
+        consistency_enabled=consistency_enabled,
+        lambda_oc=float(dlssm_cfg.get("lambda_oc", 0.1)),
+        lambda_oc_score=float(dlssm_cfg.get("lambda_oc_score", 0.0)),
+        oc_warmup_epochs=int(dlssm_cfg.get("oc_warmup_epochs", 3)),
+        lambda_cons=float(dlssm_cfg.get("lambda_cons", 0.1)),
+        aug_noise_std=float(dlssm_cfg.get("aug_noise_std", 0.05)),
+        aug_feature_dropout=float(dlssm_cfg.get("aug_feature_dropout", 0.1)),
+        latent_dim=int(dlssm_cfg.get("latent_dim", 16)),
     )
 
     # Artifact dir
@@ -659,7 +782,10 @@ def run_dlssm(config: dict | None = None) -> None:
         trainer_kwargs["precision"] = precision_cfg
     trainer = pl.Trainer(**trainer_kwargs)
 
-    logger.info("Training {} (physics={}, self_paced={})…", variant, physics_enabled, self_paced_enabled)
+    logger.info(
+        "Training {} (physics={}, one_class={}, consistency={}, self_paced={})",
+        variant, physics_enabled, oc_enabled, consistency_enabled, self_paced_enabled,
+    )
     t0 = time.perf_counter()
     trainer.fit(lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
     fit_time = time.perf_counter() - t0
@@ -736,10 +862,13 @@ def run_dlssm(config: dict | None = None) -> None:
         "variant": variant,
         "physics_enabled": physics_enabled,
         "self_paced_enabled": self_paced_enabled,
+        "oc_enabled": oc_enabled,
+        "consistency_enabled": consistency_enabled,
         **{k: v for k, v in dlssm_cfg.items() if not isinstance(v, dict)},
         "max_epochs_actual": max_epochs,
         "n_features": n_features,
         "seed": seed,
+        "c_norm": float(lit.c.norm()) if bool(lit.c_initialized) else 0.0,
     }
 
     metrics_path = artifacts_dir / "metrics.json"
@@ -784,6 +913,8 @@ def run_dlssm(config: dict | None = None) -> None:
                 "variant": variant,
                 "physics_informed": str(physics_enabled),
                 "self_paced": str(self_paced_enabled),
+                "one_class": str(oc_enabled),
+                "consistency": str(consistency_enabled),
             })
             mlflow.log_params({
                 k: v for k, v in run_params.items()
@@ -812,6 +943,11 @@ def run_dlssm(config: dict | None = None) -> None:
                 "feature_run_dir": str(resolved_run_dir),
                 "physics_enabled": physics_enabled,
                 "self_paced_enabled": self_paced_enabled,
+                "oc_enabled": oc_enabled,
+                "consistency_enabled": consistency_enabled,
+                "lambda_oc": float(dlssm_cfg.get("lambda_oc", 0.1)),
+                "lambda_cons": float(dlssm_cfg.get("lambda_cons", 0.1)),
+                "c_norm": float(lit.c.norm()) if bool(lit.c_initialized) else 0.0,
                 "n_features": n_features,
                 "win_size": win_size,
                 "hidden_dim": int(dlssm_cfg.get("hidden_dim", 64)),

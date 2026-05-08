@@ -135,6 +135,49 @@ def physics_consistency_loss(
     return loss  # [B]
 
 
+def one_class_loss(q_mu: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Deep SVDD-style compactness: pulls normal latent means toward center c.
+
+    q_mu: [B, W, Z]; c: [Z] (registered buffer, set after warmup).
+    Returns [B] window-mean squared distance.
+    """
+    return ((q_mu - c) ** 2).sum(dim=-1).mean(dim=1)
+
+
+def consistency_loss(q_mu_x: torch.Tensor, q_mu_aug: torch.Tensor) -> torch.Tensor:
+    """Consistency regularization: q_mu(x) ≈ q_mu(x_aug).
+
+    NOT Mean Teacher: there is no EMA teacher network — both forward passes
+    use the same (student) weights. The clean branch is detached only to
+    stop the augmented branch from pulling q_mu(x) toward itself, mirroring
+    the stop-gradient pattern from BYOL/SimSiam-style consistency.
+    Returns [B].
+    """
+    return ((q_mu_x.detach() - q_mu_aug) ** 2).sum(dim=-1).mean(dim=1)
+
+
+def apply_pv_safe_augmentation(
+    x: torch.Tensor,
+    noise_std: float = 0.05,
+    feature_dropout: float = 0.1,
+) -> torch.Tensor:
+    """PV-safe perturbation on standardized inputs [B, W, F].
+
+    - Gaussian sensor noise (std on the standardized scale).
+    - Per-feature dropout: zeroes whole features for the entire window.
+      Because inputs are standardized, zero == feature mean, so this
+      simulates *mean-imputed* sensor failure rather than a true stuck
+      reading or missing-data signal. That is the cheap-and-honest
+      semantics; if a stronger augmentation is needed later, replace
+      with random constant or last-known-value imputation.
+    """
+    out = x + torch.randn_like(x) * noise_std
+    if feature_dropout > 0.0:
+        mask = (torch.rand(x.size(0), 1, x.size(2), device=x.device) > feature_dropout).float()
+        out = out * mask
+    return out
+
+
 def self_paced_weights(
     recon_w: torch.Tensor,
     phys_w: torch.Tensor,
@@ -175,6 +218,8 @@ def compute_anomaly_scores(
     enable_imbalance: bool = True,
     x_pred: torch.Tensor | None = None,
     lambda_pred_score: float = 0.0,
+    c: torch.Tensor | None = None,
+    lambda_oc_score: float = 0.0,
 ) -> torch.Tensor:
     """Per-window anomaly score combining three complementary signals.
 
@@ -201,6 +246,11 @@ def compute_anomaly_scores(
 
     if lambda_pred_score > 0.0 and x_pred is not None:
         base = base + lambda_pred_score * _reduce(prediction_loss(x_pred, x))
+
+    if lambda_oc_score > 0.0 and c is not None:
+        # Deep SVDD distance: how far q_mu lies from the normal latent center
+        oc_t = ((q_mu - c) ** 2).sum(dim=-1)  # [B, W]
+        base = base + lambda_oc_score * _reduce(oc_t)
 
     if (
         lambda_phys_score > 0.0
