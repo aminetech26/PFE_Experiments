@@ -196,6 +196,8 @@ def run_staged_optuna(
     stage_results: list[HPOStageResult] = []
 
     for stage in stages:
+        if stage.n_trials <= 0:
+            continue
         objective = objective_builder(stage, dict(merged_best))
         best_params, study = run_optuna(
             objective,
