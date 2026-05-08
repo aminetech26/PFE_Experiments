@@ -1,11 +1,19 @@
 import pandas as pd
 import numpy as np
 from scipy.signal import savgol_filter
-from sklearn.preprocessing import MinMaxScaler
 from loguru import logger
+import pvlib
 import warnings
 
 warnings.filterwarnings("ignore")
+
+# Physics-based normalization constants for Costa PV module
+SHORT_CIRCUIT_CURRENT = 9.45
+OPEN_CIRCUIT_VOLTAGE = 45.6
+PEAK_POWER = 4000.0
+LATITUDE = -25.438686
+LONGITUDE = -49.268487
+ALTITUDE = 935
 
 
 class PVDataPreprocessor:
@@ -36,9 +44,10 @@ class PVDataPreprocessor:
         self.power_col = power_col
         self.corr_threshold = corr_threshold
 
-        self.scaler = MinMaxScaler()
         self.selected_features = None
         self._median_values = None
+        self.pvt_min = None
+        self.pvt_max = None
         self.fitted = False
 
     def fit_transform(self, df, timestamp_col="timestamp"):
@@ -66,9 +75,36 @@ class PVDataPreprocessor:
             self._median_values[col] = median_val
             df_clean[col].fillna(median_val, inplace=True)
 
-        # 2. Min-Max scaling
-        scaled_data = self.scaler.fit_transform(df_clean[numeric_feats])
-        df_scaled = pd.DataFrame(scaled_data, columns=numeric_feats)
+        # 2. Physics-based normalization (LSTM-AE style)
+        timestamps = pd.DatetimeIndex(df[timestamp_col])
+        if "irr" in df_clean.columns:
+            times_for_pvlib = timestamps
+            if times_for_pvlib.tzinfo is None:
+                times_for_pvlib = times_for_pvlib.tz_localize("UTC")
+            loc = pvlib.location.Location(LATITUDE, LONGITUDE, altitude=ALTITUDE)
+            clear_sky = loc.get_clearsky(times_for_pvlib)
+            df_clean["clearness_index"] = df_clean["irr"].values / (clear_sky["ghi"].values + 1e-6)
+            df_clean["clearness_index"] = df_clean["clearness_index"].clip(lower=0, upper=1.5)
+        for col in ["idc1", "idc2"]:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col] / SHORT_CIRCUIT_CURRENT
+        for col in ["vdc1", "vdc2"]:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col] / OPEN_CIRCUIT_VOLTAGE
+        for col in ["pdc1", "pdc2"]:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col] / PEAK_POWER
+        if "irr" in df_clean.columns:
+            df_clean["irr"] = df_clean["irr"] / 1000.0
+        if "pvt" in df_clean.columns:
+            self.pvt_min = df_clean["pvt"].min()
+            self.pvt_max = df_clean["pvt"].max()
+            if self.pvt_max > self.pvt_min:
+                df_clean["pvt"] = (df_clean["pvt"] - self.pvt_min) / (self.pvt_max - self.pvt_min)
+            else:
+                df_clean["pvt"] = 0.0
+        numeric_feats = [c for c in df_clean.columns if c not in [timestamp_col, "label"]]
+        df_scaled = df_clean[numeric_feats].copy()
 
         # 3. Pearson correlation-based feature selection
         corr_matrix = df_scaled.corr().abs()
@@ -182,9 +218,34 @@ class PVDataPreprocessor:
                 median_val = df_clean[col].median()
             df_clean[col].fillna(median_val, inplace=True)
 
-        # 2. Apply fitted Min-Max scaling (NOT fit_transform)
-        scaled_data = self.scaler.transform(df_clean[numeric_feats])
-        df_scaled = pd.DataFrame(scaled_data, columns=numeric_feats)
+        # 2. Physics-based normalization (LSTM-AE style)
+        timestamps = pd.DatetimeIndex(df[timestamp_col])
+        if "irr" in df_clean.columns:
+            times_for_pvlib = timestamps
+            if times_for_pvlib.tzinfo is None:
+                times_for_pvlib = times_for_pvlib.tz_localize("UTC")
+            loc = pvlib.location.Location(LATITUDE, LONGITUDE, altitude=ALTITUDE)
+            clear_sky = loc.get_clearsky(times_for_pvlib)
+            df_clean["clearness_index"] = df_clean["irr"].values / (clear_sky["ghi"].values + 1e-6)
+            df_clean["clearness_index"] = df_clean["clearness_index"].clip(lower=0, upper=1.5)
+            numeric_feats.append("clearness_index")
+        for col in ["idc1", "idc2"]:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col] / SHORT_CIRCUIT_CURRENT
+        for col in ["vdc1", "vdc2"]:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col] / OPEN_CIRCUIT_VOLTAGE
+        for col in ["pdc1", "pdc2"]:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col] / PEAK_POWER
+        if "irr" in df_clean.columns:
+            df_clean["irr"] = df_clean["irr"] / 1000.0
+        if "pvt" in df_clean.columns and self.pvt_min is not None and self.pvt_max is not None:
+            if self.pvt_max > self.pvt_min:
+                df_clean["pvt"] = (df_clean["pvt"] - self.pvt_min) / (self.pvt_max - self.pvt_min)
+            else:
+                df_clean["pvt"] = 0.0
+        df_scaled = df_clean[numeric_feats].copy()
 
         # 3. Use fitted selected features (NOT recompute)
         # Verify fitted features are available in current data
