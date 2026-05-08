@@ -71,10 +71,12 @@ anomaly_detection:
           reg_lambda: {type: float, low: 1.0e-6, high: 100.0, log: true}
           scale_pos_weight_multiplier: {type: categorical, choices: [0.25, 0.5, 1.0, 2.0]}
       bocd:
-        hazard_lambda: [100, 500]
-      switching_kalman:
-        n_states: [2, 4]
-        transition_stickiness: [0.90, 0.99]
+        scaling: standard
+        max_run_length: 200
+        kappa0: 1.0
+        alpha0: 2.0
+        search_space:
+          hazard_lambda: {type: float, low: 50.0, high: 2000.0, log: true}
 
   dl:
     active_model: maat

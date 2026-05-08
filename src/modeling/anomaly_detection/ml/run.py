@@ -56,10 +56,10 @@ def main() -> None:
         run_xgboost_anomaly(config=config)
         return
 
-    if active_model in {"switching_kalman", "bocd"}:
-        raise NotImplementedError(
-            f"Anomaly ML baseline '{active_model}' is scaffolded but not yet implemented."
-        )
+    if active_model == "bocd":
+        from src.modeling.anomaly_detection.ml.bocd_model import run_bocd  # noqa: PLC0415
+        run_bocd(config=config)
+        return
 
     raise ValueError(f"Unsupported anomaly_detection ml model: {active_model}")
 
