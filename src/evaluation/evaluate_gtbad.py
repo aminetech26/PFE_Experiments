@@ -11,14 +11,14 @@ os.environ['MPLBACKEND'] = 'Agg'
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import mean_absolute_error, precision_score, recall_score, f1_score
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
+from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel
 
 def print_class_statistics(labels, tp_mask, fn_mask):
     """
@@ -70,6 +70,12 @@ def main():
     threshold = threshold_data["threshold"]
     input_dim = threshold_data["input_dim"]
     output_dim = threshold_data["output_dim"]
+    raw_pft = threshold_data.get("per_feature_thresholds")
+    if raw_pft is None or len(raw_pft) != output_dim:
+        logger.warning("per_feature_thresholds not found in checkpoint; falling back to global threshold")
+        per_feature_thresholds = None
+    else:
+        per_feature_thresholds = np.array(raw_pft)
 
     logger.info(f"Loading GTBAD model from {checkpoint_dir}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,72 +107,77 @@ def main():
         logger.error("Dataset has no 'label' column, cannot evaluate performance.")
         return
     
-    logger.info("Filtering dataset to keep only anomalous rows (label > 0) for evaluation...")
-    df_anomaly = df[df["label"] > 0].copy()
-    df_anomaly.reset_index(drop=True, inplace=True)
-    
-    if len(df_anomaly) == 0:
-        logger.warning("No anomalous samples found in dataset. Evaluation skipped.")
-        return
-    
-    # Get the original labels before preprocessing (to track anomaly classes)
-    original_labels = df_anomaly["label"].values
-    
-    # We apply transform to scale and build windows
-    logger.info("Applying GTBAD preprocessing transform...")
-    X_full, y_target, mask, df_processed = preprocessor.transform(df_anomaly, "timestamp")
+    logger.info("Applying GTBAD preprocessing transform on full dataset...")
+    X_full, y_target, mask, df_processed = preprocessor.transform(df, "timestamp")
 
     # Map sliding window indices back to original labels
-    # For each window, we track the maximum label value in that window (to classify the window as anomalous)
+    original_labels = df["label"].values
     window_labels = []
     window_len = preprocessor.window_len
     n_samples = len(X_full)
     
     for idx in range(n_samples):
-        # Each sample corresponds to window at position (window_len - 1 + idx)
         window_end = window_len - 1 + idx
         window_start = window_end - window_len + 1
-        
-        # Get the labels for this window
         window_label_values = original_labels[window_start:window_end + 1]
-        # Use max label in window (if any value > 0, window is anomalous)
         max_label = np.max(window_label_values) if len(window_label_values) > 0 else 0
         window_labels.append(max_label)
     
     window_labels = np.array(window_labels)
     
-    logger.info(f"Generated {len(X_full)} window samples from {len(df_anomaly)} anomalous timesteps.")
-    logger.info(f"Window label distribution: {np.unique(window_labels, return_counts=True)}")
+    n_anom = np.sum(window_labels > 0)
+    logger.info(f"Generated {len(X_full)} total window samples ({n_anom} anomalous, {len(X_full) - n_anom} healthy).")
+    if n_anom > 0:
+        logger.info(f"Anomalous window label distribution: {dict(zip(*np.unique(window_labels[window_labels > 0], return_counts=True)))}")
 
     logger.info("Running inference...")
-    
-    # We do prediction in chunks to avoid OOM
     batch_size = 256
     model.eval()
-    all_errors = []
+    all_feature_errors = []
     
     with torch.no_grad():
         for i in range(0, len(X_full), batch_size):
             x_b = torch.tensor(X_full[i:i+batch_size], dtype=torch.float32).to(device)
-            # Target is the numeric features (first output_dim columns of X_full)
             y_b = torch.tensor(X_full[i:i+batch_size, :, :output_dim], dtype=torch.float32).to(device)
-            
             preds = model(x_b)
-            # Reuses the exact reconstruction error function from training
-            err = reconstruction_error(preds, y_b)
-            all_errors.extend(err.cpu().numpy().tolist())
+            feat_err = ((preds - y_b) ** 2).mean(dim=1)
+            all_feature_errors.append(feat_err.cpu().numpy())
 
-    all_errors = np.array(all_errors)
+    all_feature_errors = np.concatenate(all_feature_errors, axis=0)
 
-    logger.info(f"Evaluating with global threshold: {threshold:.6f}")
-    predicted_anomalies = (all_errors > threshold).astype(int)
+    if per_feature_thresholds is not None:
+        exceeds_threshold = all_feature_errors > per_feature_thresholds
+        n_features_exceeding = exceeds_threshold.sum(axis=1)
+        predicted_anomalies = (n_features_exceeding > output_dim / 2).astype(int)
+        logger.info(f"Majority-vote decision: anomaly if >{output_dim//2}/{output_dim} features exceed threshold")
+    else:
+        all_errors = all_feature_errors.mean(axis=1)
+        predicted_anomalies = (all_errors > threshold).astype(int)
+        logger.info(f"Falling back to global threshold: {threshold:.6f}")
 
-    # TP: predicted as anomaly and actually anomalous (label > 0)
-    # FN: predicted as normal but actually anomalous (label > 0)
-    tp_mask = (predicted_anomalies == 1) & (window_labels > 0)
-    fn_mask = (predicted_anomalies == 0) & (window_labels > 0)
+    # Full confusion matrix
+    anomaly_mask = window_labels > 0
+    tp = (predicted_anomalies == 1) & anomaly_mask
+    fp = (predicted_anomalies == 1) & ~anomaly_mask
+    tn = (predicted_anomalies == 0) & ~anomaly_mask
+    fn = (predicted_anomalies == 0) & anomaly_mask
 
-    print_class_statistics(window_labels, tp_mask, fn_mask)
+    logger.info(f"TP={tp.sum()}, FP={fp.sum()}, TN={tn.sum()}, FN={fn.sum()}")
+    if fp.sum() + tn.sum() > 0:
+        fpr = fp.sum() / (fp.sum() + tn.sum())
+        logger.info(f"False Positive Rate: {fpr:.4f}")
+    if tp.sum() + fn.sum() > 0:
+        rec = tp.sum() / (tp.sum() + fn.sum())
+        logger.info(f"Overall Recall: {rec:.4f}")
+    if tp.sum() + fp.sum() > 0:
+        prec = tp.sum() / (tp.sum() + fp.sum())
+        logger.info(f"Overall Precision: {prec:.4f}")
+    if tp.sum() + fp.sum() > 0 and tp.sum() + fn.sum() > 0:
+        prec = tp.sum() / (tp.sum() + fp.sum())
+        rec = tp.sum() / (tp.sum() + fn.sum())
+        logger.info(f"Overall F1: {2 * prec * rec / (prec + rec):.4f}")
+
+    print_class_statistics(window_labels, tp, fn)
 
 if __name__ == "__main__":
     main()

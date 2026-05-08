@@ -176,7 +176,6 @@ def load_dataset(filepath, timestamp_col="timestamp", label_col="anomaly"):
 def train_lightweight(model, train_loader, val_loader, epochs=5, lr=1e-3, device="cpu"):
     """Quick training for GVSAO fitness evaluation."""
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
     model.train()
     for _ in range(epochs):
         for x_batch, y_batch, mask_batch in train_loader:
@@ -185,11 +184,13 @@ def train_lightweight(model, train_loader, val_loader, epochs=5, lr=1e-3, device
             mask_batch = mask_batch.to(device)
             optimizer.zero_grad()
             y_pred = model(x_batch)
-            # y_pred shape (batch, seq_len, output_dim), y_batch is (batch, seq_len, output_dim)
-            # We reconstruct the full input and compute loss on all steps.
-            loss = criterion(y_pred, y_batch[:, :, :])  # assuming y_batch has same length as x
+            se = (y_pred - y_batch) ** 2
+            loss_per_sample = se.mean(dim=(1, 2))
             if mask_batch is not None:
-                loss = (loss * mask_batch.float().unsqueeze(-1).unsqueeze(-1)).mean()
+                loss_per_sample = loss_per_sample * mask_batch.float()
+                loss = loss_per_sample.sum() / (mask_batch.float().sum() + 1e-8)
+            else:
+                loss = loss_per_sample.mean()
             loss.backward()
             optimizer.step()
 
@@ -202,11 +203,12 @@ def train_lightweight(model, train_loader, val_loader, epochs=5, lr=1e-3, device
             y_batch = y_batch.to(device)
             mask_batch = mask_batch.to(device)
             y_pred = model(x_batch)
-            loss = torch.sum((y_pred - y_batch) ** 2, dim=(1, 2))
+            se = (y_pred - y_batch) ** 2
+            loss_per_sample = se.mean(dim=(1, 2))
             if mask_batch is not None:
-                loss = loss * mask_batch.float()
-            val_loss += loss.sum().item()
-            n_val += mask_batch.sum().item() if mask_batch is not None else len(y_batch)
+                loss_per_sample = loss_per_sample * mask_batch.float()
+            val_loss += loss_per_sample.sum().item()
+            n_val += mask_batch.float().sum().item() if mask_batch is not None else loss_per_sample.size(0)
     avg_loss = val_loss / n_val if n_val > 0 else 0.0
     return avg_loss
 
@@ -230,7 +232,7 @@ def main():
     logger.info(f"Loading data from {DATA_PATH}...")
     df = load_dataset(DATA_PATH, TIMESTAMP_COL, LABEL_COL)
     preprocessor = PVDataPreprocessor(
-        window_len=4,
+        window_len=5,
         stride=1,
         power_col="pdc",
         corr_threshold=0.99,
@@ -297,12 +299,18 @@ def main():
         best_lr, best_bs, best_fit = optimizer_gvsao.optimize(fitness_func)
         logger.info(f"Best LR: {best_lr:.6f}, Best batch size: {best_bs}, Fitness: {best_fit:.6f}")
 
-    # 3. Final training with best hyperparameters
+    # 3. Split training set into final train + calibration (for threshold)
+    X_final_train, X_calib, y_final_train, y_calib, mask_final_train, mask_calib = train_test_split(
+        X_train, y_train, mask_train, test_size=0.125, random_state=42, shuffle=False
+    )
+    logger.info(f"Final training samples: {len(X_final_train)}, Calibration samples: {len(X_calib)}")
+
+    # 4. Final training with best hyperparameters
     logger.info(f"Starting final training with bs={best_bs}, lr={best_lr}")
     train_dataset = TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32),
-        torch.tensor(y_train, dtype=torch.float32),
-        torch.tensor(mask_train, dtype=torch.float32),
+        torch.tensor(X_final_train, dtype=torch.float32),
+        torch.tensor(y_final_train, dtype=torch.float32),
+        torch.tensor(mask_final_train, dtype=torch.float32),
     )
     train_loader = DataLoader(train_dataset, batch_size=best_bs, shuffle=True)
 
@@ -316,7 +324,6 @@ def main():
         dropout=0.1,
     ).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
-    criterion = nn.MSELoss()
 
     model.train()
     for epoch in range(EPOCHS):
@@ -327,9 +334,13 @@ def main():
             m_b = m_b.to(DEVICE)
             optimizer.zero_grad()
             y_pred = model(x_b)
-            loss = criterion(y_pred, y_b)
+            se = (y_pred - y_b) ** 2
+            loss_per_sample = se.mean(dim=(1, 2))
             if m_b is not None:
-                loss = (loss * m_b.unsqueeze(-1).unsqueeze(-1)).mean()
+                loss_per_sample = loss_per_sample * m_b.float()
+                loss = loss_per_sample.sum() / (m_b.float().sum() + 1e-8)
+            else:
+                loss = loss_per_sample.mean()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -337,21 +348,31 @@ def main():
         avg_loss = total_loss / len(train_loader)
         logger.info(f"Epoch {epoch + 1}/{EPOCHS} Loss: {avg_loss:.6f}")
 
-    # 4. Evaluation (anomaly detection)
-    logger.info("Computing reconstruction errors to find anomaly threshold...")
+    # 5. Thresholds from calibration set (unseen during final training)
+    logger.info("Computing reconstruction errors on calibration set to find anomaly thresholds...")
     model.eval()
-    # Compute reconstruction errors on training set to set threshold
-    train_errors = []
+    calib_dataset = TensorDataset(
+        torch.tensor(X_calib, dtype=torch.float32),
+        torch.tensor(y_calib, dtype=torch.float32),
+        torch.tensor(mask_calib, dtype=torch.float32),
+    )
+    calib_errors = []
+    calib_feature_errors = []
     with torch.no_grad():
-        for x_b, y_b, m_b in DataLoader(train_dataset, batch_size=best_bs, shuffle=False):
+        for x_b, y_b, m_b in DataLoader(calib_dataset, batch_size=best_bs, shuffle=False):
             x_b = x_b.to(DEVICE)
             y_b = y_b.to(DEVICE)
             y_pred = model(x_b)
             err = reconstruction_error(y_pred, y_b)
-            train_errors.extend(err.cpu().numpy().tolist())
-    train_errors = np.array(train_errors)
-    threshold = np.percentile(train_errors, 95)
-    logger.info(f"Anomaly threshold (95th percentile): {threshold:.6f}")
+            calib_errors.extend(err.cpu().numpy().tolist())
+            feat_err = ((y_pred - y_b) ** 2).mean(dim=1)
+            calib_feature_errors.append(feat_err.cpu().numpy())
+    calib_errors = np.array(calib_errors)
+    calib_feature_errors = np.concatenate(calib_feature_errors, axis=0)
+    threshold = np.percentile(calib_errors, 95)
+    per_feature_thresholds = np.percentile(calib_feature_errors, 95, axis=0)
+    logger.info(f"Global threshold (95th percentile): {threshold:.6f}")
+    logger.info(f"Per-feature thresholds (95th percentile): {per_feature_thresholds}")
 
     # --- Save Model and Preprocessor ---
     checkpoint_dir = Path("experiments/checkpoints/gtbad")
@@ -366,11 +387,16 @@ def main():
         
     threshold_path = checkpoint_dir / "threshold.json"
     with open(threshold_path, "w") as f:
-        json.dump({"threshold": float(threshold), "input_dim": input_dim, "output_dim": output_dim}, f)
+        json.dump({
+            "threshold": float(threshold),
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "per_feature_thresholds": per_feature_thresholds.tolist(),
+        }, f)
         
     logger.info(f"Model, preprocessor, and threshold saved to {checkpoint_dir}")
 
-    # Test set errors
+    # Test set errors (per-feature majority vote)
     logger.info("Computing errors on test set...")
     test_dataset = TensorDataset(
         torch.tensor(X_test, dtype=torch.float32),
@@ -378,18 +404,19 @@ def main():
         torch.tensor(mask_test, dtype=torch.float32),
     )
     test_loader = DataLoader(test_dataset, batch_size=best_bs, shuffle=False)
-    test_errors = []
+    test_feature_errors = []
     with torch.no_grad():
         for x_b, y_b, _ in test_loader:
             x_b = x_b.to(DEVICE)
             y_b = y_b.to(DEVICE)
             y_pred = model(x_b)
-            err = reconstruction_error(y_pred, y_b)
-            test_errors.extend(err.cpu().numpy().tolist())
-    test_errors = np.array(test_errors)
-    pred_anomaly = (test_errors > threshold).astype(int)
-    logger.info("No true labels; anomaly scores saved as 'test_anomaly_scores.csv'")
-    np.savetxt("test_anomaly_scores.csv", test_errors, delimiter=",")
+            feat_err = ((y_pred - y_b) ** 2).mean(dim=1)
+            test_feature_errors.append(feat_err.cpu().numpy())
+    test_feature_errors = np.concatenate(test_feature_errors, axis=0)
+    exceeds = test_feature_errors > per_feature_thresholds
+    pred_anomaly = (exceeds.sum(axis=1) > output_dim / 2).astype(int)
+    logger.info("No true labels; anomaly predictions saved as 'test_anomaly_scores.csv'")
+    np.savetxt("test_anomaly_scores.csv", pred_anomaly, delimiter=",")
 
 
 if __name__ == "__main__":

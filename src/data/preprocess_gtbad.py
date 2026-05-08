@@ -28,6 +28,9 @@ class PVDataPreprocessor:
             power_col (str): column name used as 'power' for correlation priority
             corr_threshold (float): absolute Pearson correlation threshold for feature selection
         """
+        if window_len % 2 == 0:
+            window_len += 1
+            logger.warning(f"Adjusted window_len to {window_len} (must be odd for Savgol filter)")
         self.window_len = window_len
         self.stride = stride
         self.power_col = power_col
@@ -35,6 +38,7 @@ class PVDataPreprocessor:
 
         self.scaler = MinMaxScaler()
         self.selected_features = None
+        self._median_values = None
         self.fitted = False
 
     def fit_transform(self, df, timestamp_col="timestamp"):
@@ -56,8 +60,10 @@ class PVDataPreprocessor:
         df_clean = df.copy()
         numeric_feats = [c for c in df.columns if c not in [timestamp_col, "label"]]
         orig_missing = df_clean[numeric_feats].isna()  # record original missingness
+        self._median_values = {}
         for col in numeric_feats:
             median_val = df_clean[col].median()
+            self._median_values[col] = median_val
             df_clean[col].fillna(median_val, inplace=True)
 
         # 2. Min-Max scaling
@@ -171,7 +177,9 @@ class PVDataPreprocessor:
         numeric_feats = [c for c in df.columns if c not in [timestamp_col, "label"]]
         orig_missing = df_clean[numeric_feats].isna()  # record original missingness
         for col in numeric_feats:
-            median_val = df_clean[col].median()
+            median_val = self._median_values.get(col)
+            if median_val is None:
+                median_val = df_clean[col].median()
             df_clean[col].fillna(median_val, inplace=True)
 
         # 2. Apply fitted Min-Max scaling (NOT fit_transform)
