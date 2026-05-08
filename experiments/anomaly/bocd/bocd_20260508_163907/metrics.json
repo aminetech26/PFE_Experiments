@@ -1,0 +1,18 @@
+{
+  "val_pr_auc": 0.8854646028257057,
+  "val_roc_auc": 0.7786360720485616,
+  "val_f1_at_threshold": 0.8772133725302522,
+  "val_accuracy_at_threshold": 0.800603223359177,
+  "val_precision_at_threshold": 0.8170125156534105,
+  "val_recall_at_threshold": 0.9469916272356756,
+  "threshold": -6.309296156025424,
+  "test_pr_auc": 0.7568853975379463,
+  "test_roc_auc": 0.7830672381429689,
+  "test_f1_at_threshold": 0.7464383043516211,
+  "test_accuracy_at_threshold": 0.6781222876770512,
+  "test_precision_at_threshold": 0.6336736374114935,
+  "test_recall_at_threshold": 0.9080248224440197,
+  "n_train": 191376,
+  "fit_time_s": 0.02,
+  "score_time_s": 260.86
+}
