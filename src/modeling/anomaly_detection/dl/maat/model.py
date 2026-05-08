@@ -7,10 +7,6 @@ import torch.nn.functional as F
 from src.modeling.anomaly_detection.dl.maat.attn import AnomalyAttention, AttentionLayer
 from src.modeling.anomaly_detection.dl.maat.embed import DataEmbedding
 
-# mamba_ssm is a CUDA/Linux optional dependency — imported here so the full import
-# chain from run.py stays lazy (run.py → ssm_model.py → model.py → mamba_ssm).
-from mamba_ssm import Mamba  # noqa: E402
-
 # ARCHITECTURAL DEVIATION FROM UPSTREAM MAAT (Sellam et al. 2025 / ilyesbenaissa/MAAT):
 # Upstream places a single Mamba block shared across all encoder layers (after all attention
 # layers) and uses a different gating arrangement. This implementation uses one independent
@@ -32,6 +28,16 @@ class EncoderLayer(nn.Module):
         super().__init__()
         self.attention = attention
         self.dropout = nn.Dropout(dropout)
+
+        # mamba_ssm requires CUDA + Linux; imported at instantiation so the package
+        # is importable on CPU dev machines without crashing at module load time.
+        try:
+            from mamba_ssm import Mamba  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "mamba_ssm is required for MAAT. "
+                "Install it in a CUDA/Linux environment: pip install mamba-ssm"
+            ) from exc
 
         # Mamba SSM branch — Lightning handles device placement, no .to("cuda")
         self.mamba_block = Mamba(

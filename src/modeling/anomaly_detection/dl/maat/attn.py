@@ -37,6 +37,15 @@ class AnomalyAttention(nn.Module):
         distances = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))  # [W, W]
         self.register_buffer("distances", distances)
 
+        # Precomputed block-local mask: True where positions i,j are in the same block.
+        # Avoids rebuilding this on every forward pass (constant for fixed win_size/block_size).
+        if use_sparse_attention:
+            block_ids = torch.arange(win_size) // block_size  # [W]
+            same_block = block_ids.unsqueeze(0) == block_ids.unsqueeze(1)  # [W, W]
+            self.register_buffer("block_mask", same_block)
+        else:
+            self.block_mask: torch.Tensor | None = None
+
     def forward(
         self,
         queries: torch.Tensor,  # [B, L, H, E]
@@ -50,17 +59,11 @@ class AnomalyAttention(nn.Module):
 
         scores = torch.einsum("blhe,bshe->bhls", queries, keys)  # [B, H, L, S]
 
-        if self.use_sparse_attention:
-            # Block-local mask: keep only positions within the same block.
-            # Positions i and j are in the same block iff i // block_size == j // block_size.
-            # We build the mask on the correct device dynamically.
-            idx = torch.arange(L, device=queries.device)
-            block_ids = idx // self.block_size  # [L]
-            # [L, L] True where same block (keep), False where different block (mask out)
-            same_block = block_ids.unsqueeze(0) == block_ids.unsqueeze(1)  # [L, S]
-            # Expand to [1, 1, L, S] and fill out-of-block positions with -inf
+        if self.use_sparse_attention and self.block_mask is not None:
+            # Use precomputed block mask (avoids rebuilding on every forward pass).
+            # block_mask: [W, W]; slice to [L, S] for this sequence length.
             scores = scores.masked_fill(
-                ~same_block.unsqueeze(0).unsqueeze(0), float("-inf")
+                ~self.block_mask[:L, :S].unsqueeze(0).unsqueeze(0), float("-inf")
             )
 
         # Safe softmax: replace any remaining -inf columns (empty blocks) with uniform

@@ -58,13 +58,15 @@ def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
     """8-char hash of HPO-relevant config fields.
 
     Same config+seed resumes existing study; any change creates a new one.
-    Covers: architecture defaults, search spaces, seed. Does NOT include
-    train_stride/eval_stride/score_reduction (no effect on trial comparisons).
+    Covers: architecture defaults, search spaces, seed, score_reduction.
+    Does NOT include train_stride/eval_stride (no effect on trial comparisons).
+    score_reduction is included because it changes the trial objective value
+    via _reduce_scores(); mixing studies across reduction modes contaminates results.
     """
     relevant = {
         k: maat_cfg.get(k)
         for k in ("win_size", "block_size", "d_model", "n_heads", "e_layers",
-                  "d_ff", "dropout", "k", "temperature")
+                  "d_ff", "dropout", "k", "temperature", "score_reduction")
     }
     relevant["hpo_stage1"] = maat_cfg.get("hpo_stage1", {})
     relevant["hpo_stage2"] = maat_cfg.get("hpo_stage2", {})
@@ -91,6 +93,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--artifacts-dir", default=None)
     p.add_argument("--comparison-records-path", default=str(_default_comparison_records_path()))
     p.add_argument("--run-type", default="baseline", help="baseline | hpo | final | smoke")
+    p.add_argument(
+        "--best-params",
+        default=None,
+        help=(
+            "JSON string or path to a JSON file of pre-found HPO params. "
+            "Skips HPO entirely and merges these params directly into the final run. "
+            'Example: \'{"learning_rate": 3.2e-4, "k": 4.77, "temperature": 10}\''
+        ),
+    )
     return p.parse_args()
 
 
@@ -105,11 +116,11 @@ def _calibrate_threshold(
 ) -> tuple[float, float, float, float]:
     """Return (threshold, best_f1, precision, recall) by maximising F1 on the PR curve."""
     prec, rec, thresholds = precision_recall_curve(labels, scores)
-    f1_vals = np.where(
-        (prec[:-1] + rec[:-1]) > 0,
-        2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1]),
-        0.0,
-    )
+    denom = prec[:-1] + rec[:-1]
+    # Evaluate division only where denom > 0 to silence RuntimeWarning.
+    # np.where evaluates both branches eagerly, so guard the denominator explicitly.
+    safe_denom = np.where(denom > 0, denom, 1.0)
+    f1_vals = np.where(denom > 0, 2 * prec[:-1] * rec[:-1] / safe_denom, 0.0)
     best_idx = int(np.argmax(f1_vals))
     return (
         float(thresholds[best_idx]),
@@ -141,6 +152,7 @@ class MAATLightningModule(pl.LightningModule):
         weight_decay: float = 1e-2,
         gradient_clip_val: float | None = 1.0,
         max_epochs: int = 100,
+        score_reduction: str = "center",
     ) -> None:
         super().__init__()
         self.model = model
@@ -150,6 +162,7 @@ class MAATLightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.gradient_clip_val = gradient_clip_val
         self.max_epochs = max_epochs
+        self.score_reduction = score_reduction
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -222,6 +235,15 @@ class MAATLightningModule(pl.LightningModule):
         except Exception:
             pass
 
+    def _reduce_scores(self, scores: torch.Tensor) -> torch.Tensor:
+        """Reduce [B, W] scores to [B] per-window scalars."""
+        if self.score_reduction == "mean":
+            return scores.mean(dim=1)
+        if self.score_reduction == "max":
+            return scores.max(dim=1).values
+        # default: center
+        return scores[:, scores.size(1) // 2]
+
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         x, labels = batch
         with torch.no_grad():
@@ -229,8 +251,7 @@ class MAATLightningModule(pl.LightningModule):
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
-        center = x.size(1) // 2
-        center_scores = scores[:, center].cpu()
+        center_scores = self._reduce_scores(scores).cpu()
         center_labels = labels.cpu()
 
         rec_loss = nn.functional.mse_loss(x_hat, x)
@@ -289,9 +310,8 @@ class MAATLightningModule(pl.LightningModule):
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
-        center = x.size(1) // 2
         self._test_outputs.append({
-            "scores": scores[:, center].cpu(),
+            "scores": self._reduce_scores(scores).cpu(),
             "labels": labels.cpu(),
         })
 
@@ -465,6 +485,7 @@ def _build_lightning_module(
         weight_decay=float(training_cfg.get("weight_decay", 1e-2)),
         gradient_clip_val=float(training_cfg.get("gradient_clip_val", 1.0)),
         max_epochs=max_epochs,
+        score_reduction=str(maat_cfg.get("score_reduction", "center")),
     )
 
 
@@ -506,6 +527,7 @@ def _train_and_eval(
         callbacks=callbacks,
         enable_progress_bar=False,
         enable_model_summary=False,
+        enable_checkpointing=(ckpt_dir is not None),
         logger=False,
         deterministic=False,
     )
@@ -533,7 +555,23 @@ def run_maat(config: dict | None = None) -> None:
 
     seed: int = args.seed
     is_smoke: bool = args.smoke
-    run_hpo: bool = args.hpo and not is_smoke
+
+    # Pre-load best params if provided — skips HPO entirely.
+    injected_params: dict = {}
+    if args.best_params:
+        raw = args.best_params.strip()
+        try:
+            bp_path = Path(raw)
+            if bp_path.exists():
+                injected_params = json.loads(bp_path.read_text(encoding="utf-8"))
+                logger.info(f"Loaded best params from file: {bp_path}")
+            else:
+                injected_params = json.loads(raw)
+                logger.info("Loaded best params from --best-params JSON string")
+        except Exception as exc:
+            raise ValueError(f"--best-params could not be parsed: {exc}") from exc
+
+    run_hpo: bool = args.hpo and not is_smoke and not injected_params
 
     # ── Load features ──────────────────────────────────────────────────────────
     logger.info(
@@ -602,9 +640,12 @@ def run_maat(config: dict | None = None) -> None:
         ds_test = TimeSeriesDataset(
             test_df, features, label_col, cfg["win_size"], stride_eval, normal_only=False
         )
-        train_dl = DataLoader(ds_train, batch_size=bs, shuffle=True, drop_last=False, num_workers=4, persistent_workers=True)
-        val_dl = DataLoader(ds_val, batch_size=bs, shuffle=False, drop_last=False, num_workers=4, persistent_workers=True)
-        test_dl = DataLoader(ds_test, batch_size=bs, shuffle=False, drop_last=False, num_workers=4, persistent_workers=True)
+        # num_workers=0: avoids DataLoader multiprocessing teardown races under
+        # Lightning/Optuna/Colab (Python 3.12 AssertionError: can only test a child process).
+        # persistent_workers requires num_workers > 0, so also forced off.
+        train_dl = DataLoader(ds_train, batch_size=bs, shuffle=True, drop_last=False, num_workers=0)
+        val_dl = DataLoader(ds_val, batch_size=bs, shuffle=False, drop_last=False, num_workers=0)
+        test_dl = DataLoader(ds_test, batch_size=bs, shuffle=False, drop_last=False, num_workers=0)
         return train_dl, val_dl, test_dl
 
     train_dl, val_dl, test_dl = _make_dataloaders(maat_cfg, train_stride, eval_stride, batch_size)
@@ -614,8 +655,11 @@ def run_maat(config: dict | None = None) -> None:
     )
 
     # ── HPO ────────────────────────────────────────────────────────────────────
-    best_params: dict = {}
+    best_params: dict = injected_params
     stage_results = []
+
+    if injected_params:
+        logger.info(f"Skipping HPO — using injected params: {injected_params}")
 
     if run_hpo:
         trial_budget: dict = hpo_cfg.get("trial_budget", {})
@@ -660,8 +704,10 @@ def run_maat(config: dict | None = None) -> None:
                         n_features, hpo_epochs, hpo_patience, seed, trial=trial,
                     )
                     pr_auc = lit.best_val_pr_auc
+                except optuna.exceptions.TrialPruned:
+                    raise
                 except Exception as exc:
-                    logger.debug(f"HPO trial failed: {exc}")
+                    logger.warning(f"HPO trial real exception (will prune): {type(exc).__name__}: {exc}")
                     raise optuna.TrialPruned()
 
                 if not math.isfinite(pr_auc) or pr_auc <= 0.0:
@@ -869,7 +915,7 @@ def run_maat(config: dict | None = None) -> None:
                 "profile": str(args.profile),
                 "model": "maat",
                 "model_family": "anomaly_dl",
-                "hpo_mode": "auto_two_stage" if run_hpo else "disabled",
+                "hpo_mode": "auto_two_stage" if run_hpo else ("injected" if injected_params else "disabled"),
             })
             mlflow.log_params({
                 **{k: v for k, v in final_maat_cfg.items() if not isinstance(v, dict)},
