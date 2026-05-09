@@ -128,11 +128,15 @@ def fit_prophet_residuals(
 
     Prophet is fit ONLY on training data (leakage prevention).
     Returns each df with added '_prediction' and '_residual' columns.
+
+    Falls back to linear regression if Prophet cannot be imported or fails.
     """
     try:
+        import os as _os
+        _os.environ.setdefault("MPLBACKEND", "Agg")
         from prophet import Prophet
-    except ImportError:
-        logger.warning("prophet not installed. Falling back to linear regression residuals.")
+    except Exception as e:
+        logger.warning(f"prophet unavailable ({e}). Falling back to linear regression residuals.")
         return _fallback_linear_residuals(train_df, predict_dfs, target_col, regressor_cols)
 
     prop_data = pd.DataFrame({
