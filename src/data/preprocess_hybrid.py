@@ -6,17 +6,19 @@ Implements the data preparation from:
   Plants Using Hybrid Machine Learning Techniques", ICoEIT.
 
 Pipeline:
-  1. Load ingested Costa dataset (Parquet, 1-second resolution)
-  2. Resample to 5-minute intervals (necessary for Prophet + manageable seq len)
-  3. Temporal split: train (normal-only, first 70%) / val (normal-only, next 15%)
+  1. Load ingested Costa dataset (Parquet, native 1-second resolution)
+  2. Temporal split: train (normal-only, first 70%) / val (normal-only, next 15%)
      / test (mixed normal + faults, remaining time)
-  4. Facebook Prophet: fit on train-normal pdc with irr/pvt as regressors,
+  3. Facebook Prophet: fit on train-normal pdc with irr/pvt as regressors,
      predict for all splits, compute residuals
-  5. Create sliding residual windows for AE-LSTM (window_size × n_residual_features)
-  6. Create residual feature vectors for Isolation Forest (window-level statistics)
-  7. Data integrity checks: NaN, Inf, label distributions, temporal ordering
-  8. Leakage checks: temporal contiguity, duplicate samples
-  9. Save preprocessed sequences + metadata
+  4. Create sliding residual windows for AE-LSTM (window_size × n_residual_features)
+  5. Create residual feature vectors for Isolation Forest (window-level statistics)
+  6. Data integrity checks: NaN, Inf, label distributions, temporal ordering
+  7. Leakage checks: temporal contiguity, duplicate samples
+  8. Save preprocessed sequences + metadata
+
+NOTE: Prophet fitting on 500K+ data points at 1-second resolution may be slow.
+Consider using --window-size 300 --stride 150 for ~5-minute equivalent windows.
 
 Usage:
     uv run python -m src.data.preprocess_hybrid
@@ -33,7 +35,6 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 from loguru import logger
-from sklearn.ensemble import IsolationForest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
@@ -65,37 +66,6 @@ def load_costa_data(parquet_path: Path) -> pd.DataFrame:
     df = df.sort_values("timestamp").reset_index(drop=True)
     logger.info(f"Loaded Costa: {len(df):,} rows, columns={list(df.columns)}")
     return df
-
-
-def resample_to_interval(df: pd.DataFrame, interval_min: int = 5) -> pd.DataFrame:
-    """Resample data to fixed time intervals using mean aggregation.
-
-    Label: max value in window (if any anomalous point exists, window is anomalous).
-    Timestamps: floor to interval boundary to allow groupby.
-    """
-    df = df.copy()
-    freq = f"{interval_min}T"
-    df["_ts_bucket"] = df["timestamp"].dt.floor(freq)
-
-    agg_dict = {
-        "label": "max",
-    }
-    for col in ALL_SENSOR_COLS:
-        if col in df.columns:
-            agg_dict[col] = "mean"
-
-    resampled = df.groupby("_ts_bucket").agg(agg_dict).reset_index()
-    resampled = resampled.rename(columns={"_ts_bucket": "timestamp"})
-
-    for col in ALL_SENSOR_COLS:
-        if col in resampled.columns:
-            resampled[col] = resampled[col].ffill().fillna(0)
-
-    resampled["label"] = resampled["label"].astype(int)
-    logger.info(
-        f"Resampled to {interval_min}-min: {len(df):,} → {len(resampled):,} rows"
-    )
-    return resampled
 
 
 def temporal_split(
@@ -445,8 +415,8 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess Costa data for Hybrid model")
     parser.add_argument("--input", type=str, default=str(DEFAULT_INPUT))
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--interval-min", type=int, default=5, help="Resample interval (minutes)")
-    parser.add_argument("--window-size", type=int, default=30, help="Residual window size")
+    parser.add_argument("--window-size", type=int, default=300, help="Residual window size (datapoints at native resolution)")
+    parser.add_argument("--stride", type=int, default=150, help="Stride between windows")
     parser.add_argument("--train-frac", type=float, default=0.70)
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
@@ -455,14 +425,15 @@ def main():
     np.random.seed(args.seed)
 
     logger.info("=" * 60)
-    logger.info("HYBRID MODEL PREPROCESSING — Costa Dataset")
+    logger.info("HYBRID MODEL PREPROCESSING — Costa Dataset (native resolution)")
     logger.info("=" * 60)
 
-    # ── Step 1: Load and resample ────────────────────────────────────
-    logger.info("Step 1: Load & resample")
+    # ── Step 1: Load ──────────────────────────────────────────────────
+    logger.info("Step 1: Load Costa data (1-second resolution)")
     df = load_costa_data(Path(args.input))
-    df = resample_to_interval(df, args.interval_min)
-    logger.info(f"  Resampled: {len(df):,} rows at {args.interval_min}-min intervals")
+    logger.info(f"  {len(df):,} rows at native resolution")
+    for lbl, cnt in df["label"].value_counts().sort_index().items():
+        logger.info(f"    class {int(lbl)} ({FAULT_NAMES.get(int(lbl), '?')}): {cnt:,}")
 
     # ── Step 2: Temporal split ────────────────────────────────────────
     logger.info("\nStep 2: Temporal split")
@@ -486,15 +457,16 @@ def main():
     )
 
     # ── Step 5: Create windowed data ──────────────────────────────────
-    logger.info(f"\nStep 5: Create residual windows (size={args.window_size})")
+    stride = args.stride
+    logger.info(f"\nStep 5: Create residual windows (size={args.window_size}, stride={stride})")
 
     window_data = {}
     for name, sdf in [("train", train_df), ("val", val_df), ("test", test_df)]:
         X_res, y_bin, y_multi = create_residual_windows(
-            sdf, args.window_size, residual_cols, stride=args.window_size // 2,
+            sdf, args.window_size, residual_cols, stride=stride,
         )
         X_if, _, _ = create_isolation_forest_features(
-            sdf, args.window_size, residual_cols, stride=args.window_size // 2,
+            sdf, args.window_size, residual_cols, stride=stride,
         )
 
         window_data[f"{name}_X_res"] = X_res
@@ -551,7 +523,7 @@ def main():
         "model": "hybrid_aelstm_prophet_if",
         "paper_reference": "Ahirwar & Nandanwar (2025) ICoEIT",
         "window_size": args.window_size,
-        "interval_min": args.interval_min,
+        "stride": stride,
         "target_col": TARGET_COL,
         "regressor_cols": REGRESSOR_COLS,
         "residual_cols": residual_cols,
