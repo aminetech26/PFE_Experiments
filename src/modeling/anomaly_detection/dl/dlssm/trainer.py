@@ -78,6 +78,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--self-paced", action="store_true", help="Enable self-paced curriculum weighting")
     p.add_argument("--one-class", action="store_true", help="Deep SVDD-style latent compactness loss")
     p.add_argument("--consistency", action="store_true", help="Consistency regularization on q_mu under PV-safe augmentation")
+    p.add_argument("--cvae", action="store_true", help="Conditional VAE: condition on operating-regime features (irr, pvt, ...)")
     p.add_argument("--hpo", action="store_true", help="Run Optuna HPO sweep then retrain best config")
     p.add_argument("--n-trials", type=int, default=None, help="Override number of HPO trials")
     p.add_argument("--best-params", default=None, help="JSON string of best params to apply directly (skips HPO search)")
@@ -144,6 +145,10 @@ def _run_hpo(
     self_paced_enabled: bool,
     seed: int,
     n_trials_override: int | None,
+    cvae_enabled: bool = False,
+    condition_idx: list[int] | None = None,
+    condition_dim: int = 0,
+    recon_mask: torch.Tensor | None = None,
 ) -> dict:
     """Run Optuna TPE + ASHA sweep. Returns best params dict."""
     search_space = hpo_cfg.get("search_space", {})
@@ -166,6 +171,7 @@ def _run_hpo(
             decoder_dim=int(cfg.get("decoder_dim", 256)),
             n_gru_layers=int(cfg.get("n_gru_layers", 1)),
             dropout=float(suggested.get("dropout", cfg.get("dropout", 0.1))),
+            condition_dim=condition_dim,
         )
         physics_components = cfg.get("physics_components", {})
         hpo_lit = DLSSMLightningModule(
@@ -202,6 +208,9 @@ def _run_hpo(
             aug_noise_std=float(suggested.get("aug_noise_std", cfg.get("aug_noise_std", 0.05))),
             aug_feature_dropout=float(suggested.get("aug_feature_dropout", cfg.get("aug_feature_dropout", 0.1))),
             latent_dim=int(cfg.get("latent_dim", 32)),
+            cvae_enabled=cvae_enabled,
+            condition_idx=condition_idx or [],
+            recon_mask=recon_mask,
         )
 
         hpo_trainer = pl.Trainer(
@@ -285,6 +294,9 @@ class DLSSMLightningModule(pl.LightningModule):
         aug_noise_std: float = 0.05,
         aug_feature_dropout: float = 0.1,
         latent_dim: int = 16,
+        cvae_enabled: bool = False,
+        condition_idx: list[int] | None = None,
+        recon_mask: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -328,6 +340,14 @@ class DLSSMLightningModule(pl.LightningModule):
         self.register_buffer("c", torch.zeros(latent_dim))
         self.register_buffer("c_initialized", torch.tensor(False))
 
+        # CVAE conditioning
+        self.cvae_enabled = cvae_enabled
+        self.condition_idx = list(condition_idx) if condition_idx else []
+        if recon_mask is not None:
+            self.register_buffer("recon_mask", recon_mask.float())
+        else:
+            self.recon_mask = None
+
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
         self.best_val_pr_auc: float = 0.0
@@ -336,6 +356,12 @@ class DLSSMLightningModule(pl.LightningModule):
         self._val_labels_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
+
+    def _extract_condition(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Slice the conditioning sub-vector c_t from x. Returns None if CVAE off."""
+        if not self.cvae_enabled or not self.condition_idx:
+            return None
+        return x[:, :, self.condition_idx]
 
     def _physics_loss(self, x_hat: torch.Tensor) -> torch.Tensor:
         if not self.physics_enabled:
@@ -370,7 +396,8 @@ class DLSSMLightningModule(pl.LightningModule):
         running = torch.zeros_like(self.c)
         for batch in train_dl:
             x = batch[0].to(self.device)
-            out = self.model(x)
+            c = self._extract_condition(x)
+            out = self.model(x, c)
             running = running + out["q_mu"].mean(dim=(0, 1)).detach()
             n_batches += 1
         if n_batches == 0:
@@ -401,11 +428,12 @@ class DLSSMLightningModule(pl.LightningModule):
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         x, _ = batch  # [B, W, F]
-        out = self.model(x)
+        c = self._extract_condition(x)
+        out = self.model(x, c)
 
         # Per-window loss components [B]
-        recon_w = reconstruction_loss(out["x_hat"], x).mean(dim=1)
-        pred_w = prediction_loss(out["x_pred"], x).mean(dim=1)
+        recon_w = reconstruction_loss(out["x_hat"], x, recon_mask=self.recon_mask).mean(dim=1)
+        pred_w = prediction_loss(out["x_pred"], x, recon_mask=self.recon_mask).mean(dim=1)
         kl_w = kl_divergence(
             out["q_mu"], out["q_logvar"], out["p_mu"], out["p_logvar"],
             free_bits=self.free_bits,
@@ -435,10 +463,16 @@ class DLSSMLightningModule(pl.LightningModule):
             oc_w = torch.zeros_like(recon_w)
             lambda_oc_eff = 0.0
 
-        # Consistency regularization: extra forward pass on perturbed input
+        # Consistency regularization: extra forward pass on perturbed input.
+        # When CVAE is on, the conditioning columns are protected from
+        # augmentation so c_t stays the same — q(z|x,c) ≈ q(z|x_aug,c).
         if self.consistency_enabled:
-            x_aug = apply_pv_safe_augmentation(x, self.aug_noise_std, self.aug_feature_dropout)
-            out_aug = self.model(x_aug)
+            x_aug = apply_pv_safe_augmentation(
+                x, self.aug_noise_std, self.aug_feature_dropout,
+                protect_idx=self.condition_idx if self.cvae_enabled else None,
+            )
+            c_aug = self._extract_condition(x_aug)  # equals c if protected
+            out_aug = self.model(x_aug, c_aug)
             cons_w = consistency_loss(out["q_mu"], out_aug["q_mu"])
             lambda_cons_eff = self.lambda_cons
         else:
@@ -490,12 +524,13 @@ class DLSSMLightningModule(pl.LightningModule):
             lambda_pred_score=self.lambda_pred_score,
             c=self.c if (self.oc_enabled and bool(self.c_initialized)) else None,
             lambda_oc_score=self.lambda_oc_score,
+            recon_mask=self.recon_mask,
         )
 
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         x, labels = batch
         with torch.no_grad():
-            out = self.model(x)
+            out = self.model(x, self._extract_condition(x))
         scores = self._score_batch(x, out).cpu()
         self._val_outputs.append({"scores": scores, "labels": labels.cpu()})
 
@@ -532,7 +567,7 @@ class DLSSMLightningModule(pl.LightningModule):
     def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         x, labels = batch
         with torch.no_grad():
-            out = self.model(x)
+            out = self.model(x, self._extract_condition(x))
         scores = self._score_batch(x, out).cpu()
         self._test_outputs.append({"scores": scores, "labels": labels.cpu()})
 
@@ -680,7 +715,8 @@ def _save_prediction_residual_plot(
     target_window = target_window.to(device)
     lit.model.eval()
     with torch.no_grad():
-        out = lit.model(target_window)
+        c_target = lit._extract_condition(target_window)
+        out = lit.model(target_window, c_target)
     x_np = target_window[0].cpu().numpy()
     x_pred_np = out["x_pred"][0].cpu().numpy()
     x_hat_np = out["x_hat"][0].cpu().numpy()
@@ -746,11 +782,14 @@ def run_dlssm(config: dict | None = None) -> None:
     self_paced_enabled: bool = args.self_paced or bool(dlssm_cfg.get("self_paced", False))
     oc_enabled: bool = args.one_class or bool(dlssm_cfg.get("one_class", False))
     consistency_enabled: bool = args.consistency or bool(dlssm_cfg.get("consistency", False))
+    cvae_enabled: bool = args.cvae or bool(dlssm_cfg.get("cvae", False))
 
     run_type = "smoke" if is_smoke else args.run_type
 
     # Derive a human-readable variant name for logging
     parts: list[str] = []
+    if cvae_enabled:
+        parts.append("C")
     if physics_enabled:
         parts.append("PI")
     if oc_enabled:
@@ -833,6 +872,32 @@ def run_dlssm(config: dict | None = None) -> None:
         len(train_dl.dataset), len(val_dl.dataset), len(test_dl.dataset),
     )
 
+    # CVAE conditioning: resolve indices from feature names (used by HPO + final build)
+    cond_cfg = dlssm_cfg.get("conditioning", {}) or {}
+    cond_feats = [f for f in cond_cfg.get("features", []) if f in feature_idx]
+    missing_cond = [f for f in cond_cfg.get("features", []) if f not in feature_idx]
+    if cvae_enabled and missing_cond:
+        logger.warning("CVAE: missing condition features in manifest: {}", missing_cond)
+    if cvae_enabled and not cond_feats:
+        logger.warning("CVAE requested but no condition features available — disabling CVAE")
+        cvae_enabled = False
+    condition_idx = [feature_idx[f] for f in cond_feats] if cvae_enabled else []
+    condition_dim = len(condition_idx)
+
+    skip_feats = [f for f in cond_cfg.get("recon_skip_features", []) if f in feature_idx]
+    skip_idx = [feature_idx[f] for f in skip_feats] if cvae_enabled else []
+    if cvae_enabled and skip_idx:
+        recon_mask = torch.ones(n_features, dtype=torch.float32)
+        recon_mask[skip_idx] = 0.0
+        logger.info(
+            "CVAE: condition_features={} | recon_skip_features={} ({} kept of {})",
+            cond_feats, skip_feats, n_features - len(skip_idx), n_features,
+        )
+    else:
+        recon_mask = None
+        if cvae_enabled:
+            logger.info("CVAE: condition_features={} (no recon mask)", cond_feats)
+
     # Apply best params from --best-params JSON or from HPO sweep
     hpo_params: dict = {}
     _hpo_n_completed: int | None = None
@@ -845,6 +910,10 @@ def run_dlssm(config: dict | None = None) -> None:
         hpo_params, _hpo_n_completed = _run_hpo(
             base_cfg=dlssm_cfg,
             hpo_cfg=hpo_cfg,
+            cvae_enabled=cvae_enabled,
+            condition_idx=condition_idx,
+            condition_dim=condition_dim,
+            recon_mask=recon_mask,
             train_dl=train_dl,
             val_dl=val_dl,
             scaler_mean_t=scaler_mean_t,
@@ -877,6 +946,7 @@ def run_dlssm(config: dict | None = None) -> None:
         decoder_dim=int(dlssm_cfg.get("decoder_dim", 64)),
         n_gru_layers=int(dlssm_cfg.get("n_gru_layers", 1)),
         dropout=float(dlssm_cfg.get("dropout", 0.1)),
+        condition_dim=condition_dim,
     )
 
     lit = DLSSMLightningModule(
@@ -913,6 +983,9 @@ def run_dlssm(config: dict | None = None) -> None:
         aug_noise_std=float(dlssm_cfg.get("aug_noise_std", 0.05)),
         aug_feature_dropout=float(dlssm_cfg.get("aug_feature_dropout", 0.1)),
         latent_dim=int(dlssm_cfg.get("latent_dim", 16)),
+        cvae_enabled=cvae_enabled,
+        condition_idx=condition_idx,
+        recon_mask=recon_mask,
     )
 
     # Artifact dir
@@ -955,8 +1028,8 @@ def run_dlssm(config: dict | None = None) -> None:
     trainer = pl.Trainer(**trainer_kwargs)
 
     logger.info(
-        "Training {} (physics={}, one_class={}, consistency={}, self_paced={})",
-        variant, physics_enabled, oc_enabled, consistency_enabled, self_paced_enabled,
+        "Training {} (cvae={}, physics={}, one_class={}, consistency={}, self_paced={})",
+        variant, cvae_enabled, physics_enabled, oc_enabled, consistency_enabled, self_paced_enabled,
     )
     t0 = time.perf_counter()
     trainer.fit(lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
@@ -1036,6 +1109,9 @@ def run_dlssm(config: dict | None = None) -> None:
         "self_paced_enabled": self_paced_enabled,
         "oc_enabled": oc_enabled,
         "consistency_enabled": consistency_enabled,
+        "cvae_enabled": cvae_enabled,
+        "condition_features": cond_feats if cvae_enabled else [],
+        "recon_skip_features": skip_feats if cvae_enabled else [],
         **{k: v for k, v in dlssm_cfg.items() if not isinstance(v, dict)},
         "max_epochs_actual": max_epochs,
         "n_features": n_features,
@@ -1091,6 +1167,7 @@ def run_dlssm(config: dict | None = None) -> None:
                 "self_paced": str(self_paced_enabled),
                 "one_class": str(oc_enabled),
                 "consistency": str(consistency_enabled),
+                "cvae": str(cvae_enabled),
             })
             mlflow.log_params({
                 k: v for k, v in run_params.items()
@@ -1121,6 +1198,9 @@ def run_dlssm(config: dict | None = None) -> None:
                 "self_paced_enabled": self_paced_enabled,
                 "oc_enabled": oc_enabled,
                 "consistency_enabled": consistency_enabled,
+                "cvae_enabled": cvae_enabled,
+                "condition_features": ",".join(cond_feats) if cvae_enabled else "",
+                "recon_skip_features": ",".join(skip_feats) if cvae_enabled else "",
                 "lambda_oc": float(dlssm_cfg.get("lambda_oc", 0.1)),
                 "lambda_cons": float(dlssm_cfg.get("lambda_cons", 0.1)),
                 "c_norm": float(lit.c.norm()) if bool(lit.c_initialized) else 0.0,

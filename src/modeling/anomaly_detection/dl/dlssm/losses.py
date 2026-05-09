@@ -4,18 +4,38 @@ import torch
 import torch.nn.functional as F
 
 
-def reconstruction_loss(x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """Per-timestep MSE averaged over features. Returns [B, W]."""
-    return ((x_hat - x) ** 2).mean(dim=-1)
+def _masked_feature_mse(
+    a: torch.Tensor, b: torch.Tensor, recon_mask: torch.Tensor | None
+) -> torch.Tensor:
+    """Per-timestep MSE averaged over features, optionally masking some dims out.
+
+    recon_mask: [F] tensor of 0.0/1.0 (1.0 = include). When provided, the
+    average is taken over kept features so loss magnitude stays comparable.
+    """
+    se = (a - b) ** 2  # [B, W, F]
+    if recon_mask is None:
+        return se.mean(dim=-1)
+    keep = recon_mask.to(se.dtype)
+    n_keep = keep.sum().clamp(min=1.0)
+    return (se * keep).sum(dim=-1) / n_keep
 
 
-def prediction_loss(x_pred: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def reconstruction_loss(
+    x_hat: torch.Tensor, x: torch.Tensor, recon_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Per-timestep MSE averaged over (kept) features. Returns [B, W]."""
+    return _masked_feature_mse(x_hat, x, recon_mask)
+
+
+def prediction_loss(
+    x_pred: torch.Tensor, x: torch.Tensor, recon_mask: torch.Tensor | None = None
+) -> torch.Tensor:
     """Per-timestep MSE between one-step state prediction and observation. Returns [B, W].
 
-    x_pred comes from prediction_head(h_prev) — no z_t, no current x_t.
+    x_pred comes from prediction_head(h_prev[, c_t]) — no z_t, no current x_t.
     High values indicate the GRU state failed to predict normal PV dynamics.
     """
-    return ((x_pred - x) ** 2).mean(dim=-1)
+    return _masked_feature_mse(x_pred, x, recon_mask)
 
 
 def kl_divergence(
@@ -160,6 +180,7 @@ def apply_pv_safe_augmentation(
     x: torch.Tensor,
     noise_std: float = 0.05,
     feature_dropout: float = 0.1,
+    protect_idx: list[int] | None = None,
 ) -> torch.Tensor:
     """PV-safe perturbation on standardized inputs [B, W, F].
 
@@ -167,13 +188,20 @@ def apply_pv_safe_augmentation(
     - Per-feature dropout: zeroes whole features for the entire window.
       Because inputs are standardized, zero == feature mean, so this
       simulates *mean-imputed* sensor failure rather than a true stuck
-      reading or missing-data signal. That is the cheap-and-honest
-      semantics; if a stronger augmentation is needed later, replace
-      with random constant or last-known-value imputation.
+      reading or missing-data signal.
+    - protect_idx: feature indices to leave untouched. Required for CVAE
+      conditioning columns — perturbing them would shift the operating
+      regime, breaking the consistency contract q(z|x,c) ≈ q(z|x_aug,c).
     """
-    out = x + torch.randn_like(x) * noise_std
+    noise = torch.randn_like(x) * noise_std
+    if protect_idx:
+        noise[:, :, protect_idx] = 0.0
+    out = x + noise
+
     if feature_dropout > 0.0:
         mask = (torch.rand(x.size(0), 1, x.size(2), device=x.device) > feature_dropout).float()
+        if protect_idx:
+            mask[:, :, protect_idx] = 1.0  # never drop conditioning features
         out = out * mask
     return out
 
@@ -220,6 +248,7 @@ def compute_anomaly_scores(
     lambda_pred_score: float = 0.0,
     c: torch.Tensor | None = None,
     lambda_oc_score: float = 0.0,
+    recon_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-window anomaly score combining three complementary signals.
 
@@ -240,12 +269,12 @@ def compute_anomaly_scores(
             return t.max(dim=1).values
         return t[:, t.size(1) // 2]  # center timestep
 
-    recon_t = reconstruction_loss(x_hat, x)                              # [B, W]
+    recon_t = reconstruction_loss(x_hat, x, recon_mask=recon_mask)        # [B, W]
     kl_t = kl_divergence(q_mu, q_logvar, p_mu, p_logvar)                 # [B, W]
     base = _reduce(recon_t + lambda_kl_score * kl_t)                     # [B]
 
     if lambda_pred_score > 0.0 and x_pred is not None:
-        base = base + lambda_pred_score * _reduce(prediction_loss(x_pred, x))
+        base = base + lambda_pred_score * _reduce(prediction_loss(x_pred, x, recon_mask=recon_mask))
 
     if lambda_oc_score > 0.0 and c is not None:
         # Deep SVDD distance: how far q_mu lies from the normal latent center

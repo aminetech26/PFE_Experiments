@@ -161,6 +161,12 @@ anomaly_detection:
         aug_noise_std: 0.05
         aug_feature_dropout: 0.1
 
+        # Conditional VAE — overridden by --cvae CLI flag
+        cvae: false
+        conditioning:
+          features: [irr, pvt]
+          recon_skip_features: [irr, pvt, pdc_temp_corrected, pdc_temp_corrected_norm_irr]
+
         alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
         lambda_kl_score: 0.1
         lambda_phys_score: 0.05

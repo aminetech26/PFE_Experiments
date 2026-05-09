@@ -58,11 +58,14 @@ class DeepLatentStateSpaceModel(nn.Module):
         decoder_dim: int = 128,
         n_gru_layers: int = 1,
         dropout: float = 0.1,
+        condition_dim: int = 0,
     ) -> None:
         super().__init__()
         self.win_size = win_size
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.condition_dim = condition_dim
+        c = condition_dim  # inputs widen by c when CVAE is on (c=0 → no-op)
 
         self.input_proj = nn.Sequential(
             nn.Linear(n_features, hidden_dim),
@@ -78,30 +81,27 @@ class DeepLatentStateSpaceModel(nn.Module):
             dropout=dropout if n_gru_layers > 1 else 0.0,
         )
 
-        # Inference: q(z_t | x_t, h_{t-1}) — sees current observation + causal context
+        # Inference: q(z_t | x_t, h_{t-1}, c_t)
         self.inference_net = nn.Sequential(
-            _ResidualMLP(n_features + hidden_dim, encoder_dim, dropout),
+            _ResidualMLP(n_features + hidden_dim + c, encoder_dim, dropout),
             nn.Linear(encoder_dim, 2 * latent_dim),
         )
 
-        # Prior: p(z_t | h_{t-1}) — causal; does NOT see current observation
+        # Causal prior: p(z_t | h_{t-1}, c_t) — operating-point-aware
         self.prior_net = nn.Sequential(
-            _ResidualMLP(hidden_dim, encoder_dim, dropout),
+            _ResidualMLP(hidden_dim + c, encoder_dim, dropout),
             nn.Linear(encoder_dim, 2 * latent_dim),
         )
 
-        # Prediction head: x_pred_t = f(h_{t-1}) — expected normal evolution from state alone
-        # h_prev has no current observation info, so this is a genuine one-step prediction.
+        # Prediction head: x_pred_t = f(h_{t-1}, c_t)
         self.prediction_head = nn.Sequential(
-            _ResidualMLP(hidden_dim, decoder_dim, dropout),
+            _ResidualMLP(hidden_dim + c, decoder_dim, dropout),
             nn.Linear(decoder_dim, n_features),
         )
 
-        # Residual correction: delta_t = f(z_t, h_{t-1})
-        # z_t encodes the observation-specific deviation from the predicted state.
-        # Anomalies produce large residuals; normal observations produce small ones.
+        # Residual correction: delta_t = f(z_t, h_{t-1}, c_t)
         self.decoder = nn.Sequential(
-            _ResidualMLP(latent_dim + hidden_dim, decoder_dim, dropout),
+            _ResidualMLP(latent_dim + hidden_dim + c, decoder_dim, dropout),
             nn.Linear(decoder_dim, n_features),
         )
 
@@ -112,8 +112,8 @@ class DeepLatentStateSpaceModel(nn.Module):
         mu, logvar = params.chunk(2, dim=-1)
         return mu, logvar.clamp(-10.0, 10.0)
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        # x: [B, W, F]
+    def forward(self, x: torch.Tensor, c: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        # x: [B, W, F]    c (optional): [B, W, C]
         x_proj = self.drop(self.input_proj(x))     # [B, W, H]
         h_seq, _ = self.gru(x_proj)                # [B, W, H]  — h_seq[:, t] = h_t
 
@@ -122,12 +122,21 @@ class DeepLatentStateSpaceModel(nn.Module):
         h_prev = torch.zeros_like(h_seq)
         h_prev[:, 1:] = h_seq[:, :-1]             # [B, W, H]
 
-        # Inference distribution q(z_t | x_t, h_{t-1})
-        q_input = torch.cat([x, h_prev], dim=-1)   # [B, W, F+H]
+        # Validate conditioning expectations
+        if self.condition_dim > 0:
+            if c is None:
+                raise ValueError("condition_dim > 0 but c not provided")
+            if c.size(-1) != self.condition_dim:
+                raise ValueError(f"c last-dim {c.size(-1)} != condition_dim {self.condition_dim}")
+        cond_parts: list[torch.Tensor] = [c] if (self.condition_dim > 0 and c is not None) else []
+
+        # Inference q(z_t | x_t, h_{t-1}, c_t)
+        q_input = torch.cat([x, h_prev, *cond_parts], dim=-1)
         q_mu, q_logvar = self._split_params(self.inference_net(q_input))  # [B, W, Z]
 
-        # Causal prior p(z_t | h_{t-1}) — does NOT see x_t
-        p_mu, p_logvar = self._split_params(self.prior_net(h_prev))       # [B, W, Z]
+        # Causal prior p(z_t | h_{t-1}, c_t) — does NOT see x_t
+        p_input = torch.cat([h_prev, *cond_parts], dim=-1)
+        p_mu, p_logvar = self._split_params(self.prior_net(p_input))      # [B, W, Z]
 
         # Reparameterize during training; use mean at eval for deterministic scoring
         if self.training:
@@ -135,11 +144,13 @@ class DeepLatentStateSpaceModel(nn.Module):
         else:
             z = q_mu
 
-        # Prediction: expected observation from state alone (no z_t, no x_t)
-        x_pred = self.prediction_head(h_prev)                  # [B, W, F]
+        # Prediction: expected observation from state alone + conditioning context
+        pred_input = torch.cat([h_prev, *cond_parts], dim=-1)
+        x_pred = self.prediction_head(pred_input)                          # [B, W, F]
 
         # Residual correction: observation-specific deviation encoded by z_t
-        residual = self.decoder(torch.cat([z, h_prev], dim=-1))  # [B, W, F]
+        dec_input = torch.cat([z, h_prev, *cond_parts], dim=-1)
+        residual = self.decoder(dec_input)                                 # [B, W, F]
 
         # Final reconstruction: state prediction + latent residual
         x_hat = x_pred + residual                              # [B, W, F]
