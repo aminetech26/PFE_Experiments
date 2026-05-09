@@ -8,10 +8,10 @@ Implements the GVSAO-Transformer-BiLSTM anomaly detection approach from:
   Applied Intelligence 56:140.
 
 Adaptations for Costa (16-day, 1 Hz dataset):
-  - Resampled to 1-minute intervals (mean aggregation)
+  - Original 1 Hz sampling (no resampling)
   - Window length = 1 (point-wise reconstruction, no historical windows)
   - No multi-period positional encoding (dataset too short for seasonal patterns)
-  - No Savitzky-Golay smoothing (1-min resampling already denoises)
+  - No Savitzky-Golay smoothing
   - No correlation-based feature screening (9 raw sensor features kept)
   - Trained exclusively on healthy data (label == 0)
   - Evaluated per fault class (1=ShortCircuit, 2=Degradation, 3=OpenCircuit, 4=Shadowing)
@@ -79,13 +79,10 @@ def _resolve_device(device_str: str | None) -> torch.device:
     return torch.device(device_str)
 
 
-def load_and_resample(parquet_path: str | Path, resample_minutes: int = 1) -> pd.DataFrame:
-    """Load ingested Costa data and resample to 1-minute intervals.
+def load_data(parquet_path: str | Path) -> pd.DataFrame:
+    """Load ingested Costa data at native 1 Hz sampling.
 
-    Sensor columns are mean-aggregated. Label is max-aggregated (any fault
-    within the minute window marks the whole minute as faulty).
-
-    Returns DataFrame with timestamp index.
+    Returns DataFrame with timestamp index, sorted chronologically.
     """
     parquet_path = Path(parquet_path)
     if not parquet_path.exists():
@@ -96,22 +93,11 @@ def load_and_resample(parquet_path: str | Path, resample_minutes: int = 1) -> pd
     df = df.set_index("timestamp").sort_index()
 
     logger.info(f"  Loaded: {len(df):,} rows, {df.shape[1]} columns")
-
-    # Resample to 1-minute
-    resample_rule = f"{resample_minutes}min"
-    sensor_cols_present = [c for c in SENSOR_COLS if c in df.columns]
-    sensor_df = df[sensor_cols_present].resample(resample_rule).mean()
-    label_df = df["label"].resample(resample_rule).max()
-    df_resampled = pd.concat([sensor_df, label_df], axis=1)
-    df_resampled = df_resampled.dropna(subset=sensor_cols_present)
-    df_resampled["label"] = df_resampled["label"].fillna(0).astype(int)
-
-    logger.info(f"  After {resample_minutes}-min resample: {len(df_resampled):,} rows")
-    logger.info("  Label distribution after resample:")
-    for lbl, cnt in df_resampled["label"].value_counts().sort_index().items():
+    logger.info("  Label distribution:")
+    for lbl, cnt in df["label"].value_counts().sort_index().items():
         logger.info(f"    {FAULT_NAMES.get(int(lbl), '?')} ({int(lbl)}): {cnt:,}")
 
-    return df_resampled
+    return df
 
 
 def split_healthy_faulty(
@@ -420,9 +406,9 @@ def main():
     logger.info(f"Device: {device}")
     logger.info(f"Window length: {args.window_length}")
 
-    # ── Load & Resample ───────────────────────────────────────────────────
-    logger.info("=== Step 1: Load & Resample Costa Data ===")
-    df = load_and_resample(args.parquet_path)
+    # ── Load ──────────────────────────────────────────────────────────────
+    logger.info("=== Step 1: Load Costa Data (native 1 Hz) ===")
+    df = load_data(args.parquet_path)
 
     logger.info("=== Step 2: Split (healthy train/val, faulty test) ===")
     splits = split_healthy_faulty(df, healthy_train_frac=args.train_frac, seed=args.seed)
