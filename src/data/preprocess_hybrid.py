@@ -35,6 +35,9 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 from loguru import logger
+import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
