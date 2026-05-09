@@ -1,0 +1,70 @@
+2026-05-09 11:43:27.861 | INFO     | __main__:<module>:652 - === Stage 0: Data Ingestion — dataset=costa ===
+2026-05-09 11:43:27.970 | INFO     | __main__:load_costa:291 - Loading Costa dataset_elec.mat ...
+2026-05-09 11:43:28.239 | INFO     | __main__:load_costa:294 - Loading Costa dataset_amb.mat ...
+2026-05-09 11:43:28.431 | INFO     | __main__:load_costa:307 - Costa dataset loaded | N=1,373,798 samples ≈ 15.90 days at 1 Hz
+2026-05-09 11:43:28.472 | INFO     | __main__:load_costa:315 - Costa ingestion irradiance threshold: 100.0 W/m²
+2026-05-09 11:43:28.496 | INFO     | __main__:load_costa:337 - Costa irradiance filter (irr >= 100.0): 515,958 / 1,373,798 rows kept (37.6%)
+2026-05-09 11:43:28.528 | INFO     | __main__:load_costa:361 - Fault distribution (f_nv):
+2026-05-09 11:43:28.538 | INFO     | __main__:load_costa:373 -   0 (Normal       ):   309,253 (59.94%)
+2026-05-09 11:43:28.539 | INFO     | __main__:load_costa:373 -   1 (ShortCircuit ):     5,999 (1.16%)
+2026-05-09 11:43:28.539 | INFO     | __main__:load_costa:373 -   2 (Degradation  ):    10,371 (2.01%)
+2026-05-09 11:43:28.539 | INFO     | __main__:load_costa:373 -   3 (OpenCircuit  ):     6,024 (1.17%)
+2026-05-09 11:43:28.539 | INFO     | __main__:load_costa:373 -   4 (Shadowing    ):   184,311 (35.72%)
+2026-05-09 11:43:28.615 | SUCCESS  | __main__:_write_ingestion_outputs:117 - Saved → /content/PFE_Experiments/data/interim/ingestion/costa/costa_merged.parquet
+2026-05-09 11:43:28.615 | SUCCESS  | __main__:_write_ingestion_outputs:118 - Schema manifest → /content/PFE_Experiments/data/interim/ingestion/costa/costa_merged.schema.json
+2026-05-09 11:43:28.619 | INFO     | __main__:<module>:655 - Schema: {'timestamp': "Datetime(time_unit='us', time_zone='UTC')", 'label': 'Float64', 'vdc1': 'Float64', 'vdc2': 'Float64', 'idc1': 'Float64', 'idc2': 'Float64', 'pdc1': 'Float64', 'pdc2': 'Float64', 'pdc': 'Float64', 'irr': 'Float64', 'pvt': 'Float64'}
+2026-05-09 11:43:28.619 | INFO     | __main__:<module>:656 - First row: {'timestamp': datetime.datetime(2020, 4, 6, 12, 9, 22, tzinfo=zoneinfo.ZoneInfo(key='UTC')), 'label': 0.0, 'vdc1': 336.205, 'vdc2': 281.194, 'idc1': 0.1425, 'idc2': 0.039, 'pdc1': 47.909212499999995, 'pdc2': 10.966566, 'pdc': 58.875778499999996, 'irr': 100.185, 'pvt': -0.8391}
+2026-05-09 11:43:28.620 | SUCCESS  | __main__:<module>:662 - === Ingestion complete | dataset=costa ===
+2026-05-09 11:43:31.137 | INFO     | __main__:main:406 - Device: cuda
+2026-05-09 11:43:31.137 | INFO     | __main__:main:407 - Window length: 1
+2026-05-09 11:43:31.138 | INFO     | __main__:main:410 - === Step 1: Load Costa Data (native 1 Hz) ===
+2026-05-09 11:43:31.244 | INFO     | __main__:load_data:95 -   Loaded: 515,958 rows, 10 columns
+2026-05-09 11:43:31.244 | INFO     | __main__:load_data:96 -   Label distribution:
+2026-05-09 11:43:31.250 | INFO     | __main__:load_data:98 -     Normal (0): 309,253
+2026-05-09 11:43:31.250 | INFO     | __main__:load_data:98 -     ShortCircuit (1): 5,999
+2026-05-09 11:43:31.250 | INFO     | __main__:load_data:98 -     Degradation (2): 10,371
+2026-05-09 11:43:31.250 | INFO     | __main__:load_data:98 -     OpenCircuit (3): 6,024
+2026-05-09 11:43:31.250 | INFO     | __main__:load_data:98 -     Shadowing (4): 184,311
+2026-05-09 11:43:31.250 | INFO     | __main__:main:413 - === Step 2: Split (healthy train/val, faulty test) ===
+2026-05-09 11:43:31.294 | INFO     | __main__:split_healthy_faulty:132 -   Train (healthy): 247,402
+2026-05-09 11:43:31.294 | INFO     | __main__:split_healthy_faulty:133 -   Val   (healthy): 61,851
+2026-05-09 11:43:31.294 | INFO     | __main__:split_healthy_faulty:135 -   Test  (fault_class_1): 5,999
+2026-05-09 11:43:31.294 | INFO     | __main__:split_healthy_faulty:135 -   Test  (fault_class_2): 10,371
+2026-05-09 11:43:31.294 | INFO     | __main__:split_healthy_faulty:135 -   Test  (fault_class_3): 6,024
+2026-05-09 11:43:31.294 | INFO     | __main__:split_healthy_faulty:135 -   Test  (fault_class_4): 184,311
+2026-05-09 11:43:31.294 | INFO     | __main__:main:416 - === Step 3: Normalize & Create Tensors ===
+2026-05-09 11:43:31.329 | INFO     | __main__:main:423 -   n_features: 9 (['vdc1', 'vdc2', 'idc1', 'idc2', 'pdc1', 'pdc2', 'pdc', 'irr', 'pvt'])
+2026-05-09 11:43:31.329 | INFO     | __main__:main:424 -   X_train: (247402, 1, 9) | X_val: (61851, 1, 9)
+2026-05-09 11:43:31.329 | INFO     | __main__:main:432 - === Step 4: GVSAO Hyperparameter Tuning ===
+  GVSAO gen 1/5 | best_loss=0.000051 | lr=0.000297 | batch=58
+  GVSAO gen 2/5 | best_loss=0.000043 | lr=0.000277 | batch=60
+  GVSAO gen 3/5 | best_loss=0.000023 | lr=0.000295 | batch=58
+  GVSAO gen 4/5 | best_loss=0.000023 | lr=0.000295 | batch=58
+  GVSAO gen 5/5 | best_loss=0.000023 | lr=0.000295 | batch=58
+2026-05-09 14:54:39.540 | SUCCESS  | __main__:main:460 - GVSAO best: lr=0.000295, batch=58
+2026-05-09 14:54:39.540 | INFO     | __main__:main:463 - === Step 5: Train GTBAD (lr=0.000295, batch=58) ===
+2026-05-09 14:55:18.929 | INFO     | __main__:train_model:305 -     Epoch   1/50 | train_loss=0.004311 | val_loss=0.000458
+2026-05-09 15:01:52.874 | INFO     | __main__:train_model:305 -     Epoch  11/50 | train_loss=0.000171 | val_loss=0.000033
+2026-05-09 15:08:26.375 | INFO     | __main__:train_model:305 -     Epoch  21/50 | train_loss=0.000162 | val_loss=0.000022
+2026-05-09 15:15:00.651 | INFO     | __main__:train_model:305 -     Epoch  31/50 | train_loss=0.000160 | val_loss=0.000015
+2026-05-09 15:21:33.612 | INFO     | __main__:train_model:305 -     Epoch  41/50 | train_loss=0.000156 | val_loss=0.000016
+2026-05-09 15:22:52.930 | INFO     | __main__:train_model:309 -     Early stopping at epoch 43
+2026-05-09 15:22:52.934 | INFO     | __main__:main:476 -   Training completed in 1693.4s
+2026-05-09 15:22:52.946 | SUCCESS  | __main__:main:490 -   Saved checkpoint → /content/PFE_Experiments/experiments/checkpoints/gtbad/gtbad_best.pt
+2026-05-09 15:22:52.946 | INFO     | __main__:main:493 - === Step 6: Anomaly Detection Evaluation ===
+2026-05-09 15:22:59.618 | INFO     | __main__:main:498 -   Anomaly threshold (95.0th pctl): 0.000193
+2026-05-09 15:23:01.264 | INFO     | __main__:main:504 -   Val (healthy): FP=3853/61851 (6.23%)
+2026-05-09 15:23:01.425 | INFO     | __main__:main:519 -   ShortCircuit   Precision=1.0000 Recall=1.0000 F1=1.0000 TP=5999 FP=0 FN=0
+2026-05-09 15:23:01.702 | INFO     | __main__:main:519 -   Degradation    Precision=1.0000 Recall=1.0000 F1=1.0000 TP=10371 FP=0 FN=0
+2026-05-09 15:23:01.863 | INFO     | __main__:main:519 -   OpenCircuit    Precision=1.0000 Recall=1.0000 F1=1.0000 TP=6024 FP=0 FN=0
+2026-05-09 15:23:06.807 | INFO     | __main__:main:519 -   Shadowing      Precision=1.0000 Recall=0.8167 F1=0.8991 TP=150524 FP=0 FN=33787
+2026-05-09 15:23:12.365 | INFO     | __main__:main:543 -   OVERALL        Precision=0.9782 Recall=0.8365 F1=0.9018 TP=172918 FP=3853 FN=33787
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:593 -   Results saved → /content/PFE_Experiments/experiments/metrics/gtbad_results.json
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:596 - ============================================================
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:597 - GTBAD Training & Evaluation Complete
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:599 -   Overall F1: 0.9018
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:600 -   Overall Precision: 0.9782
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:601 -   Overall Recall: 0.8365
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:602 -   Checkpoint: /content/PFE_Experiments/experiments/checkpoints/gtbad/gtbad_best.pt
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:603 -   Metrics: /content/PFE_Experiments/experiments/metrics/gtbad_results.json
+2026-05-09 15:23:12.366 | SUCCESS  | __main__:main:604 - ============================================================

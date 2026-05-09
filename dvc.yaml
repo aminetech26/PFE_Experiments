@@ -147,3 +147,28 @@ stages:
           cache: false
     outs:
       - experiments/checkpoints/scvae/scvae_best.pth
+
+  # Stage 9: Hybrid (AE-LSTM + Prophet + IsolationForest) Preprocessing
+  preprocess_hybrid:
+    cmd: uv run python -m src.data.preprocess_hybrid
+    deps:
+      - src/data/preprocess_hybrid.py
+      - data/interim/ingestion/costa/costa_merged.parquet
+    outs:
+      - data/processed/preprocessed/costa_hybrid/hybrid_sequences.npz
+      - data/processed/preprocessed/costa_hybrid/hybrid_metadata.json
+
+  # Stage 10: Hybrid (AE-LSTM + Prophet + IsolationForest) Training
+  train_hybrid:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_hybrid
+    deps:
+      - src/modeling/anomaly_detection/dl/hybrid_model.py
+      - src/modeling/anomaly_detection/dl/train_hybrid.py
+      - src/modeling/anomaly_detection/dl/gvsao.py
+      - data/processed/preprocessed/costa_hybrid/hybrid_sequences.npz
+      - data/processed/preprocessed/costa_hybrid/hybrid_metadata.json
+    metrics:
+      - experiments/metrics/hybrid_results.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/hybrid/hybrid_best.pt
