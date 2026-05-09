@@ -1,422 +1,621 @@
+#!/usr/bin/env python3
+"""
+GTBAD Training & Evaluation — Costa dataset.
+
+Implements the GVSAO-Transformer-BiLSTM anomaly detection approach from:
+  Zhu, Ma, Xu, Xu, Du (2026) "GTBAD: GVSAO-Transformer-BiLSTM-based
+  time-series anomaly detection for photovoltaic power generation"
+  Applied Intelligence 56:140.
+
+Adaptations for Costa (16-day, 1 Hz dataset):
+  - Resampled to 1-minute intervals (mean aggregation)
+  - Window length = 1 (point-wise reconstruction, no historical windows)
+  - No multi-period positional encoding (dataset too short for seasonal patterns)
+  - No Savitzky-Golay smoothing (1-min resampling already denoises)
+  - No correlation-based feature screening (9 raw sensor features kept)
+  - Trained exclusively on healthy data (label == 0)
+  - Evaluated per fault class (1=ShortCircuit, 2=Degradation, 3=OpenCircuit, 4=Shadowing)
+  - GVSAO offline hyperparameter optimisation (learning rate, batch size)
+
+No data leakage: MinMax scaler fitted on training data only; threshold computed
+from training reconstruction errors; strict temporal train/val separation.
+
+Usage:
+    uv run python -m src.modeling.anomaly_detection.dl.train_gtbad
+    uv run python -m src.modeling.anomaly_detection.dl.train_gtbad --no-gvsao
+    uv run python -m src.modeling.anomaly_detection.dl.train_gtbad --epochs 100 --lr 0.001
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-# Fix matplotlib backend in headless/Colab environments
-os.environ['MPLBACKEND'] = 'Agg'
-
-import copy
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
-import warnings
-import argparse
-import pickle
-import json
-from pathlib import Path
-
-warnings.filterwarnings("ignore")
-
 from loguru import logger
-from src.data.preprocess_gtbad import PVDataPreprocessor
+from torch.utils.data import DataLoader, TensorDataset
+
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
+from src.modeling.anomaly_detection.dl.gvsao import GVSaoConfig, GVSaoResult, run_gvsao
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
+DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "experiments" / "checkpoints" / "gtbad"
+DEFAULT_METRICS_DIR = PROJECT_ROOT / "experiments" / "metrics"
+
+SENSOR_COLS = ["vdc1", "vdc2", "idc1", "idc2", "pdc1", "pdc2", "pdc", "irr", "pvt"]
+
+FAULT_NAMES: dict[int, str] = {
+    0: "Normal",
+    1: "ShortCircuit",
+    2: "Degradation",
+    3: "OpenCircuit",
+    4: "Shadowing",
+}
+
+EVALUABLE_CLASSES = [1, 2, 3, 4]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data Loading & Preprocessing
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-# -------------------  helper: GVSAO optimizer  -------------------
-class GVSAO:
+def _resolve_device(device_str: str | None) -> torch.device:
+    if device_str is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_str.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("CUDA not available, falling back to CPU")
+        return torch.device("cpu")
+    return torch.device(device_str)
+
+
+def load_and_resample(parquet_path: str | Path, resample_minutes: int = 1) -> pd.DataFrame:
+    """Load ingested Costa data and resample to 1-minute intervals.
+
+    Sensor columns are mean-aggregated. Label is max-aggregated (any fault
+    within the minute window marks the whole minute as faulty).
+
+    Returns DataFrame with timestamp index.
     """
-    Improved Snow Ablation Optimizer for hyperparameter tuning.
-    Searches for learning rate (log scale) and batch size (integer).
-    Implements good-point set initialization, dual-population update,
-    melting factor, and periodic oscillation mutation.
+    parquet_path = Path(parquet_path)
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"Ingested parquet not found: {parquet_path}\nRun: uv run python -m src.data.ingestion --dataset costa")
+
+    df = pd.read_parquet(parquet_path)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.set_index("timestamp").sort_index()
+
+    logger.info(f"  Loaded: {len(df):,} rows, {df.shape[1]} columns")
+
+    # Resample to 1-minute
+    resample_rule = f"{resample_minutes}min"
+    sensor_cols_present = [c for c in SENSOR_COLS if c in df.columns]
+    sensor_df = df[sensor_cols_present].resample(resample_rule).mean()
+    label_df = df["label"].resample(resample_rule).max()
+    df_resampled = pd.concat([sensor_df, label_df], axis=1)
+    df_resampled = df_resampled.dropna(subset=sensor_cols_present)
+    df_resampled["label"] = df_resampled["label"].fillna(0).astype(int)
+
+    logger.info(f"  After {resample_minutes}-min resample: {len(df_resampled):,} rows")
+    logger.info("  Label distribution after resample:")
+    for lbl, cnt in df_resampled["label"].value_counts().sort_index().items():
+        logger.info(f"    {FAULT_NAMES.get(int(lbl), '?')} ({int(lbl)}): {cnt:,}")
+
+    return df_resampled
+
+
+def split_healthy_faulty(
+    df: pd.DataFrame,
+    healthy_train_frac: float = 0.80,
+    seed: int = 42,
+) -> dict[str, pd.DataFrame]:
+    """Split data into train (healthy), val (healthy), and test (faulty per class).
+
+    TRAIN: first healthy_train_frac of healthy data (label == 0)
+    VAL:   remaining healthy data
+    TEST:  all faulty data, grouped by fault class
+
+    Temporal order is preserved within each split.
     """
+    healthy = df[df["label"] == 0].copy()
+    faulty = df[df["label"] > 0].copy()
 
-    def __init__(
-        self, dim, bounds, pop_size=20, max_gen=10, T_period=5, A=0.1, mutation_prob=0.1
-    ):
-        """
-        dim: 2
-        bounds: list of (low, high) for each dim (log scale for lr)
-        T_period: oscillation period
-        A: amplitude
-        mutation_prob: probability of applying oscillation mutation
-        """
-        self.dim = dim
-        self.bounds = np.array(bounds)
-        self.pop_size = pop_size
-        self.max_gen = max_gen
-        self.T_period = T_period
-        self.A = A
-        self.mutation_prob = mutation_prob
+    n_healthy = len(healthy)
+    split_idx = int(n_healthy * healthy_train_frac)
 
-    def _init_population(self):
-        # Good point set initialization with small random perturbation
-        pop = np.zeros((self.pop_size, self.dim))
-        for d in range(self.dim):
-            lb, ub = self.bounds[d]
-            # equally spaced points between 0 and 1
-            for i in range(self.pop_size):
-                base = lb + (ub - lb) * i / (self.pop_size - 1)
-                noise = np.random.uniform(-0.1, 0.1) * (ub - lb) / 2
-                pop[i, d] = np.clip(base + noise, lb, ub)
-        return pop
+    train_df = healthy.iloc[:split_idx]
+    val_df = healthy.iloc[split_idx:]
 
-    def optimize(self, fitness_func, verbose=True):
-        """
-        fitness_func: function taking (lr, batch_size) and returning fitness (lower is better)
-        Returns best solution and best fitness.
-        """
-        pop = self._init_population()
-        fitness = np.full(self.pop_size, np.inf)
-        pop_best = copy.deepcopy(pop)
-        fit_best = np.full(self.pop_size, np.inf)
-        global_best = None
-        global_best_fit = np.inf
+    # Group faulty data by class for per-class evaluation
+    test_by_class: dict[str, pd.DataFrame] = {}
+    for cls in EVALUABLE_CLASSES:
+        cls_data = faulty[faulty["label"] == cls]
+        if len(cls_data) > 0:
+            test_by_class[f"fault_class_{cls}"] = cls_data
 
-        # Eval initial population
-        for i in range(self.pop_size):
-            lr, bs = self._decode(pop[i])
-            fitness[i] = fitness_func(lr, bs)
-            fit_best[i] = fitness[i]
-            pop_best[i] = pop[i]
-            if fitness[i] < global_best_fit:
-                global_best_fit = fitness[i]
-                global_best = pop[i]
+    logger.info(f"  Train (healthy): {len(train_df):,}")
+    logger.info(f"  Val   (healthy): {len(val_df):,}")
+    for name, cls_df in test_by_class.items():
+        logger.info(f"  Test  ({name}): {len(cls_df):,}")
 
-        if verbose:
-            logger.info(f"Gen 0 Best Fitness: {global_best_fit:.6f}")
-
-        FEs = self.pop_size
-        FEs_max = self.pop_size * self.max_gen
-
-        for gen in range(1, self.max_gen):
-            # Sort to identify elite and compute population center
-            idx_sort = np.argsort(fitness)
-            pop_sorted = pop[idx_sort]
-            fit_sorted = fitness[idx_sort]
-            best_sol = pop_sorted[0]
-            pop_center = np.mean(pop, axis=0)
-
-            # Melting factor
-            T_ratio = gen / self.max_gen
-            DDF = 0.35 + 0.25 * (np.exp(FEs / FEs_max) - 1) / (np.e - 1)
-            M = DDF * T_ratio  # melting factor
-
-            new_pop = np.copy(pop)
-            for i in range(self.pop_size):
-                # random phase selection (exploration vs exploitation)
-                if np.random.rand() < 0.5:  # exploration
-                    b = np.random.normal(0, 1, self.dim)
-                    theta1 = np.random.rand()
-                    new_pop[i] = pop[i] + b * (
-                        theta1 * (best_sol - pop[i]) + (1 - theta1) * (pop_center - pop[i])
-                    )
-                else:  # exploitation
-                    b = np.random.normal(0, 1, self.dim)
-                    theta2 = np.random.rand()
-                    new_pop[i] = pop[i] + M * (best_sol - pop[i]) + b * (
-                        theta2 * (pop_center - pop[i])
-                    )
-
-                # Bound check
-                new_pop[i] = np.clip(new_pop[i], self.bounds[:, 0], self.bounds[:, 1])
-
-                # Periodic oscillation mutation
-                if np.random.rand() < self.mutation_prob:
-                    W = self.A * np.sin(2 * np.pi * gen / self.T_period)
-                    direction = best_sol - new_pop[i]
-                    new_pop[i] = new_pop[i] + W * direction
-                    new_pop[i] = np.clip(new_pop[i], self.bounds[:, 0], self.bounds[:, 1])
-
-            # Evaluate new population
-            for i in range(self.pop_size):
-                if np.array_equal(new_pop[i], pop[i]):
-                    continue  # skip redundant evaluation
-                lr, bs = self._decode(new_pop[i])
-                fitness[i] = fitness_func(lr, bs)
-                FEs += 1
-                if fitness[i] < fit_best[i]:
-                    fit_best[i] = fitness[i]
-                    pop_best[i] = new_pop[i]
-                if fitness[i] < global_best_fit:
-                    global_best_fit = fitness[i]
-                    global_best = new_pop[i]
-
-            pop = new_pop
-            if verbose:
-                logger.info(f"Gen {gen} Best Fitness: {global_best_fit:.6f}")
-
-        best_lr, best_bs = self._decode(global_best)
-        return best_lr, best_bs, global_best_fit
-
-    def _decode(self, x):
-        # x[0]: log10(lr), range [log10(1e-5), log10(1e-1)] -> lr
-        lr_log = x[0]
-        lr = 10 ** lr_log
-        bs = int(round(x[1]))
-        bs = max(16, min(128, bs))
-        return lr, bs
+    return {
+        "train": train_df,
+        "val": val_df,
+        **test_by_class,
+    }
 
 
-# -------------------  main training script  -------------------
-def load_dataset(filepath, timestamp_col="timestamp", label_col="anomaly"):
-    _, ext = os.path.splitext(filepath)
-    if ext.lower() == ".parquet":
-        df = pd.read_parquet(filepath)
-    else:
-        df = pd.read_csv(filepath)
-    if timestamp_col in df.columns:
-        df[timestamp_col] = pd.to_datetime(df[timestamp_col])
-    else:
-        raise ValueError(f"Column {timestamp_col} not found.")
-    return df
+class MinMaxScaler:
+    """MinMax scaler that stores fit params for later transform."""
+
+    def fit(self, data: np.ndarray) -> MinMaxScaler:
+        self.min_ = data.min(axis=0)
+        self.max_ = data.max(axis=0)
+        self.range_ = self.max_ - self.min_
+        self.range_[self.range_ < 1e-10] = 1.0
+        return self
+
+    def transform(self, data: np.ndarray) -> np.ndarray:
+        return (data - self.min_) / self.range_
+
+    def fit_transform(self, data: np.ndarray) -> np.ndarray:
+        return self.fit(data).transform(data)
 
 
-def train_lightweight(model, train_loader, val_loader, epochs=5, lr=1e-3, device="cpu"):
-    """Quick training for GVSAO fitness evaluation."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+def prepare_tensors(
+    splits: dict[str, pd.DataFrame],
+    scaler: MinMaxScaler | None = None,
+    window_length: int = 1,
+) -> dict[str, Any]:
+    """MinMax-normalize features and create windowed tensors.
+
+    Scaler is fitted on TRAIN data only (leakage prevention).
+    Window length = 1 for point-wise reconstruction.
+    """
+    sensor_cols_present = [c for c in SENSOR_COLS if c in splits["train"].columns]
+    n_features = len(sensor_cols_present)
+
+    # Fit scaler on TRAIN data only
+    if scaler is None:
+        scaler = MinMaxScaler()
+        scaler.fit(splits["train"][sensor_cols_present].values)
+
+    result: dict[str, Any] = {"scaler": scaler, "n_features": n_features, "feature_names": sensor_cols_present}
+
+    for split_name, df in splits.items():
+        X = scaler.transform(df[sensor_cols_present].values).astype(np.float32)
+        labels = df["label"].values.astype(np.int32)
+
+        if window_length == 1:
+            X_windows = X[:, np.newaxis, :]  # (n_samples, 1, n_features)
+            l_windows = labels
+        else:
+            n = len(X)
+            if n < window_length:
+                raise ValueError(f"Not enough data ({n}) for window length {window_length} in '{split_name}'")
+            X_windows = np.stack([X[i:i + window_length] for i in range(n - window_length + 1)])
+            l_windows = labels[window_length - 1:]
+            l_windows = np.max([labels[i:i + window_length] for i in range(n - window_length + 1)], axis=1)
+
+        result[split_name] = {
+            "X": torch.from_numpy(X_windows),
+            "labels": l_windows,
+            "n_samples": len(X_windows),
+        }
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Training
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_dataloader(
+    X: torch.Tensor,
+    batch_size: int,
+    shuffle: bool = True,
+) -> DataLoader:
+    dataset = TensorDataset(X, X)  # autoencoder: input == target
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=False)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+) -> float:
     model.train()
-    for _ in range(epochs):
-        for x_batch, y_batch, mask_batch in train_loader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            mask_batch = mask_batch.to(device)
-            optimizer.zero_grad()
-            y_pred = model(x_batch)
-            se = (y_pred - y_batch) ** 2
-            loss_per_sample = se.mean(dim=(1, 2))
-            if mask_batch is not None:
-                loss_per_sample = loss_per_sample * mask_batch.float()
-                loss = loss_per_sample.sum() / (mask_batch.float().sum() + 1e-8)
-            else:
-                loss = loss_per_sample.mean()
-            loss.backward()
-            optimizer.step()
+    total_loss = 0.0
+    for X_batch, _ in dataloader:
+        X_batch = X_batch.to(device)
+        optimizer.zero_grad()
+        recon = model(X_batch)
+        loss = criterion(recon, X_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * X_batch.size(0)
+    return total_loss / len(dataloader.dataset)
 
+
+@torch.no_grad()
+def evaluate_reconstruction(
+    model: nn.Module,
+    X: torch.Tensor,
+    device: torch.device,
+    batch_size: int = 256,
+) -> np.ndarray:
+    """Compute per-sample MSE reconstruction error."""
     model.eval()
-    val_loss = 0.0
-    n_val = 0
-    with torch.no_grad():
-        for x_batch, y_batch, mask_batch in val_loader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            mask_batch = mask_batch.to(device)
-            y_pred = model(x_batch)
-            se = (y_pred - y_batch) ** 2
-            loss_per_sample = se.mean(dim=(1, 2))
-            if mask_batch is not None:
-                loss_per_sample = loss_per_sample * mask_batch.float()
-            val_loss += loss_per_sample.sum().item()
-            n_val += mask_batch.float().sum().item() if mask_batch is not None else loss_per_sample.size(0)
-    avg_loss = val_loss / n_val if n_val > 0 else 0.0
-    return avg_loss
+    all_errors: list[np.ndarray] = []
+    n = X.shape[0]
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        X_batch = X[start:end].to(device)
+        recon = model(X_batch)
+        err = reconstruction_error(X_batch, recon).cpu().numpy()
+        all_errors.append(err)
+    return np.concatenate(all_errors)
+
+
+def train_model(
+    model: nn.Module,
+    X_train: torch.Tensor,
+    X_val: torch.Tensor,
+    device: torch.device,
+    lr: float,
+    batch_size: int,
+    epochs: int,
+    patience: int = 15,
+    verbose: bool = True,
+) -> tuple[nn.Module, dict]:
+    """Train GTBAD model on healthy data only with early stopping."""
+    train_loader = _make_dataloader(X_train, batch_size, shuffle=True)
+    val_loader = _make_dataloader(X_val, batch_size, shuffle=False)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    best_val_loss = float("inf")
+    best_state = None
+    epochs_without_improvement = 0
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+
+    for epoch in range(epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, _ in val_loader:
+                X_batch = X_batch.to(device)
+                recon = model(X_batch)
+                val_loss += criterion(recon, X_batch).item() * X_batch.size(0)
+        val_loss /= len(val_loader.dataset)
+        val_losses.append(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
+            logger.info(f"    Epoch {epoch+1:3d}/{epochs} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f}")
+
+        if epochs_without_improvement >= patience:
+            if verbose:
+                logger.info(f"    Early stopping at epoch {epoch+1}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    training_info = {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "best_val_loss": float(best_val_loss),
+        "epochs_trained": len(train_losses),
+    }
+    return model, training_info
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anomaly Detection & Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def compute_threshold(errors: np.ndarray, percentile: float = 95.0) -> float:
+    """Compute anomaly threshold as p-th percentile of training errors."""
+    return float(np.percentile(errors, percentile))
+
+
+def evaluate_anomaly_detection(
+    errors: np.ndarray,
+    labels: np.ndarray,
+    threshold: float,
+) -> dict[str, float]:
+    """Compute precision, recall, F1 for anomaly detection."""
+    preds = (errors > threshold).astype(int)
+    true = (labels > 0).astype(int)
+
+    tp = int(np.sum((preds == 1) & (true == 1)))
+    fp = int(np.sum((preds == 1) & (true == 0)))
+    fn = int(np.sum((preds == 0) & (true == 1)))
+    tn = int(np.sum((preds == 0) & (true == 0)))
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "TN": tn,
+        "precision": round(precision, 6),
+        "recall": round(recall, 6),
+        "f1_score": round(f1, 6),
+        "threshold": threshold,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def build_model(n_features: int, d_model: int, nhead: int, num_encoder_layers: int, lstm_hidden: int, dropout: float) -> GTBADModel:
+    return GTBADModel(
+        input_dim=n_features,
+        output_dim=n_features,
+        d_model=d_model,
+        nhead=nhead,
+        num_encoder_layers=num_encoder_layers,
+        lstm_hidden=lstm_hidden,
+        dropout=dropout,
+    )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train GTBAD model")
-    parser.add_argument("--skip-hpo", action="store_true", help="Skip hyperparameter optimization and use fixed values.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Fixed learning rate (used if --skip-hpo is set)")
-    parser.add_argument("--batch-size", type=int, default=32, help="Fixed batch size (used if --skip-hpo is set)")
+    parser = argparse.ArgumentParser(description="Train GTBAD anomaly detection on Costa dataset")
+    parser.add_argument("--parquet-path", type=str, default=str(DEFAULT_DATA_PATH))
+    parser.add_argument("--device", type=str, default=None, help="cpu | cuda:0")
+    parser.add_argument("--epochs", type=int, default=50, help="Training epochs (final model)")
+    parser.add_argument("--gvsao-epochs", type=int, default=5, help="Epochs per GVSAO fitness eval")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate (if set, skips GVSAO)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size (if set, skips GVSAO)")
+    parser.add_argument("--no-gvsao", action="store_true", help="Skip GVSAO, use defaults or --lr/--batch-size")
+    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--nhead", type=int, default=2)
+    parser.add_argument("--num-encoder-layers", type=int, default=3)
+    parser.add_argument("--lstm-hidden", type=int, default=32)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--train-frac", type=float, default=0.80)
+    parser.add_argument("--threshold-percentile", type=float, default=95.0)
+    parser.add_argument("--window-length", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    # Configuration
-    DATA_PATH = "data/interim/ingestion/costa/costa_merged.parquet"
-    TIMESTAMP_COL = "timestamp"
-    LABEL_COL = "label"  # if exists; otherwise ignore metrics
-    EPOCHS = 50
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {DEVICE}")
+    # ── Seed ──────────────────────────────────────────────────────────────
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    device = _resolve_device(args.device)
+    logger.info(f"Device: {device}")
+    logger.info(f"Window length: {args.window_length}")
 
-    # 1. Load and preprocess
-    logger.info(f"Loading data from {DATA_PATH}...")
-    df = load_dataset(DATA_PATH, TIMESTAMP_COL, LABEL_COL)
-    preprocessor = PVDataPreprocessor(
-        window_len=5,
-        stride=1,
-        power_col="pdc",
-        corr_threshold=0.99,
-    )
-    X_full, y_target, mask, df_clean = preprocessor.fit_transform(df, TIMESTAMP_COL)
-    # X_full: (n_samples, 10, input_dim)  with input_dim = n_selected + 32
-    # y_target: (n_samples, 10, n_selected)
-    # To train with full sequence reconstruction, we should use the numeric part of X_full (first n_selected features) as target.
-    n_selected = len(preprocessor.selected_features)
-    X_numeric_full = X_full[:, :, :n_selected].copy()
-    # Now X_numeric_full shape (n_samples, 10, n_selected) is both input and target.
-    # The input to model will be X_full (with time encodings), target is X_numeric_full.
+    # ── Load & Resample ───────────────────────────────────────────────────
+    logger.info("=== Step 1: Load & Resample Costa Data ===")
+    df = load_and_resample(args.parquet_path)
 
-    # Train/validation/test split
-    X_train, X_test, y_train, y_test, mask_train, mask_test = train_test_split(
-        X_full, X_numeric_full, mask, test_size=0.2, random_state=42, shuffle=False
-    )  # time series, no shuffle
-    # further split train into train/val for GVSAO (80% train, 20% val of train)
-    X_tr, X_val, y_tr, y_val, mask_tr, mask_val = train_test_split(
-        X_train, y_train, mask_train, test_size=0.2, random_state=42, shuffle=False
-    )
+    logger.info("=== Step 2: Split (healthy train/val, faulty test) ===")
+    splits = split_healthy_faulty(df, healthy_train_frac=args.train_frac, seed=args.seed)
 
-    # 2. Hyperparameter optimization or load fixed values
-    input_dim = X_train.shape[2]
-    output_dim = n_selected
+    logger.info("=== Step 3: Normalize & Create Tensors ===")
+    tensors = prepare_tensors(splits, window_length=args.window_length)
+    n_features = tensors["n_features"]
+    feature_names = tensors["feature_names"]
 
-    if args.skip_hpo:
-        logger.info(f"Skipping HPO, using provided hyperparameters: LR={args.lr}, Batch Size={args.batch_size}")
-        best_lr = args.lr
-        best_bs = args.batch_size
-    else:
-        logger.info("Starting GVSAO hyperparameter optimization...")
-        def fitness_func(lr, bs):
-            bs = int(bs)
-            # Build lightweight loaders
-            train_dataset = TensorDataset(
-                torch.tensor(X_tr, dtype=torch.float32),
-                torch.tensor(y_tr, dtype=torch.float32),
-                torch.tensor(mask_tr, dtype=torch.float32),
+    X_train = tensors["train"]["X"]
+    X_val = tensors["val"]["X"]
+    logger.info(f"  n_features: {n_features} ({feature_names})")
+    logger.info(f"  X_train: {tuple(X_train.shape)} | X_val: {tuple(X_val.shape)}")
+
+    # ── GVSAO Hyperparameter Optimisation ─────────────────────────────────
+    final_lr = args.lr or 0.001
+    final_batch_size = args.batch_size or 32
+    gvsao_result = None
+
+    if not args.no_gvsao and (args.lr is None or args.batch_size is None):
+        logger.info("=== Step 4: GVSAO Hyperparameter Tuning ===")
+
+        gvsao_config = GVSaoConfig(
+            population_size=10,
+            max_generations=5,
+            lr_bounds=(1e-5, 1e-1),
+            batch_bounds=(16, 128),
+            seed=args.seed,
+        )
+
+        def fitness_fn(lr: float, batch: int) -> float:
+            """Train lightweight model, return validation loss."""
+            model = build_model(
+                n_features, args.d_model, args.nhead,
+                args.num_encoder_layers, args.lstm_hidden, args.dropout,
+            ).to(device)
+            effective_batch = min(batch, X_train.shape[0])
+            _, info = train_model(
+                model, X_train, X_val, device,
+                lr=lr, batch_size=effective_batch,
+                epochs=args.gvsao_epochs, patience=3, verbose=False,
             )
-            val_dataset = TensorDataset(
-                torch.tensor(X_val, dtype=torch.float32),
-                torch.tensor(y_val, dtype=torch.float32),
-                torch.tensor(mask_val, dtype=torch.float32),
-            )
-            train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True)
-            val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False)
-            model = GTBADModel(
-                input_dim=input_dim,
-                output_dim=output_dim,
-                d_model=64,
-                nhead=2,
-                num_encoder_layers=3,
-                lstm_hidden=32,
-                dropout=0.1,
-            ).to(DEVICE)
-            val_loss = train_lightweight(
-                model, train_loader, val_loader, epochs=5, lr=lr, device=DEVICE
-            )
-            return val_loss
+            return info["best_val_loss"]
 
-        bounds = [[np.log10(1e-5), np.log10(1e-1)], [16, 128]]  # lr in log, bs linear
-        optimizer_gvsao = GVSAO(dim=2, bounds=bounds, pop_size=20, max_gen=10)
-        best_lr, best_bs, best_fit = optimizer_gvsao.optimize(fitness_func)
-        logger.info(f"Best LR: {best_lr:.6f}, Best batch size: {best_bs}, Fitness: {best_fit:.6f}")
+        gvsao_result = run_gvsao(fitness_fn, gvsao_config, verbose=True)
+        final_lr = gvsao_result.best_params["learning_rate"]
+        final_batch_size = gvsao_result.best_params["batch_size"]
+        final_batch_size = min(final_batch_size, X_train.shape[0])
+        logger.success(f"GVSAO best: lr={final_lr:.6f}, batch={final_batch_size}")
 
-    # 3. Split training set into final train + calibration (for threshold)
-    X_final_train, X_calib, y_final_train, y_calib, mask_final_train, mask_calib = train_test_split(
-        X_train, y_train, mask_train, test_size=0.125, random_state=42, shuffle=False
+    # ── Final Model Training ──────────────────────────────────────────────
+    logger.info(f"=== Step 5: Train GTBAD (lr={final_lr:.6f}, batch={final_batch_size}) ===")
+    model = build_model(
+        n_features, args.d_model, args.nhead,
+        args.num_encoder_layers, args.lstm_hidden, args.dropout,
+    ).to(device)
+
+    t0 = time.perf_counter()
+    model, training_info = train_model(
+        model, X_train, X_val, device,
+        lr=final_lr, batch_size=final_batch_size,
+        epochs=args.epochs, patience=args.patience, verbose=True,
     )
-    logger.info(f"Final training samples: {len(X_final_train)}, Calibration samples: {len(X_calib)}")
+    train_time = time.perf_counter() - t0
+    logger.info(f"  Training completed in {train_time:.1f}s")
 
-    # 4. Final training with best hyperparameters
-    logger.info(f"Starting final training with bs={best_bs}, lr={best_lr}")
-    train_dataset = TensorDataset(
-        torch.tensor(X_final_train, dtype=torch.float32),
-        torch.tensor(y_final_train, dtype=torch.float32),
-        torch.tensor(mask_final_train, dtype=torch.float32),
-    )
-    train_loader = DataLoader(train_dataset, batch_size=best_bs, shuffle=True)
-
-    model = GTBADModel(
-        input_dim=input_dim,
-        output_dim=output_dim,
-        d_model=64,
-        nhead=2,
-        num_encoder_layers=3,
-        lstm_hidden=32,
-        dropout=0.1,
-    ).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
-
-    model.train()
-    for epoch in range(EPOCHS):
-        total_loss = 0.0
-        for x_b, y_b, m_b in train_loader:
-            x_b = x_b.to(DEVICE)
-            y_b = y_b.to(DEVICE)
-            m_b = m_b.to(DEVICE)
-            optimizer.zero_grad()
-            y_pred = model(x_b)
-            se = (y_pred - y_b) ** 2
-            loss_per_sample = se.mean(dim=(1, 2))
-            if m_b is not None:
-                loss_per_sample = loss_per_sample * m_b.float()
-                loss = loss_per_sample.sum() / (m_b.float().sum() + 1e-8)
-            else:
-                loss = loss_per_sample.mean()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(train_loader)
-        logger.info(f"Epoch {epoch + 1}/{EPOCHS} Loss: {avg_loss:.6f}")
-
-    # 5. Thresholds from calibration set (unseen during final training)
-    logger.info("Computing reconstruction errors on calibration set to find anomaly thresholds...")
-    model.eval()
-    calib_dataset = TensorDataset(
-        torch.tensor(X_calib, dtype=torch.float32),
-        torch.tensor(y_calib, dtype=torch.float32),
-        torch.tensor(mask_calib, dtype=torch.float32),
-    )
-    calib_errors = []
-    calib_feature_errors = []
-    with torch.no_grad():
-        for x_b, y_b, m_b in DataLoader(calib_dataset, batch_size=best_bs, shuffle=False):
-            x_b = x_b.to(DEVICE)
-            y_b = y_b.to(DEVICE)
-            y_pred = model(x_b)
-            err = reconstruction_error(y_pred, y_b)
-            calib_errors.extend(err.cpu().numpy().tolist())
-            feat_err = ((y_pred - y_b) ** 2).mean(dim=1)
-            calib_feature_errors.append(feat_err.cpu().numpy())
-    calib_errors = np.array(calib_errors)
-    calib_feature_errors = np.concatenate(calib_feature_errors, axis=0)
-    threshold = np.percentile(calib_errors, 95)
-    per_feature_thresholds = np.percentile(calib_feature_errors, 95, axis=0)
-    logger.info(f"Global threshold (95th percentile): {threshold:.6f}")
-    logger.info(f"Per-feature thresholds (95th percentile): {per_feature_thresholds}")
-
-    # --- Save Model and Preprocessor ---
-    checkpoint_dir = Path("experiments/checkpoints/gtbad")
+    # ── Checkpoint ────────────────────────────────────────────────────────
+    checkpoint_dir = Path(DEFAULT_CHECKPOINT_DIR)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    model_path = checkpoint_dir / "gtbad_best.pt"
-    torch.save(model.state_dict(), model_path)
-    
-    preprocessor_path = checkpoint_dir / "preprocessor.pkl"
-    with open(preprocessor_path, "wb") as f:
-        pickle.dump(preprocessor, f)
-        
-    threshold_path = checkpoint_dir / "threshold.json"
-    with open(threshold_path, "w") as f:
-        json.dump({
-            "threshold": float(threshold),
-            "input_dim": input_dim,
-            "output_dim": output_dim,
-            "per_feature_thresholds": per_feature_thresholds.tolist(),
-        }, f)
-        
-    logger.info(f"Model, preprocessor, and threshold saved to {checkpoint_dir}")
+    ckpt_path = checkpoint_dir / "gtbad_best.pt"
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "n_features": n_features,
+        "feature_names": feature_names,
+        "scaler_min": tensors["scaler"].min_.tolist(),
+        "scaler_max": tensors["scaler"].max_.tolist(),
+        "args": vars(args),
+    }, ckpt_path)
+    logger.success(f"  Saved checkpoint → {ckpt_path}")
 
-    # Test set errors (per-feature majority vote)
-    logger.info("Computing errors on test set...")
-    test_dataset = TensorDataset(
-        torch.tensor(X_test, dtype=torch.float32),
-        torch.tensor(y_test, dtype=torch.float32),
-        torch.tensor(mask_test, dtype=torch.float32),
-    )
-    test_loader = DataLoader(test_dataset, batch_size=best_bs, shuffle=False)
-    test_feature_errors = []
-    with torch.no_grad():
-        for x_b, y_b, _ in test_loader:
-            x_b = x_b.to(DEVICE)
-            y_b = y_b.to(DEVICE)
-            y_pred = model(x_b)
-            feat_err = ((y_pred - y_b) ** 2).mean(dim=1)
-            test_feature_errors.append(feat_err.cpu().numpy())
-    test_feature_errors = np.concatenate(test_feature_errors, axis=0)
-    exceeds = test_feature_errors > per_feature_thresholds
-    pred_anomaly = (exceeds.sum(axis=1) > output_dim / 2).astype(int)
-    logger.info("No true labels; anomaly predictions saved as 'test_anomaly_scores.csv'")
-    np.savetxt("test_anomaly_scores.csv", pred_anomaly, delimiter=",")
+    # ── Anomaly Detection Evaluation ──────────────────────────────────────
+    logger.info("=== Step 6: Anomaly Detection Evaluation ===")
+
+    # Compute threshold from training reconstruction errors
+    train_errors = evaluate_reconstruction(model, X_train, device, final_batch_size)
+    threshold = compute_threshold(train_errors, args.threshold_percentile)
+    logger.info(f"  Anomaly threshold ({args.threshold_percentile}th pctl): {threshold:.6f}")
+
+    # Evaluate on validation healthy data (should have low anomaly rate)
+    val_errors = evaluate_reconstruction(model, X_val, device, final_batch_size)
+    val_fp = int(np.sum(val_errors > threshold))
+    val_result = evaluate_anomaly_detection(val_errors, tensors["val"]["labels"], threshold)
+    logger.info(f"  Val (healthy): FP={val_fp}/{len(val_errors)} ({100*val_fp/len(val_errors):.2f}%)")
+
+    # Evaluate on each fault class
+    class_results: dict[str, dict] = {}
+    for cls in EVALUABLE_CLASSES:
+        key = f"fault_class_{cls}"
+        if key not in tensors:
+            logger.warning(f"  No data for fault class {cls}")
+            continue
+
+        X_fault = tensors[key]["X"]
+        labels_fault = tensors[key]["labels"]
+        fault_errors = evaluate_reconstruction(model, X_fault, device, final_batch_size)
+        result = evaluate_anomaly_detection(fault_errors, labels_fault, threshold)
+        class_results[key] = result
+        logger.info(
+            f"  {FAULT_NAMES[cls]:<14} "
+            f"Precision={result['precision']:.4f} "
+            f"Recall={result['recall']:.4f} "
+            f"F1={result['f1_score']:.4f} "
+            f"TP={result['TP']} FP={result['FP']} FN={result['FN']}"
+        )
+
+    # ── Overall (all fault classes combined) ───────────────────────────────
+    all_fault_errors = []
+    all_fault_labels = []
+    for cls in EVALUABLE_CLASSES:
+        key = f"fault_class_{cls}"
+        if key in tensors:
+            X_f = tensors[key]["X"]
+            errs_f = evaluate_reconstruction(model, X_f, device, final_batch_size)
+            all_fault_errors.append(errs_f)
+            all_fault_labels.append(tensors[key]["labels"])
+    if all_fault_errors:
+        combined_errors = np.concatenate(all_fault_errors)
+        combined_labels = np.concatenate(all_fault_labels)
+        combined_val = np.concatenate([val_errors, combined_errors])
+        combined_label = np.concatenate([np.zeros(len(val_errors)), combined_labels])
+        overall_result = evaluate_anomaly_detection(combined_val, combined_label, threshold)
+        logger.info(
+            f"  {'OVERALL':<14} "
+            f"Precision={overall_result['precision']:.4f} "
+            f"Recall={overall_result['recall']:.4f} "
+            f"F1={overall_result['f1_score']:.4f} "
+            f"TP={overall_result['TP']} FP={overall_result['FP']} FN={overall_result['FN']}"
+        )
+
+    # ── Save Results ───────────────────────────────────────────────────────
+    metrics_dir = Path(DEFAULT_METRICS_DIR)
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    results_payload = {
+        "model": "GTBAD (GVSAO-Transformer-BiLSTM)",
+        "dataset": "Costa PV Fault Dataset",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "window_length": args.window_length,
+        "input_features": feature_names,
+        "model_config": {
+            "d_model": args.d_model,
+            "nhead": args.nhead,
+            "num_encoder_layers": args.num_encoder_layers,
+            "lstm_hidden": args.lstm_hidden,
+            "dropout": args.dropout,
+        },
+        "training": {
+            "learning_rate": final_lr,
+            "batch_size": final_batch_size,
+            "epochs": training_info["epochs_trained"],
+            "best_val_loss": training_info["best_val_loss"],
+            "train_time_seconds": round(train_time, 1),
+        },
+        "gvsao": {
+            "enabled": gvsao_result is not None,
+            "best_params": gvsao_result.best_params if gvsao_result else None,
+            "best_fitness": gvsao_result.best_fitness if gvsao_result else None,
+            "history": gvsao_result.history if gvsao_result else None,
+            "n_evals": gvsao_result.n_evals if gvsao_result else 0,
+        },
+        "anomaly_detection": {
+            "threshold_percentile": args.threshold_percentile,
+            "threshold_value": threshold,
+            "val_healthy_fp_rate": float(val_fp / len(val_errors)) if len(val_errors) > 0 else 0.0,
+            "per_class": {k: v for k, v in class_results.items()},
+            "overall": overall_result if all_fault_errors else {},
+        },
+    }
+
+    results_path = metrics_dir / "gtbad_results.json"
+    results_path.write_text(json.dumps(results_payload, indent=2, default=str), encoding="utf-8")
+    logger.success(f"  Results saved → {results_path}")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    logger.success("=" * 60)
+    logger.success("GTBAD Training & Evaluation Complete")
+    if all_fault_errors:
+        logger.success(f"  Overall F1: {overall_result['f1_score']:.4f}")
+        logger.success(f"  Overall Precision: {overall_result['precision']:.4f}")
+        logger.success(f"  Overall Recall: {overall_result['recall']:.4f}")
+    logger.success(f"  Checkpoint: {ckpt_path}")
+    logger.success(f"  Metrics: {results_path}")
+    logger.success("=" * 60)
 
 
 if __name__ == "__main__":
