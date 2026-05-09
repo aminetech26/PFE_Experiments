@@ -133,7 +133,7 @@ def fit_prophet_residuals(
     """
     try:
         import os as _os
-        _os.environ.setdefault("MPLBACKEND", "Agg")
+        _os.environ["MPLBACKEND"] = "Agg"
         from prophet import Prophet
     except Exception as e:
         logger.warning(f"prophet unavailable ({e}). Falling back to linear regression residuals.")
