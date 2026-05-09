@@ -1,501 +1,512 @@
-# -*- coding: utf-8 -*-
-import torch
-from torch import nn
-from torch.distributions import Normal
-from torch.autograd import Variable
+"""
+Sequential Conditional Variational Autoencoder (SCVAE) for PV anomaly detection.
+
+Implements the architecture from:
+  Li et al. (2024) "Sensing anomaly of photovoltaic systems with sequential
+  conditional variational autoencoder", Applied Energy 353:122124.
+
+Architecture:
+  - Conditional prior:    p(z_t | x_t, h_{t-1})
+  - Inference (encoder):  q(z_t | x_t, y_t, h_{t-1})
+  - Generative (decoder): p(y_t | z_t, x_t, h_{t-1})
+  - Recurrence:           h_t = GRU(cat[φ_x(x_t), φ_y(y_t), φ_z(z_t)], h_{t-1})
+  - Prediction pathway:   separate GRU for test-time (only x available)
+
+Target: reconstruct PV power (pdc1, pdc2) conditioned on environmental
+measurements (irr, pvt), capturing temporal and conditional dependencies.
+
+Usage:
+    model = SCVAE(x_dim=2, label_dim=2, h_dim=512, z_dim=128)
+    # Training: call model(X, Y) then use model.kld_loss, model.nll_loss, etc.
+    # Test-time reconstruction: model.reconstruct(X, Y) -> (mu, std, score)
+    # Test-time prediction (no Y): model.predict(X) -> (mu, std)
+"""
+
+from __future__ import annotations
+
 import numpy as np
 import scipy.stats as stats
+import torch
+import torch.nn as nn
+from torch.distributions import Normal
 
 
 class SCVAE(nn.Module):
-    def __init__(self, x_dim, label_dim, h_dim, z_dim, input_dim, bias=False, device=None, is_prior=False):
-        super(SCVAE, self).__init__()
+    def __init__(
+        self,
+        x_dim: int,
+        label_dim: int,
+        h_dim: int = 512,
+        z_dim: int = 128,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
 
         self.x_dim = x_dim
+        self.label_dim = label_dim
         self.h_dim = h_dim
         self.z_dim = z_dim
-        self.input_dim = input_dim
-        self.label_dim = label_dim
-        self.is_prior = is_prior
 
-        if device is None:
-            self.device = torch.device("cpu")
-        else:
-            self.device = device
+        self.device = device or torch.device("cpu")
 
-        # ---Network Structure------------
-        # feature-extracting transformations
-        self.embedding = nn.Sequential(
-            nn.Linear(input_dim, 1),
-            nn.ReLU())
+        # Feature extractors
         self.phi_x = nn.Sequential(
-            nn.Linear(x_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
+            nn.Linear(x_dim, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
         self.phi_y = nn.Sequential(
-            nn.Linear(label_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
-        self.phi_z = nn.Sequential(
-            nn.Linear(z_dim, h_dim),
-            nn.ReLU())
+            nn.Linear(label_dim, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
+        self.phi_z = nn.Sequential(nn.Linear(z_dim, h_dim), nn.ReLU())
 
-        # encoder
+        # Encoder (inference): q(z_t | x_t, y_t, h_{t-1})
         self.enc = nn.Sequential(
-            nn.Linear(h_dim + h_dim + h_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
-        self.enc_mean = nn.Sequential(nn.Linear(h_dim, z_dim),
-                                      nn.LeakyReLU(0.1))
-        self.enc_std = nn.Sequential(
-            nn.Linear(h_dim, z_dim),
-            nn.Softplus())
+            nn.Linear(h_dim * 3, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
+        self.enc_mean = nn.Linear(h_dim, z_dim)
+        self.enc_std = nn.Sequential(nn.Linear(h_dim, z_dim), nn.Softplus())
 
-        # prior
+        # Prior: p(z_t | x_t, h_{t-1})
         self.prior = nn.Sequential(
-            nn.Linear(h_dim + h_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
-        self.prior_mean = nn.Sequential(nn.Linear(h_dim, z_dim),
-                                        nn.LeakyReLU(0.1))
-        self.prior_std = nn.Sequential(
-            nn.Linear(h_dim, z_dim),
-            nn.Softplus())
+            nn.Linear(h_dim * 2, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
+        self.prior_mean = nn.Linear(h_dim, z_dim)
+        self.prior_std = nn.Sequential(nn.Linear(h_dim, z_dim), nn.Softplus())
 
-        # predict
+        # Prediction prior: p_pred(z_t | x_t, h2_{t-1})  (separate GRU state)
         self.predict_z = nn.Sequential(
-            nn.Linear(h_dim + h_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
-        self.predict_mean = nn.Sequential(nn.Linear(h_dim, z_dim),
-                                          nn.LeakyReLU(0.1))
-        self.predict_std = nn.Sequential(
-            nn.Linear(h_dim, z_dim),
-            nn.Softplus())
+            nn.Linear(h_dim * 2, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
+        self.predict_mean = nn.Linear(h_dim, z_dim)
+        self.predict_std = nn.Sequential(nn.Linear(h_dim, z_dim), nn.Softplus())
 
-        # decoder
+        # Decoder: p(y_t | z_t, x_t, h_{t-1})
         self.dec = nn.Sequential(
-            nn.Linear(h_dim + h_dim + h_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
-
+            nn.Linear(h_dim * 3, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
         self.dec_prior = nn.Sequential(
-            nn.Linear(h_dim + h_dim + h_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
-
+            nn.Linear(h_dim * 3, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
         self.dec_predict = nn.Sequential(
-            nn.Linear(h_dim + h_dim + h_dim, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim),
-            nn.ReLU())
-
-        #self.dec_mean = nn.Sequential(nn.Linear(h_dim, label_dim))
+            nn.Linear(h_dim * 3, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+        )
         self.dec_mean = nn.Sequential(
-            nn.Linear(h_dim, h_dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(h_dim, input_dim*label_dim),
-            nn.LeakyReLU(0.1))
+            nn.Linear(h_dim, h_dim), nn.ReLU(),
+            nn.Linear(h_dim, label_dim),
+        )
+        self.dec_std = nn.Sequential(nn.Linear(h_dim, label_dim), nn.Softplus())
 
-        self.dec_std = nn.Sequential(
-            nn.Linear(h_dim, input_dim*label_dim),
-            nn.Softplus())
+        # Recurrence modules
+        self.rnn = nn.GRUCell(h_dim * 2, h_dim)   # reconstruction path
+        self.rnn2 = nn.GRUCell(h_dim * 2, h_dim)  # prediction path
 
-        self.rnn = nn.GRUCell(h_dim*2, h_dim)
-        self.rnn2 = nn.GRUCell(h_dim*2, h_dim)
-
-    def reucrrence(self, x_t, y_t, h, h2, recording=True):
-        # x shape (seq_len,Batch_size, feature_dim)
-
+    # ------------------------------------------------------------------
+    # Core recurrence step
+    # ------------------------------------------------------------------
+    def _recurrence_step(self, x_t, y_t, h, h2):
         phi_x_t = self.phi_x(x_t)
         phi_y_t = self.phi_y(y_t)
 
-        # encoding
-        enc_t = self.enc(torch.cat([phi_x_t, phi_y_t, h], 1))
-        enc_mean_t = self.enc_mean(enc_t)
-        enc_std_t = self.enc_std(enc_t)
-        # prior
-        prior_t = self.prior(torch.cat([phi_x_t, h], 1))
-        prior_mean_t = self.prior_mean(prior_t)
-        prior_std_t = self.prior_std(prior_t)
+        # --- Encoder (inference) ---
+        enc_in = torch.cat([phi_x_t, phi_y_t, h], dim=1)
+        enc_out = self.enc(enc_in)
+        enc_mean_t = self.enc_mean(enc_out)
+        enc_std_t = self.enc_std(enc_out)
 
-        # prediction model doesn't share the encoder with reconstruction model
-        # predict model only considering x
-        predict_t = self.predict_z(torch.cat([phi_x_t, h2], 1))
-        predict_mean_t = self.predict_mean(predict_t)
-        predict_std_t = self.predict_std(predict_t)
-        # sampling and reparamerization
+        # --- Prior ---
+        prior_in = torch.cat([phi_x_t, h], dim=1)
+        prior_out = self.prior(prior_in)
+        prior_mean_t = self.prior_mean(prior_out)
+        prior_std_t = self.prior_std(prior_out)
 
-        z_t = self._reparameterized_sample(enc_mean_t, enc_std_t)
+        # --- Prediction prior ---
+        pred_in = torch.cat([phi_x_t, h2], dim=1)
+        pred_out = self.predict_z(pred_in)
+        predict_mean_t = self.predict_mean(pred_out)
+        predict_std_t = self.predict_std(pred_out)
 
-        z_t_prior = self._reparameterized_sample(prior_mean_t, prior_std_t)
-
-        z_t_predict = self._reparameterized_sample(
-            predict_mean_t, predict_std_t)
+        # --- Reparameterized samples ---
+        z_t = self._reparameterize(enc_mean_t, enc_std_t)
+        z_t_prior = self._reparameterize(prior_mean_t, prior_std_t)
+        z_t_predict = self._reparameterize(predict_mean_t, predict_std_t)
 
         phi_z_t = self.phi_z(z_t)
-        #phi_z_t_prior = self.phi_z(z_t_prior)
-
         phi_z_t_prior = self.phi_z(z_t_prior)
         phi_z_t_predict = self.phi_z(z_t_predict)
 
-        # decoding
-        #dec_t = self.dec(torch.cat([phi_z_t, h],1))
-        # dec_t condition on x_t and z_t
-        dec_t = self.dec(torch.cat([phi_x_t, phi_z_t, h], 1))
-        dec_mean_t = self.dec_mean(dec_t)
-        # print(dec_mean_t.detach().cpu().numpy())
+        # --- Decoder (reconstruction) --- conditions on x_t, z_t, h
+        dec_in = torch.cat([phi_x_t, phi_z_t, h], dim=1)
+        dec_out = self.dec(dec_in)
+        dec_mean_t = self.dec_mean(dec_out)
+        dec_std_t = self.dec_std(dec_out)
 
-        dec_std_t = self.dec_std(dec_t)
+        # --- Decoder (prior) --- conditions on x_t, z_t_prior, h
+        dec_p_in = torch.cat([phi_x_t, phi_z_t_prior, h], dim=1)
+        dec_p_out = self.dec_prior(dec_p_in)
+        dec_mean_t_prior = self.dec_mean(dec_p_out)
+        dec_std_t_prior = self.dec_std(dec_p_out)
 
-        # the mean and std decoders are sharing
-        # y_t condition on x_t and z_t
-        dec_t_prior = self.dec_prior(torch.cat([phi_x_t, phi_z_t_prior, h], 1))
-        dec_mean_t_prior = self.dec_mean(dec_t_prior)
-        # print(dec_mean_t_prior.detach().cpu().numpy())
-        dec_std_t_prior = self.dec_std(dec_t_prior)
+        # --- Decoder (predict) --- conditions on x_t, z_t_predict, h2
+        dec_pr_in = torch.cat([phi_x_t, phi_z_t_predict, h2], dim=1)
+        dec_pr_out = self.dec_predict(dec_pr_in)
+        dec_mean_t_predict = self.dec_mean(dec_pr_out)
+        dec_std_t_predict = self.dec_std(dec_pr_out)
 
-        # y_t condition on x_t and z_t
-        dec_t_predict = self.dec_predict(
-            torch.cat([phi_x_t, phi_z_t_predict, h2], 1))
-        dec_mean_t_predict = self.dec_mean(dec_t_predict)
-        # print(dec_mean_t_predict.detach().cpu().numpy())
-        dec_std_t_predict = self.dec_std(dec_t_predict)
+        # --- Store intermediates ---
+        self.Z_mean.append(enc_mean_t)
+        self.Z_std.append(enc_std_t)
+        self.Xr_mean.append(dec_mean_t)
+        self.Xr_std.append(dec_std_t)
 
-        if recording:
-            self.h_chain.append(h)
-            self.h2_chain.append(h2)
+        self.pZ_mean.append(prior_mean_t)
+        self.pZ_std.append(prior_std_t)
+        self.Xr_mean_prior.append(dec_mean_t_prior)
+        self.Xr_std_prior.append(dec_std_t_prior)
 
-            self.Z_mean.append(enc_mean_t)
-            self.Z_std.append(enc_std_t)
-            self.Xr_mean.append(dec_mean_t)
-            self.Xr_std.append(dec_std_t)
+        self.Z_mean_predict.append(predict_mean_t)
+        self.Z_std_predict.append(predict_std_t)
+        self.Xr_mean_predict.append(dec_mean_t_predict)
+        self.Xr_std_predict.append(dec_std_t_predict)
 
-            self.pZ_mean.append(prior_mean_t)
-            self.pZ_std.append(prior_std_t)
-            self.Xr_mean_prior.append(dec_mean_t_prior)
-            self.Xr_std_prior.append(dec_std_t_prior)
+        self.h_chain.append(h)
+        self.h2_chain.append(h2)
 
-            self.Z_mean_predict.append(predict_mean_t)
-            self.Z_std_predict.append(predict_std_t)
-            self.Xr_mean_predict.append(dec_mean_t_predict)
-            self.Xr_std_predict.append(dec_std_t_predict)
+        # --- Update hidden states ---
+        h_new = self.rnn(torch.cat([phi_x_t, phi_z_t], dim=1), h)
+        h2_new = self.rnn2(torch.cat([phi_x_t, phi_z_t_predict], dim=1), h2)
+        return h_new, h2_new
 
-        # h is the hidden state of reconstruction model
-        h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1), h)
-        # h2 is the hidden state of prediction model
-        h2 = self.rnn2(torch.cat([phi_x_t, phi_z_t_predict], 1), h2)
-        return h, h2
-
-    def predict(self, X, SMC_iter=1):
-        # X_shape: (T,batch_size,M,SMC_iter)
-
-        # (Batch_size, seq_len, feature_dim)
-        X_emb = torch.squeeze(self.embedding(X), dim=-1)
-
-        mu_rec_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        std_rec_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        for i in range(SMC_iter):
-            h2 = torch.zeros(X.shape[1], self.h_dim).to(self.device)
-            for t in range(X.shape[0]):
-                x_t = X_emb[t]
-                phi_x_t = self.phi_x(x_t)
-                # encoding
-                predict_t = self.prior(torch.cat([phi_x_t, h2], 1))
-                predict_mean_t = self.prior_mean(predict_t)
-                predict_std_t = self.prior_std(predict_t)
-                # sampling and reparamerization
-
-                z_t = predict_mean_t
-
-                phi_z_t = self.phi_z(z_t)
-
-                # decoding
-                dec_t = self.dec(torch.cat([phi_x_t, phi_z_t, h2], 1))
-                dec_mean_t = self.dec_mean(dec_t)
-                dec_std_t = self.dec_std(dec_t)
-                mu_rec_chain[t, :, :, i] = dec_mean_t.detach().cpu().numpy()
-                std_rec_chain[t, :, :, i] = dec_std_t.detach().cpu().numpy()
-
-                h2 = self.rnn2(torch.cat([phi_x_t, phi_z_t], 1), h2)
-        return mu_rec_chain.mean(axis=3), std_rec_chain.mean(axis=3)
-
-    def predict_withLabel(self, X, Y, SMC_iter=1):
-        # X_shape: (T,batch_size,M,SMC_iter)
-        # (Batch_size, seq_len, feature_dim)
-        X_emb = torch.squeeze(self.embedding(X), dim=-1)
-        # (Batch_size, seq_len, feature_dim)
-        Y_emb = torch.squeeze(self.embedding(Y), dim=-1)
-
-        Y = Y.view(Y.shape[0], Y.shape[1], self.input_dim*self.label_dim)
-        mu_rec_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        std_rec_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        score_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        for i in range(SMC_iter):
-            h2 = torch.zeros(X.shape[1], self.h_dim).to(self.device)
-            for t in range(X.shape[0]):
-                x_t = X_emb[t]
-                y_emb_t = Y_emb[t]
-                y_t = Y[t]
-                phi_x_t = self.phi_x(x_t)
-                # encoding
-                predict_t = self.prior(torch.cat([phi_x_t, h2], 1))
-                predict_mean_t = self.prior_mean(predict_t)
-                predict_std_t = self.prior_std(predict_t)
-                # sampling and reparamerization
-
-                z_t = predict_mean_t
-
-                phi_z_t = self.phi_z(z_t)
-
-                # decoding
-                dec_t = self.dec(torch.cat([phi_x_t, phi_z_t, h2], 1))
-                dec_mean_t = self.dec_mean(dec_t)
-                dec_std_t = self.dec_std(dec_t)
-                mu_rec_chain[t, :, :, i] = dec_mean_t.detach().cpu().numpy()
-                std_rec_chain[t, :, :, i] = dec_std_t.detach().cpu().numpy()
-                score_chain[t, :, :, i] = -stats.norm.pdf(y_t.cpu().numpy(),
-                                                          dec_mean_t.detach().cpu().numpy(),
-                                                          dec_std_t.detach().cpu().numpy())
-                h2 = self.rnn2(torch.cat([phi_x_t, phi_z_t], 1), h2)
-        return mu_rec_chain.mean(axis=3), std_rec_chain.mean(axis=3), score_chain.mean(axis=3)
-
-    def reconstruct(self, X, Y, SMC_iter=1, is_prior=False, is_predict=False):
-        # Iuput X shape : (seq_len, input_dim, feature_dim)
-        # Input label shape: (Batch_size,seq_len,input_dim)
-
-        # (Batch_size, seq_len, feature_dim)
-        X_emb = torch.squeeze(self.embedding(X), dim=-1)
-
-        # (Batch_size, seq_len, feature_dim)
-        Y_emb = torch.squeeze(self.embedding(Y), dim=-1)
-
-        Y = Y.view(Y.shape[0], Y.shape[1], self.input_dim*self.label_dim)
-        mu_rec_chain = np.zeros(
-            shape=(Y.shape[0], Y.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        std_rec_chain = np.zeros(
-            shape=(Y.shape[0], Y.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        score_chain = np.zeros(
-            shape=(Y.shape[0], Y.shape[1], self.input_dim*self.label_dim, SMC_iter))
-        for i in range(SMC_iter):
-            h = torch.zeros(X.shape[1], self.h_dim).to(self.device)
-            for t in range(X.shape[0]):
-                x_t = X_emb[t]
-                y_emb_t = Y_emb[t]
-                y_t = Y[t]
-                phi_x_t = self.phi_x(x_t)
-                phi_y_t = self.phi_y(y_emb_t)
-                # encoding
-                enc_t = self.enc(torch.cat([phi_x_t, phi_y_t, h], 1))
-                enc_mean_t = self.enc_mean(enc_t)
-                enc_std_t = self.enc_std(enc_t)
-                # prior
-                prior_t = self.prior(torch.cat([phi_x_t, h], 1))
-                prior_mean_t = self.prior_mean(prior_t)
-                prior_std_t = self.prior_std(prior_t)
-                # sampling and reparamerization
-
-                if(not is_prior):
-                    z_t = enc_mean_t
-                else:
-                    z_t = prior_mean_t
-
-                phi_z_t = self.phi_z(z_t)
-
-                # decoding
-                dec_t = self.dec(torch.cat([phi_x_t, phi_z_t, h], 1))
-                dec_mean_t = self.dec_mean(dec_t)
-                dec_std_t = self.dec_std(dec_t)
-                mu_rec_chain[t, :, :, i] = dec_mean_t.detach().cpu().numpy()
-                std_rec_chain[t, :, :, i] = dec_std_t.detach().cpu().numpy()
-                score_chain[t, :, :, i] = -stats.norm.pdf(y_t.cpu().numpy(),
-                                                          dec_mean_t.detach().cpu().numpy(),
-                                                          dec_std_t.detach().cpu().numpy())
-                h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1), h)
-        return mu_rec_chain.mean(axis=3), std_rec_chain.mean(axis=3), score_chain.mean(axis=3)
-
-    def reconstruct_single(self, X, SMC_iter=10):
-        SMC_iter = 10
-        mu_rec_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], X.shape[2], SMC_iter))
-        std_rec_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], X.shape[2], SMC_iter))
-        df_rec_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], X.shape[2], SMC_iter))
-        score_chain = np.zeros(
-            shape=(X.shape[0], X.shape[1], X.shape[2], SMC_iter))
-        for i in range(SMC_iter):
-            h = torch.zeros(X.shape[1], self.h_dim).to(self.device)
-            for t in range(X.shape[0]):
-                x_t = X[t]
-                phi_x_t = self.phi_x(x_t)
-                # encoding
-                enc_t = self.enc(torch.cat([phi_x_t, h], 1))
-                enc_mean_t = self.enc_mean(enc_t)
-                enc_std_t = self.enc_std(enc_t)
-                # prior
-                prior_t = self.prior(h)
-                prior_mean_t = self.prior_mean(prior_t)
-                prior_std_t = self.prior_std(prior_t)
-                # sampling and reparamerization
-                z_t = self._reparameterized_sample(enc_mean_t, enc_std_t)
-                phi_z_t = self.phi_z(z_t)
-
-                # decoding
-                dec_t = self.dec(torch.cat([phi_z_t, h], 1))
-                dec_mean_t = self.dec_mean(dec_t)
-                dec_std_t = self.dec_std(dec_t)
-
-                mu_rec_chain[t, :, :, i] = dec_mean_t.detach().cpu().numpy()
-                std_rec_chain[t, :, :, i] = dec_std_t.detach().cpu().numpy()
-                score_chain[t, :, :, i] = -stats.norm.pdf(x_t.cpu().numpy(),
-                                                          dec_mean_t.detach().cpu().numpy(),
-                                                          dec_std_t.detach().cpu().numpy())
-                h = self.rnn(torch.cat([phi_x_t, phi_z_t], 1), h)
-        return mu_rec_chain.mean(axis=3), std_rec_chain.mean(axis=3), score_chain.mean(axis=3)
-
+    # ------------------------------------------------------------------
+    # Forward pass (training)
+    # ------------------------------------------------------------------
     def forward(self, X, Y):
-        # Iuput X shape : ( seq_len, Batch_size, feature_dim, input_dim)
-        # (Batch_size, seq_len, feature_dim)
-        X_emb = torch.squeeze(self.embedding(X), dim=-1)
-
-        # ( seq_len, Batch_size,feature_dim)
-        Y_emb = torch.squeeze(self.embedding(Y), dim=-1)
-
+        # X: (seq_len, batch, x_dim)
+        # Y: (seq_len, batch, label_dim)
         self._reset_variables()
-        h = torch.zeros(X.shape[1], self.h_dim).to(self.device)
-        h2 = torch.zeros(X.shape[1], self.h_dim).to(self.device)
+        h = torch.zeros(X.shape[1], self.h_dim, device=self.device)
+        h2 = torch.zeros(X.shape[1], self.h_dim, device=self.device)
 
         for t in range(X.shape[0]):
-            x_t = X_emb[t]
-            y_t = Y_emb[t]
-            h, h2 = self.reucrrence(x_t, y_t, h, h2)
+            h, h2 = self._recurrence_step(X[t], Y[t], h, h2)
 
-        self.kld_loss, self.nll_loss, self.smooth_loss, self.kld_loss_predict, self.nll_loss_prior, self.nll_loss_predict, self.smooth_loss_prior = self.calc_loss(
-            Y)
+        self.kld_loss, self.nll_loss, self.smooth_loss, \
+            self.kld_loss_predict, self.nll_loss_prior, \
+            self.nll_loss_predict, self.smooth_loss_prior = self._calc_loss(Y)
 
+    # ------------------------------------------------------------------
+    # Reconstruction (test-time, uses both X and Y)
+    # ------------------------------------------------------------------
+    def reconstruct(self, X, Y, n_mc: int = 1):
+        """
+        Reconstruct Y from X and Y using the encoder pathway.
+
+        Returns:
+            mu:    (seq_len, batch, label_dim, n_mc) -> averaged over MC
+            std:   (seq_len, batch, label_dim, n_mc) -> averaged over MC
+            score: (seq_len, batch, label_dim, n_mc) -> NLL score per timestep
+        """
+        X_np = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
+        Y_np = Y.cpu().numpy() if isinstance(Y, torch.Tensor) else Y
+        seq_len, batch_size = X_np.shape[0], X_np.shape[1]
+
+        mu_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+        std_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+        score_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+
+        for i in range(n_mc):
+            h = torch.zeros(batch_size, self.h_dim, device=self.device)
+            for t in range(seq_len):
+                x_t = torch.as_tensor(X_np[t], dtype=torch.float32, device=self.device)
+                y_t = torch.as_tensor(Y_np[t], dtype=torch.float32, device=self.device)
+                y_t_flat = y_t
+
+                phi_x_t = self.phi_x(x_t)
+                phi_y_t = self.phi_y(y_t)
+
+                enc_out = self.enc(torch.cat([phi_x_t, phi_y_t, h], dim=1))
+                enc_mean_t = self.enc_mean(enc_out)
+
+                phi_z_t = self.phi_z(enc_mean_t)
+                dec_out = self.dec(torch.cat([phi_x_t, phi_z_t, h], dim=1))
+                dec_mean_t = self.dec_mean(dec_out)
+                dec_std_t = self.dec_std(dec_out)
+
+                mu_chain[t, :, :, i] = dec_mean_t.detach().cpu().numpy()
+                std_chain[t, :, :, i] = dec_std_t.detach().cpu().numpy()
+
+                nll = -stats.norm.logpdf(
+                    y_t_flat.cpu().numpy(),
+                    loc=dec_mean_t.detach().cpu().numpy(),
+                    scale=dec_std_t.detach().cpu().numpy(),
+                )
+                score_chain[t, :, :, i] = nll
+
+                h = self.rnn(torch.cat([phi_x_t, phi_z_t], dim=1), h)
+
+        return mu_chain.mean(axis=3), std_chain.mean(axis=3), score_chain.mean(axis=3)
+
+    # ------------------------------------------------------------------
+    # Prediction (test-time, uses only X — no Y available)
+    # ------------------------------------------------------------------
+    def predict(self, X, n_mc: int = 1):
+        """
+        Predict Y from X only (using the prediction pathway).
+
+        Returns:
+            mu:  (seq_len, batch, label_dim, n_mc) -> averaged
+            std: (seq_len, batch, label_dim, n_mc) -> averaged
+        """
+        X_np = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
+        seq_len, batch_size = X_np.shape[0], X_np.shape[1]
+
+        mu_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+        std_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+
+        for i in range(n_mc):
+            h2 = torch.zeros(batch_size, self.h_dim, device=self.device)
+            for t in range(seq_len):
+                x_t = torch.as_tensor(X_np[t], dtype=torch.float32, device=self.device)
+                phi_x_t = self.phi_x(x_t)
+
+                pred_out = self.predict_z(torch.cat([phi_x_t, h2], dim=1))
+                pred_mean_t = self.predict_mean(pred_out)
+
+                phi_z_t = self.phi_z(pred_mean_t)
+                dec_out = self.dec_predict(torch.cat([phi_x_t, phi_z_t, h2], dim=1))
+                dec_mean_t = self.dec_mean(dec_out)
+                dec_std_t = self.dec_std(dec_out)
+
+                mu_chain[t, :, :, i] = dec_mean_t.detach().cpu().numpy()
+                std_chain[t, :, :, i] = dec_std_t.detach().cpu().numpy()
+
+                h2 = self.rnn2(torch.cat([phi_x_t, phi_z_t], dim=1), h2)
+
+        return mu_chain.mean(axis=3), std_chain.mean(axis=3)
+
+    # ------------------------------------------------------------------
+    # Prediction with labels (evaluates NLL score)
+    # ------------------------------------------------------------------
+    def predict_with_label(self, X, Y, n_mc: int = 1):
+        """
+        Predict Y from X only (prediction pathway) and compute NLL score
+        against the true Y.
+
+        Returns:
+            mu, std, score — each shape (seq_len, batch, label_dim)
+        """
+        X_np = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
+        Y_np = Y.cpu().numpy() if isinstance(Y, torch.Tensor) else Y
+        seq_len, batch_size = X_np.shape[0], X_np.shape[1]
+
+        mu_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+        std_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+        score_chain = np.zeros((seq_len, batch_size, self.label_dim, n_mc))
+
+        for i in range(n_mc):
+            h2 = torch.zeros(batch_size, self.h_dim, device=self.device)
+            for t in range(seq_len):
+                x_t = torch.as_tensor(X_np[t], dtype=torch.float32, device=self.device)
+                y_t = torch.as_tensor(Y_np[t], dtype=torch.float32, device=self.device)
+                phi_x_t = self.phi_x(x_t)
+
+                pred_out = self.predict_z(torch.cat([phi_x_t, h2], dim=1))
+                pred_mean_t = self.predict_mean(pred_out)
+
+                phi_z_t = self.phi_z(pred_mean_t)
+                dec_out = self.dec_predict(torch.cat([phi_x_t, phi_z_t, h2], dim=1))
+                dec_mean_t = self.dec_mean(dec_out)
+                dec_std_t = self.dec_std(dec_out)
+
+                mu_chain[t, :, :, i] = dec_mean_t.detach().cpu().numpy()
+                std_chain[t, :, :, i] = dec_std_t.detach().cpu().numpy()
+
+                nll = -stats.norm.logpdf(
+                    y_t.cpu().numpy(),
+                    loc=dec_mean_t.detach().cpu().numpy(),
+                    scale=dec_std_t.detach().cpu().numpy(),
+                )
+                score_chain[t, :, :, i] = nll
+
+                h2 = self.rnn2(torch.cat([phi_x_t, phi_z_t], dim=1), h2)
+
+        return mu_chain.mean(axis=3), std_chain.mean(axis=3), score_chain.mean(axis=3)
+
+    # ------------------------------------------------------------------
+    # Extract latent variables for downstream diagnosis
+    # ------------------------------------------------------------------
+    def extract_latents(self, X, Y):
+        """
+        Extract z_post (encoder latent) and z_prior (prior latent) for each timestep.
+        Returns z_post, z_prior as numpy arrays of shape (seq_len, batch, z_dim).
+        """
+        X_np = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
+        Y_np = Y.cpu().numpy() if isinstance(Y, torch.Tensor) else Y
+        seq_len, batch_size = X_np.shape[0], X_np.shape[1]
+
+        z_post_chain = np.zeros((seq_len, batch_size, self.z_dim))
+        z_prior_chain = np.zeros((seq_len, batch_size, self.z_dim))
+        z_pred_chain = np.zeros((seq_len, batch_size, self.z_dim))
+
+        h = torch.zeros(batch_size, self.h_dim, device=self.device)
+        h2 = torch.zeros(batch_size, self.h_dim, device=self.device)
+
+        for t in range(seq_len):
+            x_t = torch.as_tensor(X_np[t], dtype=torch.float32, device=self.device)
+            y_t = torch.as_tensor(Y_np[t], dtype=torch.float32, device=self.device)
+            phi_x_t = self.phi_x(x_t)
+            phi_y_t = self.phi_y(y_t)
+
+            enc_out = self.enc(torch.cat([phi_x_t, phi_y_t, h], dim=1))
+            z_post = self.enc_mean(enc_out)
+
+            prior_out = self.prior(torch.cat([phi_x_t, h], dim=1))
+            z_prior = self.prior_mean(prior_out)
+
+            pred_out = self.predict_z(torch.cat([phi_x_t, h2], dim=1))
+            z_pred = self.predict_mean(pred_out)
+
+            z_post_chain[t] = z_post.detach().cpu().numpy()
+            z_prior_chain[t] = z_prior.detach().cpu().numpy()
+            z_pred_chain[t] = z_pred.detach().cpu().numpy()
+
+            phi_z_t = self.phi_z(z_post)
+            phi_z_p = self.phi_z(z_pred)
+            h = self.rnn(torch.cat([phi_x_t, phi_z_t], dim=1), h)
+            h2 = self.rnn2(torch.cat([phi_x_t, phi_z_p], dim=1), h2)
+
+        return z_post_chain, z_prior_chain, z_pred_chain
+
+    # ------------------------------------------------------------------
+    # Internal: reset stored variables
+    # ------------------------------------------------------------------
     def _reset_variables(self):
-        # defined variables
         self.Z_mean, self.Z_std = [], []
-        self.Xr_mean, self.Xr_std, self.Xr_df = [], [], []
+        self.Xr_mean, self.Xr_std = [], []
         self.pZ_mean, self.pZ_std = [], []
-        self.h_chain = []
-        self.h2_chain = []
+        self.h_chain, self.h2_chain = [], []
 
-        self.Xr_mean_prior, self.Xr_std_prior, self.Xr_df_prior = [], [], []
-
+        self.Xr_mean_prior, self.Xr_std_prior = [], []
         self.Xr_mean_predict, self.Xr_std_predict = [], []
         self.Z_mean_predict, self.Z_std_predict = [], []
 
-        # defined losses
-        self.kld_loss = 0
-        self.nll_loss = 0
-        self.smooth_loss = 0
+        self.kld_loss = 0.0
+        self.nll_loss = 0.0
+        self.smooth_loss = 0.0
+        self.kld_loss_predict = 0.0
+        self.nll_loss_prior = 0.0
+        self.nll_loss_predict = 0.0
+        self.smooth_loss_prior = 0.0
 
-        self.kld_loss_prior = 0
-        self.nll_loss_prior = 0
-        self.smooth_loss_prior = 0
+    # ------------------------------------------------------------------
+    # Internal: compute ELBO and auxiliary losses
+    # ------------------------------------------------------------------
+    def _calc_loss(self, Y):
+        Y_flat = Y.view(Y.shape[0], Y.shape[1], -1)
+        T = len(self.h_chain)
 
-    def calc_loss(self, X):
-        # seq_len,batch_size,input_dim*feature_dim)
-        X = X.view(X.shape[0], X.shape[1], -1)
-        kld_loss = 0
-        kld_loss_predict = 0
-        nll_loss = 0
-        nll_loss_prior = 0
-        nll_loss_predict = 0
-        smooth_loss = torch.FloatTensor([0]).to(self.device)
-        smooth_loss_prior = torch.FloatTensor([0]).to(self.device)
-        for t in range(len(self.h_chain)):
-            normal_t = Normal(self.Xr_mean[t], self.Xr_std[t])
-            normal_t_prior = Normal(
-                self.Xr_mean_prior[t], self.Xr_std_prior[t])
-            normal_t_predict = Normal(
-                self.Xr_mean_predict[t], self.Xr_std_predict[t])
-            #dec_studentT = StudentT(dec_df,dec_mean,dec_std)
-            kld_loss = kld_loss + self._kld_gauss(self.Z_mean[t], self.Z_std[t],
-                                                  self.pZ_mean[t], self.pZ_std[t])
+        kld_loss = torch.tensor(0.0, device=self.device)
+        kld_loss_predict = torch.tensor(0.0, device=self.device)
+        nll_loss = torch.tensor(0.0, device=self.device)
+        nll_loss_prior = torch.tensor(0.0, device=self.device)
+        nll_loss_predict = torch.tensor(0.0, device=self.device)
+        smooth_loss = torch.tensor(0.0, device=self.device)
+        smooth_loss_prior = torch.tensor(0.0, device=self.device)
 
-            kld_loss_predict = kld_loss_predict + self._kld_gauss(self.Z_mean[t], self.Z_std[t],
-                                                                  self.Z_mean_predict[t], self.Z_std_predict[t])
+        for t in range(T):
+            # KL divergence: posterior || prior
+            kld_loss = kld_loss + _kld_gauss(
+                self.Z_mean[t], self.Z_std[t],
+                self.pZ_mean[t], self.pZ_std[t],
+            )
+            # KL divergence: posterior || predict
+            kld_loss_predict = kld_loss_predict + _kld_gauss(
+                self.Z_mean[t], self.Z_std[t],
+                self.Z_mean_predict[t], self.Z_std_predict[t],
+            )
+            # Reconstruction NLL
+            dist_post = Normal(self.Xr_mean[t], self.Xr_std[t])
+            nll_loss = nll_loss - dist_post.log_prob(Y_flat[t]).sum()
 
-            nll_loss = nll_loss - normal_t.log_prob(X[t]).sum()
-            nll_loss_prior = nll_loss_prior - \
-                normal_t_prior.log_prob(X[t]).sum()
-            nll_loss_predict = nll_loss_predict - \
-                normal_t_predict.log_prob(X[t]).sum()
+            dist_prior = Normal(self.Xr_mean_prior[t], self.Xr_std_prior[t])
+            nll_loss_prior = nll_loss_prior - dist_prior.log_prob(Y_flat[t]).sum()
 
-        for t in range(len(self.h_chain)-1):
-            smooth_loss = smooth_loss + self._kld_gauss(self.Xr_mean[t], self.Xr_std[t],
-                                                        self.Xr_mean[t+1], self.Xr_std[t+1])
-            smooth_loss_prior = smooth_loss_prior + self._kld_gauss(self.Xr_mean_prior[t], self.Xr_std_prior[t],
-                                                                    self.Xr_mean_prior[t+1], self.Xr_std_prior[t+1])
+            dist_pred = Normal(self.Xr_mean_predict[t], self.Xr_std_predict[t])
+            nll_loss_predict = nll_loss_predict - dist_pred.log_prob(Y_flat[t]).sum()
 
-        return kld_loss, nll_loss, smooth_loss, kld_loss_predict, nll_loss_prior, nll_loss_predict, smooth_loss_prior
+        for t in range(T - 1):
+            smooth_loss = smooth_loss + _kld_gauss(
+                self.Xr_mean[t], self.Xr_std[t],
+                self.Xr_mean[t + 1], self.Xr_std[t + 1],
+            )
+            smooth_loss_prior = smooth_loss_prior + _kld_gauss(
+                self.Xr_mean_prior[t], self.Xr_std_prior[t],
+                self.Xr_mean_prior[t + 1], self.Xr_std_prior[t + 1],
+            )
 
-    def _reparameterized_sample(self, mean, std):
-        """using std to sample"""
-        eps = torch.FloatTensor(std.size()).normal_().to(self.device)
-        eps = Variable(eps)
-        return eps.mul(std).add_(mean)
+        return kld_loss, nll_loss, smooth_loss, kld_loss_predict, \
+            nll_loss_prior, nll_loss_predict, smooth_loss_prior
 
-    def _kld_gauss(self, mean_1, std_1, mean_2, std_2):
-        """Using std to compute KLD"""
-        kld_element = (2 * torch.log(std_2) - 2 * torch.log(std_1) +
-                       (std_1.pow(2) + (mean_1 - mean_2).pow(2)) /
-                       std_2.pow(2) - 1)
-        return 0.5 * torch.sum(kld_element)
-
-    def _nll_gauss(self, mean, std, x):
-        return torch.sum(
-            0.5*torch.log(torch.Tensor([2*np.pi]).to(self.device))
-            + 0.5*torch.log(std**2)
-            + 0.5 * (mean-x)**2 / std**2)
-
-
-def windowing(ts, anomaly_mask=None, window_size=50):
-    chunks = []
-    anomaly_label = []
-    for t in range(ts.shape[-1] - window_size+1):
-        if anomaly_mask is not None:
-            anomaly_label.append(anomaly_mask[:, t:t+window_size])
-        chunks.append(ts[:, t:t+window_size])
-    if anomaly_mask is not None:
-        return np.stack(chunks).swapaxes(2, 1), np.stack(anomaly_label).swapaxes(2, 1)
-    return np.stack(chunks).swapaxes(2, 1)
+    # ------------------------------------------------------------------
+    # Reparameterization trick
+    # ------------------------------------------------------------------
+    def _reparameterize(self, mean, std):
+        eps = torch.randn_like(std, device=self.device)
+        return eps * std + mean
 
 
-def windowing_gf(ts, anomaly_mask=None, window_size=50):
-    chunks = []
-    anomaly_label = []
-    for t in range(0, ts.shape[-1] - window_size+1, 20):
-        if anomaly_mask is not None:
-            anomaly_label.append(anomaly_mask[:, t:t+window_size])
-        chunks.append(ts[:, t:t+window_size])
-    if anomaly_mask is not None:
-        return np.stack(chunks).swapaxes(2, 1), np.stack(anomaly_label).swapaxes(2, 1)
-    return np.stack(chunks).swapaxes(2, 1)
+# =========================================================================
+# Utility functions
+# =========================================================================
+
+def _kld_gauss(mean_1, std_1, mean_2, std_2):
+    """KL divergence between two diagonal Gaussians."""
+    kld = (2 * torch.log(std_2 + 1e-8) - 2 * torch.log(std_1 + 1e-8)
+           + (std_1.pow(2) + (mean_1 - mean_2).pow(2)) / (std_2.pow(2) + 1e-8) - 1)
+    return 0.5 * torch.sum(kld)
 
 
-def windowing_true(ts, anomaly_mask=None, window_size=50):
-    chunks = []
-    anomaly_label = []
-    for t in range(ts.shape[-1] - window_size+1):
-        if anomaly_mask is not None:
-            anomaly_label.append(anomaly_mask[:, t:t+window_size])
-        chunks.append(ts[:, t:t+window_size])
-    if anomaly_mask is not None:
-        return np.stack(chunks).swapaxes(2, 1).swapaxes(0, 1), np.stack(anomaly_label).swapaxes(2, 1).swapaxes(0, 1)
-    return np.stack(chunks).swapaxes(2, 1).swapaxes(0, 1)
+def make_sliding_windows(data: np.ndarray, window_size: int, stride: int = 1) -> np.ndarray:
+    """Create sliding windows from 2D data.
+
+    Args:
+        data: shape (n_samples, n_features)
+        window_size: length of each window
+        stride: step between windows
+
+    Returns:
+        shape (n_windows, window_size, n_features)
+    """
+    if data.shape[0] < window_size:
+        raise ValueError(f"Not enough data ({data.shape[0]}) for window_size={window_size}")
+    n_windows = (data.shape[0] - window_size) // stride + 1
+    windows = np.zeros((n_windows, window_size, data.shape[1]), dtype=data.dtype)
+    for i in range(n_windows):
+        start = i * stride
+        windows[i] = data[start:start + window_size]
+    return windows
+
+
+def make_sliding_windows_with_labels(
+    data: np.ndarray,
+    labels: np.ndarray,
+    window_size: int,
+    stride: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create sliding windows with corresponding labels.
+
+    Window label = 1 if ANY point in the window has label > 0.
+    """
+    windows = make_sliding_windows(data, window_size, stride)
+    n_windows = windows.shape[0]
+    win_labels = np.zeros(n_windows, dtype=np.int32)
+    for i in range(n_windows):
+        start = i * stride
+        win_labels[i] = 1 if np.any(labels[start:start + window_size] > 0) else 0
+    return windows, win_labels

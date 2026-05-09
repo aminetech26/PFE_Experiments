@@ -103,7 +103,8 @@ stages:
       - src/data/preprocess_scvae.py
       - data/interim/ingestion/costa/costa_merged.parquet
     outs:
-      - data/processed/preprocessed/costa_scvae/scvae_preprocessed.parquet
+      - data/processed/preprocessed/costa_scvae/scvae_sequences.npz
+      - data/processed/preprocessed/costa_scvae/scvae_metadata.json
 
 
   # Stage 6: LSTM-AE Anomaly Detection
@@ -138,7 +139,9 @@ stages:
     deps:
       - src/modeling/anomaly_detection/dl/scvae_model.py
       - src/modeling/anomaly_detection/dl/train_scvae.py
-      - data/processed/preprocessed/costa_scvae/scvae_preprocessed.parquet
+      - src/modeling/anomaly_detection/dl/gvsao.py
+      - data/processed/preprocessed/costa_scvae/scvae_sequences.npz
+      - data/processed/preprocessed/costa_scvae/scvae_metadata.json
     metrics:
       - experiments/metrics/scvae_results.json:
           cache: false
