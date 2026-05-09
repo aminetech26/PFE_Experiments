@@ -28,7 +28,7 @@ import pandas as pd
 from loguru import logger
 from sklearn.model_selection import train_test_split
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_scvae"
 
