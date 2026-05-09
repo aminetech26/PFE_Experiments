@@ -140,7 +140,7 @@ def fit_prophet_residuals(
         return _fallback_linear_residuals(train_df, predict_dfs, target_col, regressor_cols)
 
     prop_data = pd.DataFrame({
-        "ds": pd.to_datetime(train_df["timestamp"]),
+        "ds": pd.to_datetime(train_df["timestamp"]).dt.tz_localize(None),
         "y": train_df[target_col].values.astype(float),
     })
 
@@ -163,7 +163,7 @@ def fit_prophet_residuals(
 
     results = []
     for df in predict_dfs:
-        future = pd.DataFrame({"ds": pd.to_datetime(df["timestamp"])})
+        future = pd.DataFrame({"ds": pd.to_datetime(df["timestamp"]).dt.tz_localize(None)})
         if regressor_cols:
             for col in regressor_cols:
                 if col in df.columns:
