@@ -314,7 +314,7 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess Costa data for SCVAE")
     parser.add_argument("--input", type=str, default=str(DEFAULT_INPUT))
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--window-size", type=int, default=72)
+    parser.add_argument("--window-size", type=int, default=32)
     parser.add_argument("--train-frac", type=float, default=0.70)
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--mad-retention", type=float, default=80.0)

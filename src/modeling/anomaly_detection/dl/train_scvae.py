@@ -11,13 +11,15 @@ Key features:
   - Data integrity checks before training
   - Leakage prevention validation
   - Multiple loss modes: 0 (KLD+NLL+smooth), 1 (+prior NLL), 2 (+predict KLD+NLL)
+  - KL annealing (β: 0→1 linear warmup over --kl-anneal-epochs)
+  - Free-bits constraint to prevent posterior collapse
   - Early stopping with patience
   - Model checkpointing and metrics logging
 
 Usage:
     uv run python -m src.modeling.anomaly_detection.dl.train_scvae
     uv run python -m src.modeling.anomaly_detection.dl.train_scvae --no-gvsao --lr 1e-5 --batch 256
-    uv run python -m src.modeling.anomaly_detection.dl.train_scvae --h-dim 512 --z-dim 128 --epochs 1000
+    uv run python -m src.modeling.anomaly_detection.dl.train_scvae --h-dim 128 --z-dim 32 --kl-anneal-epochs 50
 """
 
 from __future__ import annotations
@@ -101,7 +103,7 @@ def load_preprocessed_data(npz_path: Path, meta_path: Path) -> dict[str, Any]:
     result["conditional_features"] = meta.get("conditional_features", ["pvt", "irr"])
     result["target_features"] = meta.get("target_features", ["pdc1", "pdc2"])
     result["all_features"] = meta.get("all_features", result["conditional_features"] + result["target_features"])
-    result["window_size_original"] = meta.get("window_size", 72)
+    result["window_size_original"] = meta.get("window_size", 32)
     result["metadata"] = meta
 
     logger.info(f"Loaded preprocessed data from {npz_path}")
@@ -187,11 +189,16 @@ def _make_dataloader(X, Y, batch_size, shuffle=True):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
-def compute_elbo_loss(model, data, y_data, mode, reg, device):
-    """Compute the total loss from the SCVAE model."""
+def compute_elbo_loss(model, data, y_data, mode, reg, device, beta=1.0, free_bits=0.0):
+    """Compute the total loss from the SCVAE model.
+
+    Args:
+        beta: KL divergence weight (for KL annealing: 0→1 over warmup epochs).
+        free_bits: minimum nats per latent dimension before KL is penalized.
+    """
     data = data.permute(1, 0, 2).to(device)     # (T, B, M_x)
     y_data = y_data.permute(1, 0, 2).to(device)  # (T, B, M_y)
-    model(data, y_data)
+    model(data, y_data, beta=beta, free_bits=free_bits)
 
     if mode == 0:
         loss = model.kld_loss + model.nll_loss + reg * model.smooth_loss
@@ -206,13 +213,13 @@ def compute_elbo_loss(model, data, y_data, mode, reg, device):
     return loss
 
 
-def train_epoch(dataloader, model, optimizer, mode, reg, device):
+def train_epoch(dataloader, model, optimizer, mode, reg, device, beta=1.0, free_bits=0.0):
     model.train()
     total_loss = 0.0
     n_batches = 0
     for data, y_data in dataloader:
         optimizer.zero_grad()
-        loss = compute_elbo_loss(model, data, y_data, mode, reg, device)
+        loss = compute_elbo_loss(model, data, y_data, mode, reg, device, beta, free_bits)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -222,12 +229,12 @@ def train_epoch(dataloader, model, optimizer, mode, reg, device):
 
 
 @torch.no_grad()
-def val_epoch(dataloader, model, mode, reg, device):
+def val_epoch(dataloader, model, mode, reg, device, beta=1.0, free_bits=0.0):
     model.eval()
     total_loss = 0.0
     n_batches = 0
     for data, y_data in dataloader:
-        loss = compute_elbo_loss(model, data, y_data, mode, reg, device)
+        loss = compute_elbo_loss(model, data, y_data, mode, reg, device, beta, free_bits)
         total_loss += loss.item()
         n_batches += 1
     return total_loss / max(n_batches, 1)
@@ -330,9 +337,10 @@ def make_fitness_fn(
         patience = 3
         no_improve = 0
 
-        for _ in range(gvsao_epochs):
-            train_epoch(train_loader, model, optimizer, mode, reg, device)
-            val_loss = val_epoch(val_loader, model, mode, reg, device)
+        for epoch in range(gvsao_epochs):
+            beta = min(1.0, (epoch + 1) / max(gvsao_epochs, 1))
+            train_epoch(train_loader, model, optimizer, mode, reg, device, beta=beta, free_bits=0.0)
+            val_loss = val_epoch(val_loader, model, mode, reg, device, beta=beta, free_bits=0.0)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -372,11 +380,17 @@ def main():
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (skip GVSAO if set)")
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (skip GVSAO if set)")
     parser.add_argument("--no-gvsao", action="store_true", help="Skip GVSAO HPO")
-    parser.add_argument("--h-dim", type=int, default=512, help="Hidden layer dimension")
-    parser.add_argument("--z-dim", type=int, default=128, help="Latent variable dimension")
+    parser.add_argument("--h-dim", type=int, default=128, help="Hidden layer dimension")
+    parser.add_argument("--z-dim", type=int, default=32, help="Latent variable dimension")
     parser.add_argument("--mode", type=int, default=2, help="Loss mode: 0/1/2")
     parser.add_argument("--reg", type=float, default=0.0, help="Smoothness regularization")
-    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
+    parser.add_argument("--kl-anneal-epochs", type=int, default=50,
+                        help="KL annealing epochs (beta: 0→1 linear warmup, 0=disabled)")
+    parser.add_argument("--free-bits", type=float, default=0.5,
+                        help="Minimum nats per latent dim for KL (0=disabled, prevents posterior collapse)")
+    parser.add_argument("--beta", type=float, default=None,
+                        help="Fixed KL weight (overrides annealing if set)")
+    parser.add_argument("--patience", type=int, default=30, help="Early stopping patience")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -450,7 +464,8 @@ def main():
     # ── Train final model ───────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info(f"Step 4: Train SCVAE (lr={final_lr:.6f}, batch={final_batch_size}, "
-                 f"h={args.h_dim}, z={args.z_dim})")
+                 f"h={args.h_dim}, z={args.z_dim}, β_anneal={args.kl_anneal_epochs}ep, "
+                 f"free_bits={args.free_bits})")
     logger.info("=" * 60)
 
     model = SCVAE(
@@ -481,12 +496,22 @@ def main():
     t0 = time.perf_counter()
 
     for epoch in range(args.epochs):
+        # KL annealing: linear warmup from 0 to 1
+        if args.beta is not None:
+            beta = args.beta
+        elif args.kl_anneal_epochs > 0:
+            beta = min(1.0, (epoch + 1) / args.kl_anneal_epochs)
+        else:
+            beta = 1.0
+
         # Train
-        train_loss = train_epoch(train_loader, model, optimizer, args.mode, args.reg, device)
+        train_loss = train_epoch(train_loader, model, optimizer, args.mode, args.reg,
+                                 device, beta=beta, free_bits=args.free_bits)
         train_losses.append(train_loss)
 
         # Validate
-        val_loss = val_epoch(val_loader, model, args.mode, args.reg, device)
+        val_loss = val_epoch(val_loader, model, args.mode, args.reg, device,
+                             beta=beta, free_bits=args.free_bits)
         val_losses.append(val_loss)
         scheduler.step(val_loss)
 
@@ -499,7 +524,7 @@ def main():
             pr_aucs.append(float(val_pr))
 
             logger.info(
-                f"  Epoch {epoch+1:4d}/{args.epochs} | "
+                f"  Epoch {epoch+1:4d}/{args.epochs} | β={beta:.3f} | "
                 f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
                 f"val_PR-AUC={val_pr:.4f}"
             )
@@ -639,6 +664,9 @@ def main():
             "target_features": targ_cols,
             "loss_mode": args.mode,
             "smooth_reg": args.reg,
+            "kl_anneal_epochs": args.kl_anneal_epochs,
+            "free_bits": args.free_bits,
+            "fixed_beta": args.beta,
         },
         "training": {
             "learning_rate": final_lr,

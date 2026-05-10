@@ -69,8 +69,8 @@ def load_model(model_path: Path, device: torch.device) -> SCVAE:
     model = SCVAE(
         x_dim=checkpoint.get("x_dim", 2),
         label_dim=checkpoint.get("label_dim", 2),
-        h_dim=checkpoint.get("h_dim", 512),
-        z_dim=checkpoint.get("z_dim", 128),
+        h_dim=checkpoint.get("h_dim", 128),
+        z_dim=checkpoint.get("z_dim", 32),
         device=device,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])

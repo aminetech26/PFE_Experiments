@@ -16,8 +16,8 @@ Target: reconstruct PV power (pdc1, pdc2) conditioned on environmental
 measurements (irr, pvt), capturing temporal and conditional dependencies.
 
 Usage:
-    model = SCVAE(x_dim=2, label_dim=2, h_dim=512, z_dim=128)
-    # Training: call model(X, Y) then use model.kld_loss, model.nll_loss, etc.
+    model = SCVAE(x_dim=2, label_dim=2, h_dim=128, z_dim=32)
+    # Training: call model(X, Y, beta=0.5, free_bits=0.5) then use model.kld_loss, model.nll_loss, etc.
     # Test-time reconstruction: model.reconstruct(X, Y) -> (mu, std, score)
     # Test-time prediction (no Y): model.predict(X) -> (mu, std)
 """
@@ -36,8 +36,8 @@ class SCVAE(nn.Module):
         self,
         x_dim: int,
         label_dim: int,
-        h_dim: int = 512,
-        z_dim: int = 128,
+        h_dim: int = 128,
+        z_dim: int = 32,
         device: torch.device | None = None,
     ):
         super().__init__()
@@ -186,7 +186,7 @@ class SCVAE(nn.Module):
     # ------------------------------------------------------------------
     # Forward pass (training)
     # ------------------------------------------------------------------
-    def forward(self, X, Y):
+    def forward(self, X, Y, beta: float = 1.0, free_bits: float = 0.0):
         # X: (seq_len, batch, x_dim)
         # Y: (seq_len, batch, label_dim)
         self._reset_variables()
@@ -198,7 +198,7 @@ class SCVAE(nn.Module):
 
         self.kld_loss, self.nll_loss, self.smooth_loss, \
             self.kld_loss_predict, self.nll_loss_prior, \
-            self.nll_loss_predict, self.smooth_loss_prior = self._calc_loss(Y)
+            self.nll_loss_predict, self.smooth_loss_prior = self._calc_loss(Y, beta, free_bits)
 
     # ------------------------------------------------------------------
     # Reconstruction (test-time, uses both X and Y)
@@ -411,9 +411,13 @@ class SCVAE(nn.Module):
     # ------------------------------------------------------------------
     # Internal: compute ELBO and auxiliary losses
     # ------------------------------------------------------------------
-    def _calc_loss(self, Y):
+    def _calc_loss(self, Y, beta: float = 1.0, free_bits: float = 0.0):
         Y_flat = Y.view(Y.shape[0], Y.shape[1], -1)
         T = len(self.h_chain)
+        B = Y.shape[1]
+
+        # Free-bits minimum: free_bits nats per latent dim * per sample
+        fb_min = free_bits * B * self.z_dim
 
         kld_loss = torch.tensor(0.0, device=self.device)
         kld_loss_predict = torch.tensor(0.0, device=self.device)
@@ -425,23 +429,27 @@ class SCVAE(nn.Module):
 
         for t in range(T):
             # KL divergence: posterior || prior
-            kld_loss = kld_loss + _kld_gauss(
+            kld_t = _kld_gauss(
                 self.Z_mean[t], self.Z_std[t],
                 self.pZ_mean[t], self.pZ_std[t],
             )
+            kld_loss = kld_loss + _apply_free_bits(kld_t, fb_min)
+
             # KL divergence: posterior || predict
-            kld_loss_predict = kld_loss_predict + _kld_gauss(
+            kld_p_t = _kld_gauss(
                 self.Z_mean[t], self.Z_std[t],
                 self.Z_mean_predict[t], self.Z_std_predict[t],
             )
-            # Reconstruction NLL
-            dist_post = Normal(self.Xr_mean[t], self.Xr_std[t])
+            kld_loss_predict = kld_loss_predict + _apply_free_bits(kld_p_t, fb_min)
+
+            # Reconstruction NLL (per-sample mean for numerical stability)
+            dist_post = Normal(self.Xr_mean[t], self.Xr_std[t].clamp(min=1e-4))
             nll_loss = nll_loss - dist_post.log_prob(Y_flat[t]).sum()
 
-            dist_prior = Normal(self.Xr_mean_prior[t], self.Xr_std_prior[t])
+            dist_prior = Normal(self.Xr_mean_prior[t], self.Xr_std_prior[t].clamp(min=1e-4))
             nll_loss_prior = nll_loss_prior - dist_prior.log_prob(Y_flat[t]).sum()
 
-            dist_pred = Normal(self.Xr_mean_predict[t], self.Xr_std_predict[t])
+            dist_pred = Normal(self.Xr_mean_predict[t], self.Xr_std_predict[t].clamp(min=1e-4))
             nll_loss_predict = nll_loss_predict - dist_pred.log_prob(Y_flat[t]).sum()
 
         for t in range(T - 1):
@@ -450,8 +458,15 @@ class SCVAE(nn.Module):
                 self.Xr_mean[t + 1], self.Xr_std[t + 1],
             )
 
-        return kld_loss, nll_loss, smooth_loss, kld_loss_predict, \
-            nll_loss_prior, nll_loss_predict, smooth_loss_prior
+        # Normalize all losses by (batch * seq_len) for scale invariance
+        norm = max(B * T, 1)
+        return (kld_loss * beta / norm,
+                nll_loss / norm,
+                smooth_loss / norm,
+                kld_loss_predict * beta / norm,
+                nll_loss_prior / norm,
+                nll_loss_predict / norm,
+                smooth_loss_prior / norm)
 
     # ------------------------------------------------------------------
     # Reparameterization trick
@@ -464,6 +479,24 @@ class SCVAE(nn.Module):
 # =========================================================================
 # Utility functions
 # =========================================================================
+
+def _apply_free_bits(kld: torch.Tensor, min_val: float) -> torch.Tensor:
+    """Apply free-bits constraint: zero out KL below a minimum value.
+
+    This prevents the KL from collapsing to zero (posterior collapse) by
+    enforcing a minimum information content in the latent code.
+
+    Args:
+        kld: KL divergence tensor (already summed over batch and latent dims).
+        min_val: minimum total KL value. If kld < min_val, kld is set to min_val.
+
+    Returns:
+        Clamped KL value.
+    """
+    if min_val <= 0:
+        return kld
+    return torch.clamp(kld, min=min_val)
+
 
 def _kld_gauss(mean_1, std_1, mean_2, std_2):
     """KL divergence between two diagonal Gaussians."""
