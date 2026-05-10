@@ -197,18 +197,20 @@ def split_data(
     val_frac: float = 0.15,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split normal data into train/val, faulty data goes to test only."""
+    """Split normal data chronologically (no temporal leakage).
+
+    Assumes normal_df is already sorted by timestamp (earliest first).
+    First train_frac goes to train, next val_frac to val, remainder to test.
+    Faulty data always goes to test only.
+    """
     n_normal = len(normal_df)
     n_train = int(n_normal * train_frac)
     n_val = int(n_normal * val_frac)
 
-    rng = np.random.default_rng(seed)
-    indices = rng.permutation(n_normal)
+    train_df = normal_df.iloc[:n_train].copy()
+    val_df = normal_df.iloc[n_train:n_train + n_val].copy()
 
-    train_df = normal_df.iloc[indices[:n_train]].copy()
-    val_df = normal_df.iloc[indices[n_train:n_train + n_val]].copy()
-
-    test_normal = normal_df.iloc[indices[n_train + n_val:]].copy()
+    test_normal = normal_df.iloc[n_train + n_val:].copy()
     test_df = pd.concat([test_normal, faulty_df], ignore_index=True)
 
     logger.info(
@@ -369,7 +371,9 @@ def main():
     normal_df = normal_df.sort_values("_mad_score").reset_index(drop=True)
 
     n_keep = max(1, int(len(normal_df) * args.mad_retention / 100))
-    normal_clean = normal_df.iloc[:n_keep].copy().reset_index(drop=True)
+    normal_clean = normal_df.iloc[:n_keep].copy()
+    # Restore chronological order after MAD-based selection
+    normal_clean = normal_clean.sort_values("timestamp").reset_index(drop=True)
     logger.info(
         f"MAD filtering: retained {len(normal_clean):,} / {len(normal_df):,} "
         f"({args.mad_retention:.0f}%) lowest-MAD normal samples"
