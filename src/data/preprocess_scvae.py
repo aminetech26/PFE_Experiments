@@ -86,30 +86,6 @@ def compute_mad_score(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def filter_clean_normal(
-    df: pd.DataFrame,
-    normal_retention_pct: float = 80.0,
-) -> pd.DataFrame:
-    """Filter to keep only normal data, then retain top percentile by MAD.
-
-    Args:
-        normal_retention_pct: percentage of normal samples to keep (lowest MAD)
-    """
-    normal_df = df[df["label"] == 0].copy()
-    n_total = len(normal_df)
-    n_keep = max(1, int(n_total * normal_retention_pct / 100))
-
-    if "_mad_score" not in normal_df.columns:
-        normal_df = compute_mad_score(normal_df)
-
-    normal_df = normal_df.sort_values("_mad_score").iloc[:n_keep]
-    logger.info(
-        f"MAD filtering: retained {len(normal_df):,} / {n_total:,} "
-        f"({normal_retention_pct:.0f}%) normal samples with lowest MAD"
-    )
-    return normal_df.reset_index(drop=True)
-
-
 def augment_data(
     df: pd.DataFrame,
     target_rows: int,

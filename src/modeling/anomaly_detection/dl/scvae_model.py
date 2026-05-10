@@ -9,7 +9,7 @@ Architecture:
   - Conditional prior:    p(z_t | x_t, h_{t-1})
   - Inference (encoder):  q(z_t | x_t, y_t, h_{t-1})
   - Generative (decoder): p(y_t | z_t, x_t, h_{t-1})
-  - Recurrence:           h_t = GRU(cat[φ_x(x_t), φ_y(y_t), φ_z(z_t)], h_{t-1})
+  - Recurrence:           h_t = GRU(cat[φ_x(x_t), φ_z(z_t)], h_{t-1})
   - Prediction pathway:   separate GRU for test-time (only x available)
 
 Target: reconstruct PV power (pdc1, pdc2) conditioned on environmental
@@ -207,10 +207,12 @@ class SCVAE(nn.Module):
         """
         Reconstruct Y from X and Y using the encoder pathway.
 
+        Uses MC sampling from the encoder posterior for n_mc > 1.
+
         Returns:
-            mu:    (seq_len, batch, label_dim, n_mc) -> averaged over MC
-            std:   (seq_len, batch, label_dim, n_mc) -> averaged over MC
-            score: (seq_len, batch, label_dim, n_mc) -> NLL score per timestep
+            mu:    (seq_len, batch, label_dim) — averaged over MC
+            std:   (seq_len, batch, label_dim) — averaged over MC
+            score: (seq_len, batch, label_dim) — NLL score per timestep
         """
         X_np = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
         Y_np = Y.cpu().numpy() if isinstance(Y, torch.Tensor) else Y
@@ -232,8 +234,10 @@ class SCVAE(nn.Module):
 
                 enc_out = self.enc(torch.cat([phi_x_t, phi_y_t, h], dim=1))
                 enc_mean_t = self.enc_mean(enc_out)
+                enc_std_t = self.enc_std(enc_out)
+                z_t = self._reparameterize(enc_mean_t, enc_std_t)
 
-                phi_z_t = self.phi_z(enc_mean_t)
+                phi_z_t = self.phi_z(z_t)
                 dec_out = self.dec(torch.cat([phi_x_t, phi_z_t, h], dim=1))
                 dec_mean_t = self.dec_mean(dec_out)
                 dec_std_t = self.dec_std(dec_out)
@@ -444,10 +448,6 @@ class SCVAE(nn.Module):
             smooth_loss = smooth_loss + _kld_gauss(
                 self.Xr_mean[t], self.Xr_std[t],
                 self.Xr_mean[t + 1], self.Xr_std[t + 1],
-            )
-            smooth_loss_prior = smooth_loss_prior + _kld_gauss(
-                self.Xr_mean_prior[t], self.Xr_std_prior[t],
-                self.Xr_mean_prior[t + 1], self.Xr_std_prior[t + 1],
             )
 
         return kld_loss, nll_loss, smooth_loss, kld_loss_predict, \
