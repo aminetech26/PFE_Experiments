@@ -753,7 +753,45 @@ def run_maat(config: dict | None = None) -> None:
             storage_url=hpo_cfg.get("storage_url"),
             study_name_prefix=fingerprinted_prefix,
         )
-        logger.info(f"HPO best params: {best_params}")
+        logger.info(f"HPO val-max winner: {best_params}")
+
+        # Validation-only selection: among each stage's top-decile val_pr_auc trials,
+        # pick the simplest / most-regularized one. Fights val-overfit without ever
+        # touching the test set.
+        def _simplicity_score(t: optuna.trial.FrozenTrial) -> tuple:
+            p = t.params
+            sr_rank = {"center": 2, "mean": 1, "max": 0}.get(p.get("score_reduction", "center"), 2)
+            return (
+                -int(p.get("d_model", 64)),                 # smaller architecture
+                -int(p.get("e_layers", 2)),
+                -int(p.get("d_ff", 256)),
+                -float(p.get("learning_rate", 1.0e-4)),     # lower lr (less aggressive)
+                 int(p.get("batch_size", 256)),             # larger batch (more stable)
+                -sr_rank,                                   # simpler score reduction
+            )
+
+        validation_selected: dict = {}
+        for sr in stage_results:
+            completed = [
+                t for t in sr.study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+                and math.isfinite(t.value)
+            ]
+            if not completed:
+                continue
+            top_n = max(1, len(completed) // 10)
+            top_decile = sorted(completed, key=lambda t: t.value, reverse=True)[:top_n]
+            picked = max(top_decile, key=_simplicity_score)
+            logger.info(
+                f"[{sr.name}] val-only select | top-decile={top_n}/{len(completed)} | "
+                f"picked val_pr_auc={picked.value:.4f} (val-max was {sr.best_value:.4f}) | "
+                f"params={picked.params}"
+            )
+            validation_selected.update(picked.params)
+
+        if validation_selected:
+            best_params = validation_selected
+        logger.info(f"HPO validation-only selected params: {best_params}")
     else:
         if not injected_params:
             best_params = {}
@@ -764,7 +802,7 @@ def run_maat(config: dict | None = None) -> None:
     final_training_cfg = dict(training_cfg)
     for k, v in best_params.items():
         if k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff",
-                 "dropout", "k", "temperature"):
+                 "dropout", "k", "temperature", "score_reduction"):
             final_maat_cfg[k] = v
         elif k == "learning_rate":
             final_training_cfg["lr"] = v
