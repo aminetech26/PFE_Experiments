@@ -9,6 +9,20 @@
 - Decision: replace the MAAT token embedding with a per-timestep linear projection (`Linear(F, d_model)`) while keeping sinusoidal positional encoding unchanged.
 - Consequence: embedding now handles feature-space projection only, and temporal dependency modeling is delegated cleanly to the explicit Mamba and anomaly-attention branches.
 
+### MAAT robust window-score reduction
+
+- Observation: MAAT produces per-timestep anomaly scores inside each window, but Costa row-aligned MAAT windows are grouped by same-label `segment_id`/episode units.
+- Interpretation: center-point reduction is valid but unnecessarily point-local for sustained Costa fault episodes; max reduction is high-recall but overly sensitive to isolated score spikes.
+- Decision: add `median` score reduction and make it the MAAT default/search candidate as a robust window-level summary.
+- Consequence: the default MAAT score now represents typical anomaly evidence across the same-label window while suppressing isolated reconstruction or association artifacts.
+
+### MAAT training-window redundancy control
+
+- Observation: Costa is sampled at 1 Hz, so `train_stride=1` with `win_size=30` creates adjacent training windows with 96.7% overlap.
+- Interpretation: this inflates training-set size with highly autocorrelated near-duplicates, increasing compute cost and encouraging regime memorization without adding proportional independent evidence.
+- Decision: set MAAT `train_stride=5` while preserving `eval_stride=1` for dense validation/test scoring.
+- Consequence: training uses less redundant normal windows, while evaluation still assigns scores to every valid center timestep inside each grouped episode.
+
 ## 2026-05-01
 
 ### Costa FE profile semantics and path-policy corrections

@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import optuna
-import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -239,6 +238,8 @@ class MAATLightningModule(pl.LightningModule):
         """Reduce [B, W] scores to [B] per-window scalars."""
         if self.score_reduction == "mean":
             return scores.mean(dim=1)
+        if self.score_reduction == "median":
+            return scores.median(dim=1).values
         if self.score_reduction == "max":
             return scores.max(dim=1).values
         # default: center
@@ -760,7 +761,9 @@ def run_maat(config: dict | None = None) -> None:
         # touching the test set.
         def _simplicity_score(t: optuna.trial.FrozenTrial) -> tuple:
             p = t.params
-            sr_rank = {"center": 2, "mean": 1, "max": 0}.get(p.get("score_reduction", "center"), 2)
+            sr_rank = {"median": 3, "center": 2, "mean": 1, "max": 0}.get(
+                p.get("score_reduction", "median"), 3
+            )
             return (
                 -int(p.get("d_model", 64)),                 # smaller architecture
                 -int(p.get("e_layers", 2)),

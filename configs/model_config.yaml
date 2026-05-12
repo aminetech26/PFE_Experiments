@@ -104,9 +104,9 @@ anomaly_detection:
         dropout: 0.1
         k: 3.0
         temperature: 50
-        train_stride: 1
+        train_stride: 5
         eval_stride: 1
-        score_reduction: center
+        score_reduction: median
         scaling: standard
         hpo_stage1:
           learning_rate: {type: float, low: 1.0e-5, high: 1.0e-3, log: true}
@@ -123,7 +123,7 @@ anomaly_detection:
           n_heads: {type: categorical, choices: [2, 4, 8]}
           e_layers: {type: int, low: 1, high: 3}
           d_ff: {type: categorical, choices: [64, 128, 256, 512]}
-          score_reduction: {type: categorical, choices: [center, mean, max]}
+          score_reduction: {type: categorical, choices: [center, mean, median, max]}
 
       dlssm:
         win_size: 60
