@@ -66,6 +66,18 @@ def compute_maat_scores(
     Returns:
         scores: [B, W] — higher = more anomalous
     """
+    ass_dis = compute_association_discrepancy(series_list, prior_list)
+    ass_dis = ass_dis * temperature
+
+    metric = torch.softmax(-ass_dis, dim=-1)  # [B, W]
+    return metric * recon_error               # [B, W]
+
+
+def compute_association_discrepancy(
+    series_list: list[torch.Tensor],
+    prior_list: list[torch.Tensor],
+) -> torch.Tensor:
+    """Return per-timestep association discrepancy before temperature scaling."""
     kl_per_layer: list[torch.Tensor] = []
     for s, p in zip(series_list, prior_list):
         p_norm = normalize_prior(p)
@@ -73,8 +85,4 @@ def compute_maat_scores(
         kl_ps = maat_kl_loss(p_norm, s)    # [B, H, W]
         kl_per_layer.append((kl_sp + kl_ps).mean(dim=1))  # [B, W]
 
-    ass_dis = torch.stack(kl_per_layer, dim=0).mean(dim=0)  # [B, W]
-    ass_dis = ass_dis * temperature
-
-    metric = torch.softmax(-ass_dis, dim=-1)  # [B, W]
-    return metric * recon_error               # [B, W]
+    return torch.stack(kl_per_layer, dim=0).mean(dim=0)  # [B, W]

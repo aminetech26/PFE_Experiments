@@ -123,7 +123,7 @@ anomaly_detection:
           n_heads: {type: categorical, choices: [2, 4, 8]}
           e_layers: {type: int, low: 1, high: 3}
           d_ff: {type: categorical, choices: [64, 128, 256, 512]}
-          score_reduction: {type: categorical, choices: [center, mean, median, max]}
+          score_reduction: {type: categorical, choices: [center, mean, max]}
 
       dlssm:
         win_size: 60

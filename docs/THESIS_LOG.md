@@ -9,12 +9,12 @@
 - Decision: replace the MAAT token embedding with a per-timestep linear projection (`Linear(F, d_model)`) while keeping sinusoidal positional encoding unchanged.
 - Consequence: embedding now handles feature-space projection only, and temporal dependency modeling is delegated cleanly to the explicit Mamba and anomaly-attention branches.
 
-### MAAT robust window-score reduction
+### MAAT window-score reduction ablation
 
 - Observation: MAAT produces per-timestep anomaly scores inside each window, but Costa row-aligned MAAT windows are grouped by same-label `segment_id`/episode units.
-- Interpretation: center-point reduction is valid but unnecessarily point-local for sustained Costa fault episodes; max reduction is high-recall but overly sensitive to isolated score spikes.
-- Decision: add `median` score reduction and make it the MAAT default/search candidate as a robust window-level summary.
-- Consequence: the default MAAT score now represents typical anomaly evidence across the same-label window while suppressing isolated reconstruction or association artifacts.
+- Interpretation: median reduction was scientifically plausible as a robust same-label window summary, but empirically suppressed the sparse high-evidence timesteps used by MAAT's association-weighted score.
+- Decision: reject `median` as a default/HPO candidate and keep `max` reduction for MAAT scoring.
+- Consequence: `max` preserves short, high-confidence anomaly evidence and recovered Costa Path A MAAT performance under the faster `train_stride=5` setup.
 
 ### MAAT training-window redundancy control
 
@@ -23,12 +23,12 @@
 - Decision: set MAAT `train_stride=5` while preserving `eval_stride=1` for dense validation/test scoring.
 - Consequence: training uses less redundant normal windows, while evaluation still assigns scores to every valid center timestep inside each grouped episode.
 
-### MAAT prior-support alignment
+### MAAT prior-support ablation
 
 - Observation: MAAT sparse series attention is block-local, but the Gaussian prior association was normalized over the full window support.
-- Interpretation: KL discrepancy should compare distributions over the same event space; otherwise it partly measures the imposed sparse-attention mask rather than anomaly-relevant association structure.
-- Decision: apply the same block mask to the Gaussian prior and renormalize it before association-loss and scoring computations.
-- Consequence: series/prior discrepancy now reflects deviations from the local temporal prior within the same block-local support used by sparse attention.
+- Interpretation: masking the prior support was conceptually consistent, but it reduced the association-discrepancy signal that MAAT relies on for ranking and threshold transfer.
+- Decision: restore the full-window Gaussian prior while keeping series attention block-sparse.
+- Consequence: full prior support plus `score_reduction=max` improved the post-cleanup Costa Path A run to `test_pr_auc=0.9224`, `test_roc_auc=0.9295`, `test_f1=0.8818` with `train_stride=5`.
 
 ## 2026-05-01
 

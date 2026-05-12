@@ -5,7 +5,6 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-
 _GROUP_COL_FALLBACK = ("episode_id", "segment_id", "operating_day_id")
 
 
@@ -32,10 +31,12 @@ class TimeSeriesDataset(Dataset):
         win_size: int,
         stride: int = 1,
         normal_only: bool = False,
+        return_original_label: bool = False,
     ) -> None:
         super().__init__()
         self.win_size = win_size
         self.stride = stride
+        self.return_original_label = return_original_label
 
         if normal_only:
             n_before = len(df)
@@ -53,7 +54,8 @@ class TimeSeriesDataset(Dataset):
         group_col = _resolve_group_col(df)
 
         self._features: np.ndarray = df[feature_cols].to_numpy(dtype=np.float32)
-        self._labels: np.ndarray = (df[label_col].to_numpy() != 0).astype(np.int64)
+        self._original_labels: np.ndarray = df[label_col].to_numpy(dtype=np.float64)
+        self._labels: np.ndarray = (self._original_labels != 0).astype(np.int64)
 
         # Build (start_idx, end_idx) window indices that don't cross group boundaries
         self._windows: list[tuple[int, int]] = []
@@ -84,4 +86,7 @@ class TimeSeriesDataset(Dataset):
         x = torch.from_numpy(self._features[start:end])  # [W, F]
         center = start + (end - start) // 2
         label = torch.tensor(self._labels[center], dtype=torch.long)
+        if self.return_original_label:
+            original_label = torch.tensor(self._original_labels[center], dtype=torch.float64)
+            return x, label, original_label
         return x, label

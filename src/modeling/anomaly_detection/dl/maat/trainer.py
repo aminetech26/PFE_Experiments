@@ -35,6 +35,7 @@ from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
+    compute_association_discrepancy,
     compute_maat_scores,
 )
 from src.modeling.anomaly_detection.dl.maat.model import MambaAnomalyTransformer
@@ -129,6 +130,110 @@ def _calibrate_threshold(
     )
 
 
+def _safe_pr_auc(labels: np.ndarray, scores: np.ndarray) -> float:
+    if labels.sum() == 0 or labels.sum() == len(labels):
+        return 0.0
+    return float(average_precision_score(labels, scores))
+
+
+def _score_metrics(scores: np.ndarray, labels: np.ndarray, threshold: float) -> dict[str, float]:
+    preds = (scores >= threshold).astype(int)
+    return {
+        "pr_auc": _safe_pr_auc(labels, scores),
+        "roc_auc": float(roc_auc_score(labels, scores))
+        if labels.sum() not in (0, len(labels)) else 0.0,
+        "f1_at_threshold": float(f1_score(labels, preds, zero_division=0)),
+        "accuracy_at_threshold": float(accuracy_score(labels, preds)),
+        "precision_at_threshold": float(precision_score(labels, preds, zero_division=0)),
+        "recall_at_threshold": float(recall_score(labels, preds, zero_division=0)),
+        "threshold": float(threshold),
+    }
+
+
+def _zscore_from_val(val_scores: np.ndarray, test_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mean = float(np.mean(val_scores))
+    std = float(np.std(val_scores))
+    if std <= 1e-12 or not math.isfinite(std):
+        std = 1.0
+    return (val_scores - mean) / std, (test_scores - mean) / std
+
+
+def _build_score_decomposition_report(
+    val_parts: dict[str, np.ndarray],
+    test_parts: dict[str, np.ndarray],
+    val_labels: np.ndarray,
+    test_labels: np.ndarray,
+    test_original_labels: np.ndarray,
+) -> dict:
+    report: dict = {"scores": {}, "additive_alpha_grid": [0.0, 0.25, 0.5, 1.0, 2.0]}
+
+    for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
+        threshold, _, _, _ = _calibrate_threshold(val_parts[name], val_labels)
+        report["scores"][name] = {
+            "val": _score_metrics(val_parts[name], val_labels, threshold),
+            "test": _score_metrics(test_parts[name], test_labels, threshold),
+        }
+
+    val_recon_z, test_recon_z = _zscore_from_val(
+        val_parts["reconstruction"], test_parts["reconstruction"]
+    )
+    val_affinity_z, test_affinity_z = _zscore_from_val(
+        val_parts["association_affinity"], test_parts["association_affinity"]
+    )
+
+    best_alpha = 0.0
+    best_val_pr_auc = -np.inf
+    additive_trials: list[dict] = []
+    for alpha in report["additive_alpha_grid"]:
+        val_add = val_recon_z + float(alpha) * val_affinity_z
+        pr_auc = _safe_pr_auc(val_labels, val_add)
+        threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_add, val_labels)
+        additive_trials.append({
+            "alpha": float(alpha),
+            "val_pr_auc": pr_auc,
+            "val_f1_at_threshold": float(val_f1),
+            "val_precision_at_threshold": float(val_prec),
+            "val_recall_at_threshold": float(val_rec),
+            "threshold": float(threshold),
+        })
+        if pr_auc > best_val_pr_auc:
+            best_val_pr_auc = pr_auc
+            best_alpha = float(alpha)
+
+    val_add = val_recon_z + best_alpha * val_affinity_z
+    test_add = test_recon_z + best_alpha * test_affinity_z
+    threshold, _, _, _ = _calibrate_threshold(val_add, val_labels)
+    report["additive_trials"] = additive_trials
+    report["scores"]["additive_z_recon_plus_alpha_association_affinity"] = {
+        "selected_alpha": best_alpha,
+        "selection_metric": "val_pr_auc",
+        "val": _score_metrics(val_add, val_labels, threshold),
+        "test": _score_metrics(test_add, test_labels, threshold),
+    }
+
+    by_fault: dict[str, dict] = {}
+    for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
+        mask = (test_original_labels == fault_label) | (test_original_labels == 0)
+        labels = (test_original_labels[mask] == fault_label).astype(int)
+        if labels.sum() == 0 or labels.sum() == len(labels):
+            continue
+        by_fault[f"{fault_label:g}"] = {
+            "n_windows": int(mask.sum()),
+            "n_fault_windows": int(labels.sum()),
+            "product_pr_auc": _safe_pr_auc(labels, test_parts["product"][mask]),
+            "reconstruction_pr_auc": _safe_pr_auc(labels, test_parts["reconstruction"][mask]),
+            "association_discrepancy_pr_auc": _safe_pr_auc(
+                labels, test_parts["association_discrepancy"][mask]
+            ),
+            "association_affinity_pr_auc": _safe_pr_auc(
+                labels, test_parts["association_affinity"][mask]
+            ),
+            "additive_pr_auc": _safe_pr_auc(labels, test_add[mask]),
+        }
+    report["test_by_fault_vs_normal"] = by_fault
+    return report
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Lightning Module
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,8 +274,14 @@ class MAATLightningModule(pl.LightningModule):
         self.val_threshold: float = 0.5
         self._val_scores_np: np.ndarray | None = None
         self._val_labels_np: np.ndarray | None = None
+        self._val_recon_scores_np: np.ndarray | None = None
+        self._val_assoc_scores_np: np.ndarray | None = None
+        self._val_original_labels_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
+        self._test_recon_scores_np: np.ndarray | None = None
+        self._test_assoc_scores_np: np.ndarray | None = None
+        self._test_original_labels_np: np.ndarray | None = None
         self._nan_count: int = 0
 
     def _compute_step(
@@ -246,11 +357,16 @@ class MAATLightningModule(pl.LightningModule):
         return scores[:, scores.size(1) // 2]
 
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        x, labels = batch
+        if len(batch) == 3:
+            x, labels, original_labels = batch
+        else:
+            x, labels = batch
+            original_labels = labels
         with torch.no_grad():
             x_hat, series_list, prior_list, _ = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
+        assoc_dis = compute_association_discrepancy(series_list, prior_list)  # [B, W]
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         center_scores = self._reduce_scores(scores).cpu()
         center_labels = labels.cpu()
@@ -260,7 +376,10 @@ class MAATLightningModule(pl.LightningModule):
 
         self._val_outputs.append({
             "scores": center_scores,
+            "recon_scores": self._reduce_scores(recon_error).cpu(),
+            "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "labels": center_labels,
+            "original_labels": original_labels.cpu(),
             "rec_loss": rec_loss.item(),
             "s_loss": s_loss.item(),
             "p_loss": p_loss.item(),
@@ -271,7 +390,10 @@ class MAATLightningModule(pl.LightningModule):
             return
 
         all_scores = torch.cat([o["scores"] for o in self._val_outputs]).numpy()
+        all_recon_scores = torch.cat([o["recon_scores"] for o in self._val_outputs]).numpy()
+        all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._val_outputs]).numpy()
         all_labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
+        all_original_labels = torch.cat([o["original_labels"] for o in self._val_outputs]).numpy()
         mean_rec = float(np.mean([o["rec_loss"] for o in self._val_outputs]))
         mean_s = float(np.mean([o["s_loss"] for o in self._val_outputs]))
         mean_p = float(np.mean([o["p_loss"] for o in self._val_outputs]))
@@ -292,6 +414,9 @@ class MAATLightningModule(pl.LightningModule):
         self.val_threshold = threshold
         self._val_scores_np = all_scores
         self._val_labels_np = all_labels
+        self._val_recon_scores_np = all_recon_scores
+        self._val_assoc_scores_np = all_assoc_scores
+        self._val_original_labels_np = all_original_labels
 
         self.log("val_pr_auc", val_pr_auc, prog_bar=True)
         self.log("val_roc_auc", val_roc_auc)
@@ -305,15 +430,23 @@ class MAATLightningModule(pl.LightningModule):
         self.log("val_prior_kl", mean_p)
 
     def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        x, labels = batch
+        if len(batch) == 3:
+            x, labels, original_labels = batch
+        else:
+            x, labels = batch
+            original_labels = labels
         with torch.no_grad():
             x_hat, series_list, prior_list, _ = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
+        assoc_dis = compute_association_discrepancy(series_list, prior_list)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         self._test_outputs.append({
             "scores": self._reduce_scores(scores).cpu(),
+            "recon_scores": self._reduce_scores(recon_error).cpu(),
+            "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "labels": labels.cpu(),
+            "original_labels": original_labels.cpu(),
         })
 
     def on_test_epoch_end(self) -> None:
@@ -321,11 +454,17 @@ class MAATLightningModule(pl.LightningModule):
             return
 
         all_scores = torch.cat([o["scores"] for o in self._test_outputs]).numpy()
+        all_recon_scores = torch.cat([o["recon_scores"] for o in self._test_outputs]).numpy()
+        all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._test_outputs]).numpy()
         all_labels = torch.cat([o["labels"] for o in self._test_outputs]).numpy()
+        all_original_labels = torch.cat([o["original_labels"] for o in self._test_outputs]).numpy()
         self._test_outputs.clear()
 
         self._test_scores_np = all_scores
         self._test_labels_np = all_labels
+        self._test_recon_scores_np = all_recon_scores
+        self._test_assoc_scores_np = all_assoc_scores
+        self._test_original_labels_np = all_original_labels
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
             self.log("test_pr_auc", 0.0)
@@ -636,10 +775,12 @@ def run_maat(config: dict | None = None) -> None:
             train_df, features, label_col, cfg["win_size"], stride_train, normal_only=True
         )
         ds_val = TimeSeriesDataset(
-            val_df, features, label_col, cfg["win_size"], stride_eval, normal_only=False
+            val_df, features, label_col, cfg["win_size"], stride_eval,
+            normal_only=False, return_original_label=True,
         )
         ds_test = TimeSeriesDataset(
-            test_df, features, label_col, cfg["win_size"], stride_eval, normal_only=False
+            test_df, features, label_col, cfg["win_size"], stride_eval,
+            normal_only=False, return_original_label=True,
         )
         # num_workers=0: avoids DataLoader multiprocessing teardown races under
         # Lightning/Optuna/Colab (Python 3.12 AssertionError: can only test a child process).
@@ -761,9 +902,7 @@ def run_maat(config: dict | None = None) -> None:
         # touching the test set.
         def _simplicity_score(t: optuna.trial.FrozenTrial) -> tuple:
             p = t.params
-            sr_rank = {"median": 3, "center": 2, "mean": 1, "max": 0}.get(
-                p.get("score_reduction", "median"), 3
-            )
+            sr_rank = {"center": 2, "mean": 1, "max": 0}.get(p.get("score_reduction", "max"), 0)
             return (
                 -int(p.get("d_model", 64)),                 # smaller architecture
                 -int(p.get("e_layers", 2)),
@@ -870,6 +1009,13 @@ def run_maat(config: dict | None = None) -> None:
     val_labels = final_lit._val_labels_np
     test_scores = final_lit._test_scores_np
     test_labels = final_lit._test_labels_np
+    val_recon_scores = final_lit._val_recon_scores_np
+    val_assoc_scores = final_lit._val_assoc_scores_np
+    val_assoc_affinity_scores = final_lit._val_assoc_affinity_scores_np
+    test_recon_scores = final_lit._test_recon_scores_np
+    test_assoc_scores = final_lit._test_assoc_scores_np
+    test_assoc_affinity_scores = final_lit._test_assoc_affinity_scores_np
+    test_original_labels = final_lit._test_original_labels_np
 
     if val_scores is None or test_scores is None:
         logger.error("Score arrays not populated — test may not have run.")
@@ -924,6 +1070,7 @@ def run_maat(config: dict | None = None) -> None:
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
     manifest_path = artifacts_dir / "features_manifest.json"
+    decomposition_path = artifacts_dir / "score_decomposition_metrics.json"
 
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     joblib.dump(scaler, scaler_path)
@@ -937,6 +1084,46 @@ def run_maat(config: dict | None = None) -> None:
     _save_pr_curve(val_scores, val_labels, test_scores, test_labels, pr_curve_path)
     _save_score_histogram(val_scores, val_labels, threshold, histogram_path)
     _save_score_timeline(test_scores, test_labels, threshold, timeline_path)
+
+    decomposition_report = None
+    if all(
+        x is not None for x in (
+            val_recon_scores,
+            val_assoc_scores,
+            val_assoc_affinity_scores,
+            test_recon_scores,
+            test_assoc_scores,
+            test_assoc_affinity_scores,
+            test_original_labels,
+        )
+    ):
+        decomposition_report = _build_score_decomposition_report(
+            val_parts={
+                "product": val_scores,
+                "reconstruction": val_recon_scores,
+                "association_discrepancy": val_assoc_scores,
+                "association_affinity": val_assoc_affinity_scores,
+            },
+            test_parts={
+                "product": test_scores,
+                "reconstruction": test_recon_scores,
+                "association_discrepancy": test_assoc_scores,
+                "association_affinity": test_assoc_affinity_scores,
+            },
+            val_labels=val_labels,
+            test_labels=test_labels,
+            test_original_labels=test_original_labels,
+        )
+        decomposition_path.write_text(
+            json.dumps(decomposition_report, indent=2, default=str), encoding="utf-8"
+        )
+        best_add = decomposition_report["scores"][
+            "additive_z_recon_plus_alpha_association_affinity"
+        ]
+        logger.info(
+            "Score decomposition — additive alpha={} test_pr_auc={:.4f}",
+            best_add["selected_alpha"], best_add["test"]["pr_auc"],
+        )
 
     if stage_results:
         for sr in stage_results:
@@ -969,7 +1156,8 @@ def run_maat(config: dict | None = None) -> None:
             })
             mlflow.log_metrics(metrics)
             for p in (metrics_path, scaler_path, params_path, config_path,
-                      pr_curve_path, histogram_path, timeline_path, manifest_path):
+                      pr_curve_path, histogram_path, timeline_path, manifest_path,
+                      decomposition_path):
                 if p.exists():
                     mlflow.log_artifact(str(p))
             if stage_results:
