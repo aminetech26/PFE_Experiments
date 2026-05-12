@@ -66,7 +66,8 @@ def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
     relevant = {
         k: maat_cfg.get(k)
         for k in ("win_size", "block_size", "d_model", "n_heads", "e_layers",
-                  "d_ff", "dropout", "k", "temperature", "score_reduction")
+                  "d_ff", "dropout", "k", "temperature", "score_reduction",
+                  "architecture_variant")
     }
     relevant["hpo_stage1"] = maat_cfg.get("hpo_stage1", {})
     relevant["hpo_stage2"] = maat_cfg.get("hpo_stage2", {})
@@ -276,11 +277,13 @@ class MAATLightningModule(pl.LightningModule):
         self._val_labels_np: np.ndarray | None = None
         self._val_recon_scores_np: np.ndarray | None = None
         self._val_assoc_scores_np: np.ndarray | None = None
+        self._val_assoc_affinity_scores_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
         self._test_recon_scores_np: np.ndarray | None = None
         self._test_assoc_scores_np: np.ndarray | None = None
+        self._test_assoc_affinity_scores_np: np.ndarray | None = None
         self._test_original_labels_np: np.ndarray | None = None
         self._nan_count: int = 0
 
@@ -367,6 +370,7 @@ class MAATLightningModule(pl.LightningModule):
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
         assoc_dis = compute_association_discrepancy(series_list, prior_list)  # [B, W]
+        assoc_affinity = torch.softmax(-assoc_dis * self.temperature, dim=-1)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         center_scores = self._reduce_scores(scores).cpu()
         center_labels = labels.cpu()
@@ -378,6 +382,7 @@ class MAATLightningModule(pl.LightningModule):
             "scores": center_scores,
             "recon_scores": self._reduce_scores(recon_error).cpu(),
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
+            "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
             "labels": center_labels,
             "original_labels": original_labels.cpu(),
             "rec_loss": rec_loss.item(),
@@ -392,6 +397,9 @@ class MAATLightningModule(pl.LightningModule):
         all_scores = torch.cat([o["scores"] for o in self._val_outputs]).numpy()
         all_recon_scores = torch.cat([o["recon_scores"] for o in self._val_outputs]).numpy()
         all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._val_outputs]).numpy()
+        all_assoc_affinity_scores = torch.cat(
+            [o["assoc_affinity_scores"] for o in self._val_outputs]
+        ).numpy()
         all_labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._val_outputs]).numpy()
         mean_rec = float(np.mean([o["rec_loss"] for o in self._val_outputs]))
@@ -416,6 +424,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_labels_np = all_labels
         self._val_recon_scores_np = all_recon_scores
         self._val_assoc_scores_np = all_assoc_scores
+        self._val_assoc_affinity_scores_np = all_assoc_affinity_scores
         self._val_original_labels_np = all_original_labels
 
         self.log("val_pr_auc", val_pr_auc, prog_bar=True)
@@ -440,11 +449,13 @@ class MAATLightningModule(pl.LightningModule):
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         assoc_dis = compute_association_discrepancy(series_list, prior_list)
+        assoc_affinity = torch.softmax(-assoc_dis * self.temperature, dim=-1)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         self._test_outputs.append({
             "scores": self._reduce_scores(scores).cpu(),
             "recon_scores": self._reduce_scores(recon_error).cpu(),
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
+            "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
             "labels": labels.cpu(),
             "original_labels": original_labels.cpu(),
         })
@@ -456,6 +467,9 @@ class MAATLightningModule(pl.LightningModule):
         all_scores = torch.cat([o["scores"] for o in self._test_outputs]).numpy()
         all_recon_scores = torch.cat([o["recon_scores"] for o in self._test_outputs]).numpy()
         all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._test_outputs]).numpy()
+        all_assoc_affinity_scores = torch.cat(
+            [o["assoc_affinity_scores"] for o in self._test_outputs]
+        ).numpy()
         all_labels = torch.cat([o["labels"] for o in self._test_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._test_outputs]).numpy()
         self._test_outputs.clear()
@@ -464,6 +478,7 @@ class MAATLightningModule(pl.LightningModule):
         self._test_labels_np = all_labels
         self._test_recon_scores_np = all_recon_scores
         self._test_assoc_scores_np = all_assoc_scores
+        self._test_assoc_affinity_scores_np = all_assoc_affinity_scores
         self._test_original_labels_np = all_original_labels
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
@@ -608,6 +623,7 @@ def _build_model(maat_cfg: dict, n_features: int) -> MambaAnomalyTransformer:
         d_ff=int(maat_cfg["d_ff"]),
         dropout=float(maat_cfg["dropout"]),
         block_size=int(maat_cfg["block_size"]),
+        architecture_variant=str(maat_cfg.get("architecture_variant", "local_parallel_mamba")),
     )
 
 
@@ -812,7 +828,10 @@ def run_maat(config: dict | None = None) -> None:
 
         fixed_arch = {
             k: maat_cfg[k]
-            for k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff")
+            for k in (
+                "win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff",
+                "architecture_variant",
+            )
         }
 
         def objective_builder(stage: HPOStageConfig, frozen_params: dict):
@@ -944,7 +963,7 @@ def run_maat(config: dict | None = None) -> None:
     final_training_cfg = dict(training_cfg)
     for k, v in best_params.items():
         if k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff",
-                 "dropout", "k", "temperature", "score_reduction"):
+                 "dropout", "k", "temperature", "score_reduction", "architecture_variant"):
             final_maat_cfg[k] = v
         elif k == "learning_rate":
             final_training_cfg["lr"] = v

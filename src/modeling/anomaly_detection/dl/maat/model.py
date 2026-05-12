@@ -7,15 +7,24 @@ import torch.nn.functional as functional
 from src.modeling.anomaly_detection.dl.maat.attn import AnomalyAttention, AttentionLayer
 from src.modeling.anomaly_detection.dl.maat.embed import DataEmbedding
 
-# ARCHITECTURAL DEVIATION FROM UPSTREAM MAAT (Sellam et al. 2025 / ilyesbenaissa/MAAT):
-# Upstream defines one Mamba block on the Encoder and reuses that same block inside the
-# encoder loop after each anomaly-attention layer: x = attn_layer(x), then shared_mamba(x)
-# is fused with the attention-updated x via a gate and skip connection. This implementation
-# instead gives each EncoderLayer its own independent Mamba block running in parallel with
-# the anomaly-attention branch from the same layer input, then fuses both branch outputs via
-# a learned sigmoid gate. The association discrepancy mechanism (sparse attention + Gaussian
-# prior + KL minimax) is faithful to the paper. The Mamba placement is a deliberate adaptation;
-# thesis should note this as a variant rather than a strict replication.
+
+def _build_mamba_block(d_model: int) -> nn.Module:
+    # mamba_ssm requires CUDA + Linux; imported at instantiation so the package
+    # is importable on CPU dev machines without crashing at module load time.
+    try:
+        from mamba_ssm import Mamba  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            "mamba_ssm is required for MAAT. "
+            "Install it in a CUDA/Linux environment: pip install mamba-ssm"
+        ) from exc
+
+    return Mamba(
+        d_model=d_model,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+    )
 
 
 class EncoderLayer(nn.Module):
@@ -31,23 +40,8 @@ class EncoderLayer(nn.Module):
         self.attention = attention
         self.dropout = nn.Dropout(dropout)
 
-        # mamba_ssm requires CUDA + Linux; imported at instantiation so the package
-        # is importable on CPU dev machines without crashing at module load time.
-        try:
-            from mamba_ssm import Mamba  # noqa: PLC0415
-        except ImportError as exc:
-            raise ImportError(
-                "mamba_ssm is required for MAAT. "
-                "Install it in a CUDA/Linux environment: pip install mamba-ssm"
-            ) from exc
-
         # Mamba SSM branch — Lightning handles device placement, no .to("cuda")
-        self.mamba_block = Mamba(
-            d_model=d_model,
-            d_state=16,
-            d_conv=4,
-            expand=2,
-        )
+        self.mamba_block = _build_mamba_block(d_model)
 
         # Gate: fuse Mamba output (x_skip) and attention output (x_attn)
         # gate = sigmoid(Linear(cat([x_skip, x_attn], dim=-1)))
@@ -102,6 +96,61 @@ class Encoder(nn.Module):
         return x, series_list, prior_list, sigma_list
 
 
+class AttentionFFNLayer(nn.Module):
+    """Attention + FFN layer used by the upstream-style shared-Mamba encoder."""
+
+    def __init__(
+        self,
+        attention: AttentionLayer,
+        d_model: int,
+        d_ff: int,
+        dropout: float = 0.0,
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        self.attention = attention
+        self.dropout = nn.Dropout(dropout)
+        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.activation = functional.gelu if activation == "gelu" else functional.relu
+
+    def forward(
+        self, x: torch.Tensor, attn_mask=None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        new_x, series, prior, sigma = self.attention(x, x, x)
+        x = self.norm1(x + self.dropout(new_x))
+        y = self.dropout(self.activation(self.conv1(x.transpose(-1, 1))))
+        y = self.dropout(self.conv2(y).transpose(-1, 1))
+        x = self.norm2(x + y)
+        return x, series, prior, sigma
+
+
+class UpstreamSharedMambaEncoder(nn.Module):
+    """Upstream-style MAAT encoder: attention layer followed by one shared Mamba block."""
+
+    def __init__(self, layers: list[AttentionFFNLayer], d_model: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+        self.shared_mamba = _build_mamba_block(d_model)
+        self.gate_linear = nn.Linear(2 * d_model, d_model)
+
+    def forward(
+        self, x: torch.Tensor, attn_mask=None
+    ) -> tuple[torch.Tensor, list, list, list]:
+        series_list, prior_list, sigma_list = [], [], []
+        for layer in self.layers:
+            x, series, prior, sigma = layer(x, attn_mask=attn_mask)
+            mamba_x = self.shared_mamba(x)
+            gate = torch.sigmoid(self.gate_linear(torch.cat([mamba_x, x], dim=-1)))
+            x = gate * mamba_x + (1.0 - gate) * x
+            series_list.append(series)
+            prior_list.append(prior)
+            sigma_list.append(sigma)
+        return x, series_list, prior_list, sigma_list
+
+
 class MambaAnomalyTransformer(nn.Module):
     def __init__(
         self,
@@ -115,6 +164,7 @@ class MambaAnomalyTransformer(nn.Module):
         dropout: float = 0.1,
         activation: str = "gelu",
         block_size: int = 10,
+        architecture_variant: str = "local_parallel_mamba",
     ) -> None:
         super().__init__()
         assert win_size % block_size == 0, (
@@ -124,30 +174,55 @@ class MambaAnomalyTransformer(nn.Module):
             f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
         )
 
+        self.architecture_variant = architecture_variant
         self.enc_embedding = DataEmbedding(enc_in, d_model, dropout)
 
-        self.encoder = Encoder(
-            [
-                EncoderLayer(
-                    AttentionLayer(
-                        AnomalyAttention(
-                            win_size=win_size,
-                            mask_flag=False,
-                            attention_dropout=dropout,
-                            block_size=block_size,
-                            use_sparse_attention=True,  # explicitly enabled
-                        ),
+        def _attention_layer() -> AttentionLayer:
+            return AttentionLayer(
+                AnomalyAttention(
+                    win_size=win_size,
+                    mask_flag=False,
+                    attention_dropout=dropout,
+                    block_size=block_size,
+                    use_sparse_attention=True,
+                ),
+                d_model=d_model,
+                n_heads=n_heads,
+            )
+
+        if architecture_variant == "upstream_shared_mamba":
+            self.encoder = UpstreamSharedMambaEncoder(
+                [
+                    AttentionFFNLayer(
+                        _attention_layer(),
                         d_model=d_model,
-                        n_heads=n_heads,
-                    ),
-                    d_model=d_model,
-                    d_ff=d_ff,
-                    dropout=dropout,
-                    activation=activation,
-                )
-                for _ in range(e_layers)
-            ]
-        )
+                        d_ff=d_ff,
+                        dropout=dropout,
+                        activation=activation,
+                    )
+                    for _ in range(e_layers)
+                ],
+                d_model=d_model,
+            )
+        elif architecture_variant == "local_parallel_mamba":
+            self.encoder = Encoder(
+                [
+                    EncoderLayer(
+                        _attention_layer(),
+                        d_model=d_model,
+                        d_ff=d_ff,
+                        dropout=dropout,
+                        activation=activation,
+                    )
+                    for _ in range(e_layers)
+                ]
+            )
+        else:
+            raise ValueError(
+                "Unsupported MAAT architecture_variant="
+                f"{architecture_variant!r}. Expected 'local_parallel_mamba' or "
+                "'upstream_shared_mamba'."
+            )
 
         self.projection = nn.Linear(d_model, c_out, bias=True)
 

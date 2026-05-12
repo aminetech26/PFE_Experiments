@@ -30,6 +30,12 @@
 - Decision: restore the full-window Gaussian prior while keeping series attention block-sparse.
 - Consequence: full prior support plus `score_reduction=max` improved the post-cleanup Costa Path A run to `test_pr_auc=0.9224`, `test_roc_auc=0.9295`, `test_f1=0.8818` with `train_stride=5`.
 
+### MAAT upstream-style architecture variant
+
+- Observation: the local MAAT variant uses independent per-layer Mamba blocks in parallel with anomaly attention, while upstream MAAT reuses one shared Mamba block after each attention layer.
+- Decision: add `architecture_variant=upstream_shared_mamba` as an explicit controlled variant while preserving the tested changes: linear token embedding, full Gaussian prior, `train_stride=5`, and `score_reduction=max`.
+- Consequence: upstream-style Mamba placement can now be tested directly against the local parallel-Mamba variant without changing feature profile, scoring policy, or training-window redundancy control.
+
 ## 2026-05-01
 
 ### Costa FE profile semantics and path-policy corrections
