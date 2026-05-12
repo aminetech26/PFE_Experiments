@@ -159,14 +159,33 @@ def _zscore_from_val(val_scores: np.ndarray, test_scores: np.ndarray) -> tuple[n
     return (val_scores - mean) / std, (test_scores - mean) / std
 
 
+def _macro_fault_pr_auc(
+    original_labels: np.ndarray,
+    scores: np.ndarray,
+) -> float:
+    values: list[float] = []
+    for fault_label in sorted(float(x) for x in np.unique(original_labels) if float(x) != 0.0):
+        mask = (original_labels == fault_label) | (original_labels == 0)
+        labels = (original_labels[mask] == fault_label).astype(int)
+        if labels.sum() == 0 or labels.sum() == len(labels):
+            continue
+        values.append(_safe_pr_auc(labels, scores[mask]))
+    return float(np.mean(values)) if values else 0.0
+
+
 def _build_score_decomposition_report(
     val_parts: dict[str, np.ndarray],
     test_parts: dict[str, np.ndarray],
     val_labels: np.ndarray,
     test_labels: np.ndarray,
+    val_original_labels: np.ndarray,
     test_original_labels: np.ndarray,
 ) -> dict:
-    report: dict = {"scores": {}, "additive_alpha_grid": [0.0, 0.25, 0.5, 1.0, 2.0]}
+    report: dict = {
+        "scores": {},
+        "additive_alpha_grid": [0.0, 0.25, 0.5, 1.0, 2.0],
+        "product_fusion_alpha_grid": [0.0, 0.25, 0.5, 1.0, 2.0],
+    }
 
     for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
         threshold, _, _, _ = _calibrate_threshold(val_parts[name], val_labels)
@@ -212,6 +231,41 @@ def _build_score_decomposition_report(
         "test": _score_metrics(test_add, test_labels, threshold),
     }
 
+    val_product_z, test_product_z = _zscore_from_val(val_parts["product"], test_parts["product"])
+    product_fusion_trials: list[dict] = []
+    best_product_alpha = 0.0
+    best_macro_pr_auc = -np.inf
+    for alpha in report["product_fusion_alpha_grid"]:
+        val_fused = val_recon_z + float(alpha) * val_product_z
+        macro_pr_auc = _macro_fault_pr_auc(val_original_labels, val_fused)
+        global_pr_auc = _safe_pr_auc(val_labels, val_fused)
+        threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_fused, val_labels)
+        product_fusion_trials.append({
+            "alpha": float(alpha),
+            "val_macro_fault_pr_auc": macro_pr_auc,
+            "val_global_pr_auc": global_pr_auc,
+            "val_f1_at_threshold": float(val_f1),
+            "val_precision_at_threshold": float(val_prec),
+            "val_recall_at_threshold": float(val_rec),
+            "threshold": float(threshold),
+        })
+        if macro_pr_auc > best_macro_pr_auc:
+            best_macro_pr_auc = macro_pr_auc
+            best_product_alpha = float(alpha)
+
+    val_product_fused = val_recon_z + best_product_alpha * val_product_z
+    test_product_fused = test_recon_z + best_product_alpha * test_product_z
+    threshold, _, _, _ = _calibrate_threshold(val_product_fused, val_labels)
+    report["product_fusion_trials"] = product_fusion_trials
+    report["scores"]["macro_selected_z_recon_plus_alpha_product"] = {
+        "selected_alpha": best_product_alpha,
+        "selection_metric": "val_macro_fault_pr_auc",
+        "val_macro_fault_pr_auc": _macro_fault_pr_auc(val_original_labels, val_product_fused),
+        "test_macro_fault_pr_auc": _macro_fault_pr_auc(test_original_labels, test_product_fused),
+        "val": _score_metrics(val_product_fused, val_labels, threshold),
+        "test": _score_metrics(test_product_fused, test_labels, threshold),
+    }
+
     by_fault: dict[str, dict] = {}
     for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
         mask = (test_original_labels == fault_label) | (test_original_labels == 0)
@@ -230,6 +284,9 @@ def _build_score_decomposition_report(
                 labels, test_parts["association_affinity"][mask]
             ),
             "additive_pr_auc": _safe_pr_auc(labels, test_add[mask]),
+            "macro_selected_product_fusion_pr_auc": _safe_pr_auc(
+                labels, test_product_fused[mask]
+            ),
         }
     report["test_by_fault_vs_normal"] = by_fault
     return report
@@ -1031,6 +1088,7 @@ def run_maat(config: dict | None = None) -> None:
     val_recon_scores = final_lit._val_recon_scores_np
     val_assoc_scores = final_lit._val_assoc_scores_np
     val_assoc_affinity_scores = final_lit._val_assoc_affinity_scores_np
+    val_original_labels = final_lit._val_original_labels_np
     test_recon_scores = final_lit._test_recon_scores_np
     test_assoc_scores = final_lit._test_assoc_scores_np
     test_assoc_affinity_scores = final_lit._test_assoc_affinity_scores_np
@@ -1110,6 +1168,7 @@ def run_maat(config: dict | None = None) -> None:
             val_recon_scores,
             val_assoc_scores,
             val_assoc_affinity_scores,
+            val_original_labels,
             test_recon_scores,
             test_assoc_scores,
             test_assoc_affinity_scores,
@@ -1131,6 +1190,7 @@ def run_maat(config: dict | None = None) -> None:
             },
             val_labels=val_labels,
             test_labels=test_labels,
+            val_original_labels=val_original_labels,
             test_original_labels=test_original_labels,
         )
         decomposition_path.write_text(
