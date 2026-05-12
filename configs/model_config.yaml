@@ -104,9 +104,9 @@ anomaly_detection:
         dropout: 0.1
         k: 3.0
         temperature: 50
-        train_stride: 5
+        train_stride: 1
         eval_stride: 1
-        score_reduction: median
+        score_reduction: max
         scaling: standard
         hpo_stage1:
           learning_rate: {type: float, low: 1.0e-5, high: 1.0e-3, log: true}
