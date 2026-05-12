@@ -23,6 +23,13 @@
 - Decision: set MAAT `train_stride=5` while preserving `eval_stride=1` for dense validation/test scoring.
 - Consequence: training uses less redundant normal windows, while evaluation still assigns scores to every valid center timestep inside each grouped episode.
 
+### MAAT prior-support alignment
+
+- Observation: MAAT sparse series attention is block-local, but the Gaussian prior association was normalized over the full window support.
+- Interpretation: KL discrepancy should compare distributions over the same event space; otherwise it partly measures the imposed sparse-attention mask rather than anomaly-relevant association structure.
+- Decision: apply the same block mask to the Gaussian prior and renormalize it before association-loss and scoring computations.
+- Consequence: series/prior discrepancy now reflects deviations from the local temporal prior within the same block-local support used by sparse attention.
+
 ## 2026-05-01
 
 ### Costa FE profile semantics and path-policy corrections
