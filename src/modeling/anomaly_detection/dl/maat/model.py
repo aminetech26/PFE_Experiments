@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 
 from src.modeling.anomaly_detection.dl.maat.attn import AnomalyAttention, AttentionLayer
 from src.modeling.anomaly_detection.dl.maat.embed import DataEmbedding
 
 # ARCHITECTURAL DEVIATION FROM UPSTREAM MAAT (Sellam et al. 2025 / ilyesbenaissa/MAAT):
-# Upstream places a single Mamba block shared across all encoder layers (after all attention
-# layers) and uses a different gating arrangement. This implementation uses one independent
-# Mamba block *per encoder layer* running in parallel with the anomaly attention branch,
-# fused via a learned sigmoid gate. The association discrepancy mechanism (sparse attention +
-# Gaussian prior + KL minimax) is faithful to the paper. The Mamba placement is a deliberate
-# adaptation; thesis should note this as a variant rather than a strict replication.
+# Upstream defines one Mamba block on the Encoder and reuses that same block inside the
+# encoder loop after each anomaly-attention layer: x = attn_layer(x), then shared_mamba(x)
+# is fused with the attention-updated x via a gate and skip connection. This implementation
+# instead gives each EncoderLayer its own independent Mamba block running in parallel with
+# the anomaly-attention branch from the same layer input, then fuses both branch outputs via
+# a learned sigmoid gate. The association discrepancy mechanism (sparse attention + Gaussian
+# prior + KL minimax) is faithful to the paper. The Mamba placement is a deliberate adaptation;
+# thesis should note this as a variant rather than a strict replication.
 
 
 class EncoderLayer(nn.Module):
@@ -56,7 +58,7 @@ class EncoderLayer(nn.Module):
         self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.activation = F.gelu if activation == "gelu" else F.relu
+        self.activation = functional.gelu if activation == "gelu" else functional.relu
 
     def forward(
         self, x: torch.Tensor, attn_mask=None
