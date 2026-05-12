@@ -25,19 +25,12 @@ class PositionalEmbedding(nn.Module):
 class TokenEmbedding(nn.Module):
     def __init__(self, c_in: int, d_model: int) -> None:
         super().__init__()
-        self.tokenConv = nn.Conv1d(
-            in_channels=c_in,
-            out_channels=d_model,
-            kernel_size=3,
-            padding=1,
-            padding_mode="circular",
-            bias=False,
-        )
-        nn.init.kaiming_normal_(self.tokenConv.weight, mode="fan_in", nonlinearity="leaky_relu")
+        self.projection = nn.Linear(c_in, d_model, bias=False)
+        nn.init.kaiming_normal_(self.projection.weight, mode="fan_in", nonlinearity="leaky_relu")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, W, F] → [B, F, W] → conv → [B, d_model, W] → [B, W, d_model]
-        return self.tokenConv(x.permute(0, 2, 1)).transpose(1, 2)
+        # x: [B, W, F] -> [B, W, d_model]
+        return self.projection(x)
 
 
 class DataEmbedding(nn.Module):

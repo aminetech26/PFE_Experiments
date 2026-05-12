@@ -1,5 +1,14 @@
 # Thesis Log
 
+## 2026-05-12
+
+### MAAT token embedding surgical intervention
+
+- Observation: MAAT's token embedding used a `Conv1d(kernel_size=3, padding_mode="circular")`, which makes the first and last samples of each finite PV window artificial neighbors.
+- Interpretation: Costa sliding windows are local temporal slices, not periodic sequences; circular boundary context is therefore physically unjustified and can introduce split-sensitive artifacts.
+- Decision: replace the MAAT token embedding with a per-timestep linear projection (`Linear(F, d_model)`) while keeping sinusoidal positional encoding unchanged.
+- Consequence: embedding now handles feature-space projection only, and temporal dependency modeling is delegated cleanly to the explicit Mamba and anomaly-attention branches.
+
 ## 2026-05-01
 
 ### Costa FE profile semantics and path-policy corrections
