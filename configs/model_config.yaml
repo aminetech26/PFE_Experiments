@@ -104,7 +104,7 @@ anomaly_detection:
         dropout: 0.1
         k: 3.0
         temperature: 50
-        train_stride: 1
+        train_stride: 5
         eval_stride: 1
         score_reduction: max
         scaling: standard

@@ -84,11 +84,6 @@ class AnomalyAttention(nn.Module):
             -dists.pow(2).unsqueeze(0).unsqueeze(0) / (2.0 * sigma_t.pow(2))
         )  # [B, H, L, S]
 
-        if self.use_sparse_attention and self.block_mask is not None:
-            prior = prior * self.block_mask[:seq_len, :source_len].unsqueeze(0).unsqueeze(0).to(
-                prior.dtype
-            )
-
         # Normalize prior to sum to 1 over j (last dim)
         prior = prior / (prior.sum(dim=-1, keepdim=True).clamp(min=1e-9))
 
