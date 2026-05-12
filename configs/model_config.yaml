@@ -146,11 +146,6 @@ anomaly_detection:
           imbalance: true
           temperature_correction: false   # disabled until base is stable
 
-        self_paced: false                 # override via --self-paced CLI flag
-        self_paced_tau_start: 0.1
-        self_paced_tau_end: 1.0
-        self_paced_w_min: 0.2
-
         # Semi-supervised paradigms — override via --one-class / --consistency CLI flags
         one_class: false                  # Deep SVDD-style latent compactness
         lambda_oc: 0.1                    # training loss weight

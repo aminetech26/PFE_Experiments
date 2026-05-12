@@ -43,7 +43,6 @@ from src.modeling.anomaly_detection.dl.dlssm.losses import (
     physics_consistency_loss,
     prediction_loss,
     reconstruction_loss,
-    self_paced_weights,
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
 from src.modeling.common.feature_loader import load_features_for_task
@@ -62,7 +61,7 @@ def _default_comparison_records_path() -> Path:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="PI-SP-DLS-SSM anomaly detection")
+    p = argparse.ArgumentParser(description="PI-DLS-SSM anomaly detection")
     p.add_argument("--task", default="anomaly_semisup")
     p.add_argument("--dataset", default="costa")
     p.add_argument("--split-path", default="path_a")
@@ -75,7 +74,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--artifacts-dir", default=None)
     p.add_argument("--comparison-records-path", default=str(_default_comparison_records_path()))
     p.add_argument("--physics", action="store_true", help="Enable physics consistency loss")
-    p.add_argument("--self-paced", action="store_true", help="Enable self-paced curriculum weighting")
     p.add_argument("--one-class", action="store_true", help="Deep SVDD-style latent compactness loss")
     p.add_argument("--consistency", action="store_true", help="Consistency regularization on q_mu under PV-safe augmentation")
     p.add_argument("--cvae", action="store_true", help="Conditional VAE: condition on operating-regime features (irr, pvt, ...)")
@@ -142,7 +140,6 @@ def _run_hpo(
     physics_enabled: bool,
     oc_enabled: bool,
     consistency_enabled: bool,
-    self_paced_enabled: bool,
     seed: int,
     n_trials_override: int | None,
     cvae_enabled: bool = False,
@@ -189,10 +186,6 @@ def _run_hpo(
             enable_string_power=bool(physics_components.get("string_power", True)),
             enable_imbalance=bool(physics_components.get("imbalance", True)),
             physics_enabled=physics_enabled,
-            self_paced_enabled=self_paced_enabled,
-            tau_start=float(cfg.get("self_paced_tau_start", 0.1)),
-            tau_end=float(cfg.get("self_paced_tau_end", 1.0)),
-            w_min=float(cfg.get("self_paced_w_min", 0.2)),
             lambda_kl_score=float(suggested.get("lambda_kl_score", cfg.get("lambda_kl_score", 0.1))),
             lambda_phys_score=float(suggested.get("lambda_phys_score", cfg.get("lambda_phys_score", 0.0))),
             alpha_pred=float(cfg.get("alpha_pred", 0.1)),
@@ -253,10 +246,10 @@ def _run_hpo(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DLSSMLightningModule(pl.LightningModule):
-    """PI-SP-DLS-SSM training module.
+    """PI-DLS-SSM training module.
 
-    Uses standard automatic optimization (single ELBO loss with physics and
-    self-paced extensions) — no manual backward like MAAT.
+    Uses standard automatic optimization (single ELBO loss with optional
+    regularization terms) — no manual backward like MAAT.
     """
 
     def __init__(
@@ -274,11 +267,7 @@ class DLSSMLightningModule(pl.LightningModule):
         lambda_phys: float = 0.05,
         enable_string_power: bool = True,
         enable_imbalance: bool = True,
-        self_paced_enabled: bool = True,
         physics_enabled: bool = True,
-        tau_start: float = 0.1,
-        tau_end: float = 1.0,
-        w_min: float = 0.2,
         lambda_kl_score: float = 0.1,
         lambda_phys_score: float = 0.0,
         alpha_pred: float = 0.1,
@@ -314,10 +303,6 @@ class DLSSMLightningModule(pl.LightningModule):
         self.enable_string_power = enable_string_power
         self.enable_imbalance = enable_imbalance
         self.physics_enabled = physics_enabled
-        self.self_paced_enabled = self_paced_enabled
-        self.tau_start = tau_start
-        self.tau_end = tau_end
-        self.w_min = w_min
         self.lambda_kl_score = lambda_kl_score
         self.lambda_phys_score = lambda_phys_score
         self.alpha_pred = alpha_pred
@@ -443,16 +428,6 @@ class DLSSMLightningModule(pl.LightningModule):
         # KL warmup: ramp beta_kl from 0 to beta_kl over kl_warmup_epochs
         beta = self.beta_kl * min(1.0, (self.current_epoch + 1) / max(self.kl_warmup_epochs, 1))
 
-        # SPL tau schedule: anneal from tau_start (focus easy) to tau_end (include hard)
-        progress = self.current_epoch / max(self.max_epochs - 1, 1)
-        tau = self.tau_start * (self.tau_end / max(self.tau_start, 1e-6)) ** progress
-
-        # Self-paced weights
-        if self.self_paced_enabled:
-            w = self_paced_weights(recon_w, phys_w, self.lambda_phys, tau, self.w_min)
-        else:
-            w = torch.ones_like(recon_w)
-
         lambda_phys = self.lambda_phys if self.physics_enabled else 0.0
 
         # One-class compactness (only after c is initialized)
@@ -487,7 +462,7 @@ class DLSSMLightningModule(pl.LightningModule):
             + lambda_oc_eff * oc_w
             + lambda_cons_eff * cons_w
         )
-        loss = (w * per_window).mean()
+        loss = per_window.mean()
 
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_recon", recon_w.mean(), on_step=False, on_epoch=True)
@@ -498,14 +473,6 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("train_cons", cons_w.mean(), on_step=False, on_epoch=True)
         self.log("train_c_norm", self.c.norm(), on_step=False, on_epoch=True)
         self.log("train_beta_kl", beta, on_step=False, on_epoch=True)
-        self.log("train_tau", tau, on_step=False, on_epoch=True)
-        self.log("train_w_mean", w.mean(), on_step=False, on_epoch=True)
-        self.log("train_w_std", w.std(), on_step=False, on_epoch=True)
-        self.log("train_w_min", w.min(), on_step=False, on_epoch=True)
-        self.log("train_w_max", w.max(), on_step=False, on_epoch=True)
-        # Effective sample fraction: fraction of windows with weight above mean
-        eff_frac = (w > w.mean()).float().mean()
-        self.log("train_w_eff_frac", eff_frac, on_step=False, on_epoch=True)
         return loss
 
     def _score_batch(self, x: torch.Tensor, out: dict) -> torch.Tensor:
@@ -779,7 +746,6 @@ def run_dlssm(config: dict | None = None) -> None:
     is_smoke: bool = args.smoke
 
     physics_enabled: bool = args.physics or bool(dlssm_cfg.get("physics_enabled", False))
-    self_paced_enabled: bool = args.self_paced or bool(dlssm_cfg.get("self_paced", False))
     oc_enabled: bool = args.one_class or bool(dlssm_cfg.get("one_class", False))
     consistency_enabled: bool = args.consistency or bool(dlssm_cfg.get("consistency", False))
     cvae_enabled: bool = args.cvae or bool(dlssm_cfg.get("cvae", False))
@@ -796,8 +762,6 @@ def run_dlssm(config: dict | None = None) -> None:
         parts.append("OC")
     if consistency_enabled:
         parts.append("Cons")
-    if self_paced_enabled:
-        parts.append("SP")
     variant = ("-".join(parts) + "-DLS-SSM") if parts else "DLS-SSM"
 
     logger.info(
@@ -923,7 +887,6 @@ def run_dlssm(config: dict | None = None) -> None:
             physics_enabled=physics_enabled,
             oc_enabled=oc_enabled,
             consistency_enabled=consistency_enabled,
-            self_paced_enabled=self_paced_enabled,
             seed=seed,
             n_trials_override=args.n_trials,
         )
@@ -964,10 +927,6 @@ def run_dlssm(config: dict | None = None) -> None:
         enable_string_power=bool(physics_components.get("string_power", True)),
         enable_imbalance=bool(physics_components.get("imbalance", True)),
         physics_enabled=physics_enabled,
-        self_paced_enabled=self_paced_enabled,
-        tau_start=float(dlssm_cfg.get("self_paced_tau_start", 0.1)),
-        tau_end=float(dlssm_cfg.get("self_paced_tau_end", 1.0)),
-        w_min=float(dlssm_cfg.get("self_paced_w_min", 0.2)),
         lambda_kl_score=float(dlssm_cfg.get("lambda_kl_score", 0.1)),
         lambda_phys_score=float(dlssm_cfg.get("lambda_phys_score", 0.0)),
         alpha_pred=float(dlssm_cfg.get("alpha_pred", 0.1)),
@@ -1028,8 +987,8 @@ def run_dlssm(config: dict | None = None) -> None:
     trainer = pl.Trainer(**trainer_kwargs)
 
     logger.info(
-        "Training {} (cvae={}, physics={}, one_class={}, consistency={}, self_paced={})",
-        variant, cvae_enabled, physics_enabled, oc_enabled, consistency_enabled, self_paced_enabled,
+        "Training {} (cvae={}, physics={}, one_class={}, consistency={})",
+        variant, cvae_enabled, physics_enabled, oc_enabled, consistency_enabled,
     )
     t0 = time.perf_counter()
     trainer.fit(lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
@@ -1106,7 +1065,6 @@ def run_dlssm(config: dict | None = None) -> None:
     run_params = {
         "variant": variant,
         "physics_enabled": physics_enabled,
-        "self_paced_enabled": self_paced_enabled,
         "oc_enabled": oc_enabled,
         "consistency_enabled": consistency_enabled,
         "cvae_enabled": cvae_enabled,
@@ -1164,7 +1122,6 @@ def run_dlssm(config: dict | None = None) -> None:
                 "model_family": "anomaly_dl",
                 "variant": variant,
                 "physics_informed": str(physics_enabled),
-                "self_paced": str(self_paced_enabled),
                 "one_class": str(oc_enabled),
                 "consistency": str(consistency_enabled),
                 "cvae": str(cvae_enabled),
@@ -1195,7 +1152,6 @@ def run_dlssm(config: dict | None = None) -> None:
                 "feature_profile": str(args.profile),
                 "feature_run_dir": str(resolved_run_dir),
                 "physics_enabled": physics_enabled,
-                "self_paced_enabled": self_paced_enabled,
                 "oc_enabled": oc_enabled,
                 "consistency_enabled": consistency_enabled,
                 "cvae_enabled": cvae_enabled,

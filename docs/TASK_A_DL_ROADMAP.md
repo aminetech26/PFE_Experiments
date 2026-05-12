@@ -8,7 +8,6 @@ Task A ML baselines complete: OC-SVM ~92% PR-AUC (RBF, plus_physics), XGBoost ~9
 - Task A only — Task B (classification) is considered resolved
 - No focal loss — Costa supervised split is ~53% normal / ~47% fault, not a severe enough imbalance to justify focal loss complexity
 - Physics loss (Track 2) requires a dedicated design session before implementation — open problems documented below
-- SPL used across all three tracks
 
 ---
 
@@ -20,7 +19,7 @@ Task A ML baselines complete: OC-SVM ~92% PR-AUC (RBF, plus_physics), XGBoost ~9
 - **Profiles**: `plus_rolling` (Path A), `plus_all` (Path B)
 - **Challenge**: High dimensionality (plus_all can be 100+ features) — dimensionality reduction may be needed (PCA, learned linear projection, or input embedding layer before SSM)
 - **Model**: SSM variants from papers — architecture and variant selection driven by user's paper references
-- **Loss**: Standard reconstruction MSE + SPL curriculum
+- **Loss**: Standard reconstruction MSE
 - **Anomaly score**: Reconstruction MSE(x̂, x) at test time
 - **Note**: No physics loss, no SSL — clean ablation that isolates the SSM architecture's contribution
 
@@ -29,7 +28,7 @@ Task A ML baselines complete: OC-SVM ~92% PR-AUC (RBF, plus_physics), XGBoost ~9
 - **Purpose**: Augment Track 1's SSM with domain-specific physics constraints on the reconstruction output
 - **Profile**: Same as Track 1 (`plus_rolling` / `plus_all`)
 - **Model**: Same SSM family as Track 1, with reconstruction head outputting x̂ in feature space
-- **Loss**: `L_recon(x̂, x) + λ_physics × L_physics(x̂)` + SPL
+- **Loss**: `L_recon(x̂, x) + λ_physics × L_physics(x̂)`
 - **Physics loss**: Applied to x̂ (reconstruction output) — NOT to z (latent). x̂ lives in feature space where each dimension is a named physical channel. See design section below.
 - **Anomaly score**: Reconstruction MSE, optionally weighted by physics violation magnitude
 - **Contribution**: The physics loss is a major thesis contribution — careful derivation and domain argumentation required
@@ -41,7 +40,6 @@ Task A ML baselines complete: OC-SVM ~92% PR-AUC (RBF, plus_physics), XGBoost ~9
 - **No reconstruction head**: Forcing reconstruction risks pulling representations toward identity mapping, conflicting with SSL's goal of learning abstract invariances and temporal structure
 - **Anomaly score**: Distance in latent space from normal centroid (Mahalanobis distance, cosine distance, or NLL under fitted Gaussian on training embeddings)
 - **No physics loss**: z has no guaranteed correspondence to physical channels — applying physics equations to abstract latent dimensions is architecturally unjustifiable
-- **SPL**: Curriculum on distance-from-centroid difficulty during pre-training
 
 ---
 
@@ -83,22 +81,6 @@ L_ohm = || x̂[pdc1] - x̂[vdc1] × x̂[idc1] ||²
 
 ---
 
-## Self-Paced Learning (All Three Tracks)
-
-```
-Threshold:     λ_e = λ_0 × (1 + κ × e)
-Sample weight: w_i = 1  if loss_i ≤ λ_e,  else 0
-```
-
-| Track | loss_i definition |
-|---|---|
-| Track 1 | reconstruction MSE of sample i |
-| Track 2 | reconstruction MSE (same as Track 1, before physics term) |
-| Track 3 | distance from normal centroid in latent space |
-
-Log active fraction per epoch — must grow from ~50% → ~100% to confirm curriculum is functioning.
-
----
 
 ## Dimensionality Reduction (Track 1 / Track 2 on plus_all)
 
@@ -124,7 +106,7 @@ Windows provide **short-term temporal context around the operating point** — n
 | File | Purpose |
 |---|---|
 | `src/modeling/anomaly_detection/dl/dataset.py` | `TimeSeriesDataset` — sliding window (episode-safe), normal-only mode for semisup |
-| `src/modeling/anomaly_detection/dl/losses.py` | `PhysicsInformedLoss(x_hat, feature_index_map)` (TBD terms), `SPLWeightedLoss` |
+| `src/modeling/anomaly_detection/dl/losses.py` | `PhysicsInformedLoss(x_hat, feature_index_map)` (TBD terms) |
 | `src/modeling/anomaly_detection/dl/base_trainer.py` | `BaseAnomalyLightningModule` — val/test PR-AUC, threshold calibration, MLflow hooks |
 | `src/modeling/anomaly_detection/dl/run.py` | Dispatcher — reads `anomaly_detection.dl.active_model`, routes to track1/2/3 |
 | `src/modeling/anomaly_detection/dl/ssl_encoder.py` | `SSLEncoder(nn.Module)` — backbone + SSL pre-training variants (JEPA / BYOL / TS2Vec) |
@@ -132,7 +114,7 @@ Windows provide **short-term temporal context around the operating point** — n
 ### Expand stubs
 | File | Change |
 |---|---|
-| `src/modeling/anomaly_detection/dl/ssm_model.py` | Track 1: pure SSM + SPL; Track 2: SSM + reconstruction head + physics loss on x̂ |
+| `src/modeling/anomaly_detection/dl/ssm_model.py` | Track 1: pure SSM; Track 2: SSM + reconstruction head + physics loss on x̂ |
 | `src/modeling/anomaly_detection/dl/reconstruction_autoencoder_model.py` | Repurpose for Track 3 SSL entry point: `run_ssl_anomaly()` — pre-train encoder, fit normal centroid, score by latent distance |
 
 ---
@@ -144,7 +126,7 @@ Windows provide **short-term temporal context around the operating point** — n
 3. Test: PR-AUC, F1, precision, recall
 4. Ablations:
    - Track 1: SSM variants, plus_rolling vs plus_all, with/without DR
-   - Track 2: ±physics loss terms, ±SPL, Path A vs Path B
+   - Track 2: ±physics loss terms, Path A vs Path B
    - Track 3: JEPA vs BYOL vs TS2Vec, distance metric (Mahalanobis vs cosine vs NLL)
 5. Wilcoxon signed-rank test vs best ML (OC-SVM), p < 0.05
 6. Cross-dataset: La Réunion binary, Mendeley binary
@@ -169,6 +151,5 @@ Windows provide **short-term temporal context around the operating point** — n
 - [ ] Track 1: training loop reachable, val PR-AUC logged to `Task_A_Anomaly`
 - [ ] Track 2: physics loss terms logged separately per epoch
 - [ ] Track 3: SSL pre-training loss decreasing; centroid fit on train embeddings
-- [ ] SPL active fraction grows ~50% → ~100% across all tracks
 - [ ] `experiments/metrics/anomaly_dl_results.json` written per track
 - [ ] Cross-dataset: `--dataset la_reunion` and `--dataset mendeley` produce scores without error

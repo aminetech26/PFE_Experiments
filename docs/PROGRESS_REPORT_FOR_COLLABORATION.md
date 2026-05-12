@@ -95,7 +95,6 @@ The following methods are part of our active experimentation roadmap and design 
 - stratified temporal undersampling,
 - instance hardness thresholding,
 - focal loss (for deep models),
-- self-paced learning style curricula,
 - comparative protocol across multiple resampling strategies.
 
 

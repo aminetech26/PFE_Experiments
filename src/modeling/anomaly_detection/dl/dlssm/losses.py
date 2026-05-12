@@ -206,29 +206,6 @@ def apply_pv_safe_augmentation(
     return out
 
 
-def self_paced_weights(
-    recon_w: torch.Tensor,
-    phys_w: torch.Tensor,
-    lambda_phys: float,
-    tau: float,
-    w_min: float = 0.2,
-) -> torch.Tensor:
-    """Per-window self-paced curriculum weights.
-
-    Difficulty d_i = recon_i + lambda_phys * phys_i (both detached).
-    Easy windows (low d_i) get high weight early; tau anneals toward 1 to
-    progressively include harder windows.
-
-    Returns [B] weights normalized to unit mean, clamped to [w_min, inf].
-    """
-    d = recon_w.detach() + lambda_phys * phys_w.detach()  # [B]
-    w = torch.exp(-d / max(float(tau), 1e-6))
-    # Clamp first so w_min is respected before normalization;
-    # then renormalize so mean stays near 1 and loss scale is stable.
-    w = w.clamp(min=w_min)
-    return w / (w.mean() + 1e-8)
-
-
 def compute_anomaly_scores(
     x: torch.Tensor,
     x_hat: torch.Tensor,
