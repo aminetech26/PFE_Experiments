@@ -288,6 +288,52 @@ def _build_score_decomposition_report(
                 test_original_labels,
             )
 
+    if "voltage_drop_vdc2" in val_parts and "voltage_drop_vdc2" in test_parts:
+        _add_score_entry(
+            report,
+            "voltage_drop_vdc2",
+            val_parts["voltage_drop_vdc2"],
+            test_parts["voltage_drop_vdc2"],
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        val_vdrop_z, test_vdrop_z = _zscore_from_val(
+            val_parts["voltage_drop_vdc2"], test_parts["voltage_drop_vdc2"]
+        )
+        _add_score_entry(
+            report,
+            "clean_max_z_product_voltage",
+            np.maximum(val_product_z, val_vdrop_z),
+            np.maximum(test_product_z, test_vdrop_z),
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        _add_score_entry(
+            report,
+            "clean_max_z_recon_product_voltage",
+            np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z),
+            np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z),
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        for tau in (0.5, 1.0):
+            _add_score_entry(
+                report,
+                f"clean_logsumexp_z_product_voltage_tau_{tau:g}",
+                _logsumexp_pair(val_product_z, val_vdrop_z, tau=tau),
+                _logsumexp_pair(test_product_z, test_vdrop_z, tau=tau),
+                val_labels,
+                test_labels,
+                val_original_labels,
+                test_original_labels,
+            )
+
     by_fault: dict[str, dict] = {}
     for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
         mask = (test_original_labels == fault_label) | (test_original_labels == 0)
@@ -307,6 +353,14 @@ def _build_score_decomposition_report(
             ),
             "clean_max_pr_auc": _safe_pr_auc(labels, test_clean_max[mask]),
         }
+        if "drift_efficiency" in test_parts:
+            by_fault[f"{fault_label:g}"]["drift_efficiency_pr_auc"] = _safe_pr_auc(
+                labels, test_parts["drift_efficiency"][mask]
+            )
+        if "voltage_drop_vdc2" in test_parts:
+            by_fault[f"{fault_label:g}"]["voltage_drop_vdc2_pr_auc"] = _safe_pr_auc(
+                labels, test_parts["voltage_drop_vdc2"][mask]
+            )
     report["test_by_fault_vs_normal"] = by_fault
     return report
 
@@ -335,6 +389,7 @@ class MAATLightningModule(pl.LightningModule):
         max_epochs: int = 100,
         score_reduction: str = "center",
         drift_feature_idx: int | None = None,
+        voltage_drop_feature_idx: int | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -346,6 +401,7 @@ class MAATLightningModule(pl.LightningModule):
         self.max_epochs = max_epochs
         self.score_reduction = score_reduction
         self.drift_feature_idx = drift_feature_idx
+        self.voltage_drop_feature_idx = voltage_drop_feature_idx
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -357,6 +413,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_assoc_scores_np: np.ndarray | None = None
         self._val_assoc_affinity_scores_np: np.ndarray | None = None
         self._val_drift_scores_np: np.ndarray | None = None
+        self._val_voltage_drop_scores_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
@@ -364,6 +421,7 @@ class MAATLightningModule(pl.LightningModule):
         self._test_assoc_scores_np: np.ndarray | None = None
         self._test_assoc_affinity_scores_np: np.ndarray | None = None
         self._test_drift_scores_np: np.ndarray | None = None
+        self._test_voltage_drop_scores_np: np.ndarray | None = None
         self._test_original_labels_np: np.ndarray | None = None
         self._nan_count: int = 0
 
@@ -453,6 +511,10 @@ class MAATLightningModule(pl.LightningModule):
         if self.drift_feature_idx is not None:
             drift_series = torch.clamp(-x[:, :, self.drift_feature_idx], min=0.0)
             drift_scores = drift_series.mean(dim=1)
+        voltage_drop_scores = None
+        if self.voltage_drop_feature_idx is not None:
+            vdrop_series = torch.clamp(-x[:, :, self.voltage_drop_feature_idx], min=0.0)
+            voltage_drop_scores = vdrop_series.mean(dim=1)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         center_scores = self._reduce_scores(scores).cpu()
         center_labels = labels.cpu()
@@ -466,6 +528,9 @@ class MAATLightningModule(pl.LightningModule):
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
             "drift_scores": drift_scores.cpu() if drift_scores is not None else None,
+            "voltage_drop_scores": (
+                voltage_drop_scores.cpu() if voltage_drop_scores is not None else None
+            ),
             "labels": center_labels,
             "original_labels": original_labels.cpu(),
             "rec_loss": rec_loss.item(),
@@ -484,8 +549,13 @@ class MAATLightningModule(pl.LightningModule):
             [o["assoc_affinity_scores"] for o in self._val_outputs]
         ).numpy()
         drift_present = self._val_outputs[0].get("drift_scores") is not None
+        vdrop_present = self._val_outputs[0].get("voltage_drop_scores") is not None
         all_drift_scores = (
             torch.cat([o["drift_scores"] for o in self._val_outputs]).numpy() if drift_present else None
+        )
+        all_voltage_drop_scores = (
+            torch.cat([o["voltage_drop_scores"] for o in self._val_outputs]).numpy()
+            if vdrop_present else None
         )
         all_labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._val_outputs]).numpy()
@@ -513,6 +583,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_assoc_scores_np = all_assoc_scores
         self._val_assoc_affinity_scores_np = all_assoc_affinity_scores
         self._val_drift_scores_np = all_drift_scores
+        self._val_voltage_drop_scores_np = all_voltage_drop_scores
         self._val_original_labels_np = all_original_labels
 
         self.log("val_pr_auc", val_pr_auc, prog_bar=True)
@@ -542,6 +613,10 @@ class MAATLightningModule(pl.LightningModule):
         if self.drift_feature_idx is not None:
             drift_series = torch.clamp(-x[:, :, self.drift_feature_idx], min=0.0)
             drift_scores = drift_series.mean(dim=1)
+        voltage_drop_scores = None
+        if self.voltage_drop_feature_idx is not None:
+            vdrop_series = torch.clamp(-x[:, :, self.voltage_drop_feature_idx], min=0.0)
+            voltage_drop_scores = vdrop_series.mean(dim=1)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         self._test_outputs.append({
             "scores": self._reduce_scores(scores).cpu(),
@@ -549,6 +624,9 @@ class MAATLightningModule(pl.LightningModule):
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
             "drift_scores": drift_scores.cpu() if drift_scores is not None else None,
+            "voltage_drop_scores": (
+                voltage_drop_scores.cpu() if voltage_drop_scores is not None else None
+            ),
             "labels": labels.cpu(),
             "original_labels": original_labels.cpu(),
         })
@@ -564,8 +642,13 @@ class MAATLightningModule(pl.LightningModule):
             [o["assoc_affinity_scores"] for o in self._test_outputs]
         ).numpy()
         drift_present = self._test_outputs[0].get("drift_scores") is not None
+        vdrop_present = self._test_outputs[0].get("voltage_drop_scores") is not None
         all_drift_scores = (
             torch.cat([o["drift_scores"] for o in self._test_outputs]).numpy() if drift_present else None
+        )
+        all_voltage_drop_scores = (
+            torch.cat([o["voltage_drop_scores"] for o in self._test_outputs]).numpy()
+            if vdrop_present else None
         )
         all_labels = torch.cat([o["labels"] for o in self._test_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._test_outputs]).numpy()
@@ -577,6 +660,7 @@ class MAATLightningModule(pl.LightningModule):
         self._test_assoc_scores_np = all_assoc_scores
         self._test_assoc_affinity_scores_np = all_assoc_affinity_scores
         self._test_drift_scores_np = all_drift_scores
+        self._test_voltage_drop_scores_np = all_voltage_drop_scores
         self._test_original_labels_np = all_original_labels
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
@@ -730,6 +814,7 @@ def _build_lightning_module(
     training_cfg: dict,
     max_epochs: int,
     drift_feature_idx: int | None,
+    voltage_drop_feature_idx: int | None,
 ) -> MAATLightningModule:
     return MAATLightningModule(
         model=model,
@@ -741,6 +826,7 @@ def _build_lightning_module(
         max_epochs=max_epochs,
         score_reduction=str(maat_cfg.get("score_reduction", "center")),
         drift_feature_idx=drift_feature_idx,
+        voltage_drop_feature_idx=voltage_drop_feature_idx,
     )
 
 
@@ -751,6 +837,7 @@ def _train_and_eval(
     val_dl: DataLoader,
     n_features: int,
     drift_feature_idx: int | None,
+    voltage_drop_feature_idx: int | None,
     max_epochs: int,
     patience: int,
     seed: int,
@@ -760,7 +847,9 @@ def _train_and_eval(
     pl.seed_everything(seed, workers=True)
 
     model = _build_model(maat_cfg, n_features)
-    lit = _build_lightning_module(model, maat_cfg, training_cfg, max_epochs, drift_feature_idx)
+    lit = _build_lightning_module(
+        model, maat_cfg, training_cfg, max_epochs, drift_feature_idx, voltage_drop_feature_idx
+    )
 
     ckpt_callback: ModelCheckpoint | None = None
     callbacks: list = [
@@ -852,6 +941,19 @@ def run_maat(config: dict | None = None) -> None:
         logger.info(f"Drift channel enabled on feature: {drift_feature_name} (idx={drift_feature_idx})")
     else:
         logger.info(f"Drift channel disabled: missing feature '{drift_feature_name}' in manifest")
+
+    voltage_drop_feature_name = "vdc2"
+    voltage_drop_feature_idx: int | None = None
+    if voltage_drop_feature_name in features:
+        voltage_drop_feature_idx = int(features.index(voltage_drop_feature_name))
+        logger.info(
+            "Voltage-drop channel enabled on feature: "
+            f"{voltage_drop_feature_name} (idx={voltage_drop_feature_idx})"
+        )
+    else:
+        logger.info(
+            f"Voltage-drop channel disabled: missing feature '{voltage_drop_feature_name}' in manifest"
+        )
 
     y_train = (train_df[label_col].to_numpy() != 0).astype(int)
     y_val = (val_df[label_col].to_numpy() != 0).astype(int)
@@ -966,7 +1068,8 @@ def run_maat(config: dict | None = None) -> None:
                 try:
                     lit, _ = _train_and_eval(
                         trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
-                        n_features, drift_feature_idx, hpo_epochs, hpo_patience, seed, trial=trial,
+                        n_features, drift_feature_idx, voltage_drop_feature_idx,
+                        hpo_epochs, hpo_patience, seed, trial=trial,
                     )
                     pr_auc = lit.best_val_pr_auc
                 except optuna.exceptions.TrialPruned:
@@ -1095,6 +1198,7 @@ def run_maat(config: dict | None = None) -> None:
         final_maat_cfg, final_training_cfg, train_dl, val_dl,
         n_features=n_features,
         drift_feature_idx=drift_feature_idx,
+        voltage_drop_feature_idx=voltage_drop_feature_idx,
         max_epochs=max_epochs,
         patience=patience,
         seed=seed,
@@ -1142,6 +1246,8 @@ def run_maat(config: dict | None = None) -> None:
     test_assoc_affinity_scores = final_lit._test_assoc_affinity_scores_np
     val_drift_scores = final_lit._val_drift_scores_np
     test_drift_scores = final_lit._test_drift_scores_np
+    val_voltage_drop_scores = final_lit._val_voltage_drop_scores_np
+    test_voltage_drop_scores = final_lit._test_voltage_drop_scores_np
     test_original_labels = final_lit._test_original_labels_np
 
     if val_scores is None or test_scores is None:
@@ -1224,6 +1330,8 @@ def run_maat(config: dict | None = None) -> None:
             test_assoc_scores,
             test_assoc_affinity_scores,
             test_drift_scores,
+            val_voltage_drop_scores,
+            test_voltage_drop_scores,
             test_original_labels,
         )
     ):
@@ -1234,6 +1342,7 @@ def run_maat(config: dict | None = None) -> None:
                 "association_discrepancy": val_assoc_scores,
                 "association_affinity": val_assoc_affinity_scores,
                 "drift_efficiency": val_drift_scores,
+                "voltage_drop_vdc2": val_voltage_drop_scores,
             },
             test_parts={
                 "product": test_scores,
@@ -1241,6 +1350,7 @@ def run_maat(config: dict | None = None) -> None:
                 "association_discrepancy": test_assoc_scores,
                 "association_affinity": test_assoc_affinity_scores,
                 "drift_efficiency": test_drift_scores,
+                "voltage_drop_vdc2": test_voltage_drop_scores,
             },
             val_labels=val_labels,
             test_labels=test_labels,
