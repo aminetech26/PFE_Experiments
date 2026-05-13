@@ -37,6 +37,7 @@ from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
     compute_association_discrepancy,
     compute_maat_scores,
+    physics_consistency_loss,
 )
 from src.modeling.anomaly_detection.dl.maat.model import MambaAnomalyTransformer
 from src.modeling.common.feature_loader import load_features_for_task
@@ -70,6 +71,7 @@ def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
     }
     relevant["hpo_stage1"] = maat_cfg.get("hpo_stage1", {})
     relevant["hpo_stage2"] = maat_cfg.get("hpo_stage2", {})
+    relevant["physics"] = maat_cfg.get("physics", {})
     relevant["seed"] = seed
     raw = json.dumps(relevant, sort_keys=True, default=str).encode()
     return hashlib.sha1(raw).hexdigest()[:8]
@@ -390,6 +392,12 @@ class MAATLightningModule(pl.LightningModule):
         score_reduction: str = "center",
         drift_feature_idx: int | None = None,
         voltage_drop_feature_idx: int | None = None,
+        physics_enabled: bool = False,
+        lambda_phys: float = 0.0,
+        physics_feature_idx: dict[str, int] | None = None,
+        scaler_mean: torch.Tensor | None = None,
+        scaler_scale: torch.Tensor | None = None,
+        physics_huber_delta: float = 0.05,
     ) -> None:
         super().__init__()
         self.model = model
@@ -402,6 +410,12 @@ class MAATLightningModule(pl.LightningModule):
         self.score_reduction = score_reduction
         self.drift_feature_idx = drift_feature_idx
         self.voltage_drop_feature_idx = voltage_drop_feature_idx
+        self.physics_enabled = physics_enabled
+        self.lambda_phys = lambda_phys
+        self.physics_feature_idx = physics_feature_idx or {}
+        self.physics_huber_delta = physics_huber_delta
+        self.scaler_mean = scaler_mean
+        self.scaler_scale = scaler_scale
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -427,19 +441,42 @@ class MAATLightningModule(pl.LightningModule):
 
     def _compute_step(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x_hat, series_list, prior_list, _ = self.model(x)
         rec_loss = nn.functional.mse_loss(x_hat, x)
         s_loss, p_loss = association_losses(series_list, prior_list)
-        loss1 = rec_loss - self.k * s_loss
-        loss2 = rec_loss + self.k * p_loss
-        return rec_loss, s_loss, p_loss, loss1, loss2
+        phys_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        if (
+            self.physics_enabled
+            and self.lambda_phys > 0.0
+            and self.scaler_mean is not None
+            and self.scaler_scale is not None
+            and self.physics_feature_idx
+        ):
+            scaler_mean = self.scaler_mean.to(device=x_hat.device, dtype=x_hat.dtype)
+            scaler_scale = self.scaler_scale.to(device=x_hat.device, dtype=x_hat.dtype)
+            phys_loss = physics_consistency_loss(
+                x_hat_scaled=x_hat,
+                scaler_mean=scaler_mean,
+                scaler_scale=scaler_scale,
+                feature_idx=self.physics_feature_idx,
+                huber_delta=self.physics_huber_delta,
+            ).mean()
+
+        loss1 = rec_loss + self.lambda_phys * phys_loss - self.k * s_loss
+        loss2 = rec_loss + self.lambda_phys * phys_loss + self.k * p_loss
+        return rec_loss, s_loss, p_loss, phys_loss, loss1, loss2
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         x, _ = batch
         opt = self.optimizers()
 
-        rec_loss, s_loss, p_loss, loss1, loss2 = self._compute_step(x)
+        rec_loss, s_loss, p_loss, phys_loss, loss1, loss2 = self._compute_step(x)
+
+        if not torch.isfinite(phys_loss):
+            self._nan_count += 1
+            self.log("physics_nan_detected", 1.0, prog_bar=False)
+            return
 
         if not (torch.isfinite(loss1) and torch.isfinite(loss2)):
             self._nan_count += 1
@@ -474,6 +511,7 @@ class MAATLightningModule(pl.LightningModule):
         self.log("train_prior_kl", p_loss, on_step=False, on_epoch=True)
         self.log("train_loss1", loss1, on_step=False, on_epoch=True)
         self.log("train_loss2", loss2, on_step=False, on_epoch=True)
+        self.log("train_phys_loss", phys_loss, on_step=False, on_epoch=True)
         self.log("grad_norm", grad_norm, on_step=False, on_epoch=True)
 
     def on_train_epoch_end(self) -> None:
@@ -815,6 +853,12 @@ def _build_lightning_module(
     max_epochs: int,
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
+    physics_enabled: bool,
+    lambda_phys: float,
+    physics_feature_idx: dict[str, int],
+    scaler_mean: torch.Tensor,
+    scaler_scale: torch.Tensor,
+    physics_huber_delta: float,
 ) -> MAATLightningModule:
     return MAATLightningModule(
         model=model,
@@ -827,6 +871,12 @@ def _build_lightning_module(
         score_reduction=str(maat_cfg.get("score_reduction", "center")),
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
+        physics_enabled=physics_enabled,
+        lambda_phys=lambda_phys,
+        physics_feature_idx=physics_feature_idx,
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
+        physics_huber_delta=physics_huber_delta,
     )
 
 
@@ -838,6 +888,12 @@ def _train_and_eval(
     n_features: int,
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
+    physics_enabled: bool,
+    lambda_phys: float,
+    physics_feature_idx: dict[str, int],
+    scaler_mean: torch.Tensor,
+    scaler_scale: torch.Tensor,
+    physics_huber_delta: float,
     max_epochs: int,
     patience: int,
     seed: int,
@@ -848,7 +904,18 @@ def _train_and_eval(
 
     model = _build_model(maat_cfg, n_features)
     lit = _build_lightning_module(
-        model, maat_cfg, training_cfg, max_epochs, drift_feature_idx, voltage_drop_feature_idx
+        model=model,
+        maat_cfg=maat_cfg,
+        training_cfg=training_cfg,
+        max_epochs=max_epochs,
+        drift_feature_idx=drift_feature_idx,
+        voltage_drop_feature_idx=voltage_drop_feature_idx,
+        physics_enabled=physics_enabled,
+        lambda_phys=lambda_phys,
+        physics_feature_idx=physics_feature_idx,
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
+        physics_huber_delta=physics_huber_delta,
     )
 
     ckpt_callback: ModelCheckpoint | None = None
@@ -977,6 +1044,29 @@ def run_maat(config: dict | None = None) -> None:
     val_df[features] = scaler.transform(val_df[features])
     test_df[features] = scaler.transform(test_df[features])
 
+    physics_cfg = maat_cfg.get("physics", {})
+    physics_enabled = bool(physics_cfg.get("enabled", False))
+    lambda_phys = float(physics_cfg.get("lambda_phys", 0.0))
+    physics_huber_delta = float(physics_cfg.get("huber_delta", 0.05))
+    physics_feature_names = ["pdc1", "pdc2", "vdc1", "vdc2", "idc1", "idc2"]
+    physics_feature_idx = {name: features.index(name) for name in physics_feature_names if name in features}
+    if physics_enabled:
+        missing = [name for name in physics_feature_names if name not in physics_feature_idx]
+        if missing:
+            raise ValueError(
+                "MAAT physics.enabled=true requires all symmetry features in final_features. "
+                f"Missing: {missing}"
+            )
+    scaler_mean_t = torch.tensor(scaler.mean_, dtype=torch.float32)
+    scaler_scale_t = torch.tensor(scaler.scale_, dtype=torch.float32)
+    if physics_enabled:
+        logger.info(
+            "Physics regularizer enabled | lambda_phys={} huber_delta={} features={}",
+            lambda_phys,
+            physics_huber_delta,
+            sorted(physics_feature_idx.keys()),
+        )
+
     # ── Window config ──────────────────────────────────────────────────────────
     win_size = int(maat_cfg["win_size"])
     train_stride = int(maat_cfg.get("train_stride", 1))
@@ -1069,6 +1159,9 @@ def run_maat(config: dict | None = None) -> None:
                     lit, _ = _train_and_eval(
                         trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
                         n_features, drift_feature_idx, voltage_drop_feature_idx,
+                        physics_enabled, lambda_phys, physics_feature_idx,
+                        scaler_mean_t, scaler_scale_t,
+                        physics_huber_delta,
                         hpo_epochs, hpo_patience, seed, trial=trial,
                     )
                     pr_auc = lit.best_val_pr_auc
@@ -1199,6 +1292,12 @@ def run_maat(config: dict | None = None) -> None:
         n_features=n_features,
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
+        physics_enabled=physics_enabled,
+        lambda_phys=lambda_phys,
+        physics_feature_idx=physics_feature_idx,
+        scaler_mean=scaler_mean_t,
+        scaler_scale=scaler_scale_t,
+        physics_huber_delta=physics_huber_delta,
         max_epochs=max_epochs,
         patience=patience,
         seed=seed,

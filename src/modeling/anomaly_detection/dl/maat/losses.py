@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def maat_kl_loss(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
@@ -86,3 +87,65 @@ def compute_association_discrepancy(
         kl_per_layer.append((kl_sp + kl_ps).mean(dim=1))  # [B, W]
 
     return torch.stack(kl_per_layer, dim=0).mean(dim=0)  # [B, W]
+
+
+def inverse_standardize(
+    x_scaled: torch.Tensor,
+    mean: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Invert StandardScaler normalization for [B, W, F] inputs."""
+    return x_scaled * scale + mean
+
+
+def physics_consistency_loss(
+    x_hat_scaled: torch.Tensor,
+    scaler_mean: torch.Tensor,
+    scaler_scale: torch.Tensor,
+    feature_idx: dict[str, int],
+    huber_delta: float = 0.05,
+) -> torch.Tensor:
+    """String-symmetry physics loss on reconstructed outputs in physical units.
+
+    Enforces normal-manifold two-string symmetry:
+      pdc1 ~= pdc2, vdc1 ~= vdc2, idc1 ~= idc2
+
+    Returns a [B] per-window scalar.
+    """
+    x_hat_phys = inverse_standardize(x_hat_scaled, scaler_mean, scaler_scale)  # [B, W, F]
+    bsz = x_hat_phys.size(0)
+    loss = torch.zeros(bsz, device=x_hat_phys.device, dtype=x_hat_phys.dtype)
+    n_components = 3
+
+    def _get(name: str) -> torch.Tensor | None:
+        idx = feature_idx.get(name)
+        return x_hat_phys[:, :, idx] if idx is not None else None
+
+    pdc1 = _get("pdc1")
+    pdc2 = _get("pdc2")
+    vdc1 = _get("vdc1")
+    vdc2 = _get("vdc2")
+    idc1 = _get("idc1")
+    idc2 = _get("idc2")
+
+    pdc_scale = scaler_scale[feature_idx["pdc1"]].abs().clamp(min=1.0)
+    vdc_scale = scaler_scale[feature_idx["vdc1"]].abs().clamp(min=1.0)
+    idc_scale = scaler_scale[feature_idx["idc1"]].abs().clamp(min=1.0)
+
+    r_p = (pdc1 - pdc2) / pdc_scale
+    r_v = (vdc1 - vdc2) / vdc_scale
+    r_i = (idc1 - idc2) / idc_scale
+
+    loss = loss + F.huber_loss(
+        r_p, torch.zeros_like(r_p), delta=huber_delta, reduction="none"
+    ).mean(dim=1)
+    loss = loss + F.huber_loss(
+        r_v, torch.zeros_like(r_v), delta=huber_delta, reduction="none"
+    ).mean(dim=1)
+    loss = loss + F.huber_loss(
+        r_i, torch.zeros_like(r_i), delta=huber_delta, reduction="none"
+    ).mean(dim=1)
+
+    loss = loss / n_components
+
+    return loss
