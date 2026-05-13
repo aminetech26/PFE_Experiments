@@ -96,61 +96,6 @@ class Encoder(nn.Module):
         return x, series_list, prior_list, sigma_list
 
 
-class AttentionFFNLayer(nn.Module):
-    """Attention + FFN layer used by the upstream-style shared-Mamba encoder."""
-
-    def __init__(
-        self,
-        attention: AttentionLayer,
-        d_model: int,
-        d_ff: int,
-        dropout: float = 0.0,
-        activation: str = "gelu",
-    ) -> None:
-        super().__init__()
-        self.attention = attention
-        self.dropout = nn.Dropout(dropout)
-        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
-        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.activation = functional.gelu if activation == "gelu" else functional.relu
-
-    def forward(
-        self, x: torch.Tensor, attn_mask=None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        new_x, series, prior, sigma = self.attention(x, x, x)
-        x = self.norm1(x + self.dropout(new_x))
-        y = self.dropout(self.activation(self.conv1(x.transpose(-1, 1))))
-        y = self.dropout(self.conv2(y).transpose(-1, 1))
-        x = self.norm2(x + y)
-        return x, series, prior, sigma
-
-
-class UpstreamSharedMambaEncoder(nn.Module):
-    """Upstream-style MAAT encoder: attention layer followed by one shared Mamba block."""
-
-    def __init__(self, layers: list[AttentionFFNLayer], d_model: int) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList(layers)
-        self.shared_mamba = _build_mamba_block(d_model)
-        self.gate_linear = nn.Linear(2 * d_model, d_model)
-
-    def forward(
-        self, x: torch.Tensor, attn_mask=None
-    ) -> tuple[torch.Tensor, list, list, list]:
-        series_list, prior_list, sigma_list = [], [], []
-        for layer in self.layers:
-            x, series, prior, sigma = layer(x, attn_mask=attn_mask)
-            mamba_x = self.shared_mamba(x)
-            gate = torch.sigmoid(self.gate_linear(torch.cat([mamba_x, x], dim=-1)))
-            x = gate * mamba_x + (1.0 - gate) * x
-            series_list.append(series)
-            prior_list.append(prior)
-            sigma_list.append(sigma)
-        return x, series_list, prior_list, sigma_list
-
-
 class MambaAnomalyTransformer(nn.Module):
     def __init__(
         self,
@@ -164,7 +109,6 @@ class MambaAnomalyTransformer(nn.Module):
         dropout: float = 0.1,
         activation: str = "gelu",
         block_size: int = 10,
-        architecture_variant: str = "local_parallel_mamba",
     ) -> None:
         super().__init__()
         assert win_size % block_size == 0, (
@@ -174,7 +118,6 @@ class MambaAnomalyTransformer(nn.Module):
             f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
         )
 
-        self.architecture_variant = architecture_variant
         self.enc_embedding = DataEmbedding(enc_in, d_model, dropout)
 
         def _attention_layer() -> AttentionLayer:
@@ -190,39 +133,18 @@ class MambaAnomalyTransformer(nn.Module):
                 n_heads=n_heads,
             )
 
-        if architecture_variant == "upstream_shared_mamba":
-            self.encoder = UpstreamSharedMambaEncoder(
-                [
-                    AttentionFFNLayer(
-                        _attention_layer(),
-                        d_model=d_model,
-                        d_ff=d_ff,
-                        dropout=dropout,
-                        activation=activation,
-                    )
-                    for _ in range(e_layers)
-                ],
-                d_model=d_model,
-            )
-        elif architecture_variant == "local_parallel_mamba":
-            self.encoder = Encoder(
-                [
-                    EncoderLayer(
-                        _attention_layer(),
-                        d_model=d_model,
-                        d_ff=d_ff,
-                        dropout=dropout,
-                        activation=activation,
-                    )
-                    for _ in range(e_layers)
-                ]
-            )
-        else:
-            raise ValueError(
-                "Unsupported MAAT architecture_variant="
-                f"{architecture_variant!r}. Expected 'local_parallel_mamba' or "
-                "'upstream_shared_mamba'."
-            )
+        self.encoder = Encoder(
+            [
+                EncoderLayer(
+                    _attention_layer(),
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    activation=activation,
+                )
+                for _ in range(e_layers)
+            ]
+        )
 
         self.projection = nn.Linear(d_model, c_out, bias=True)
 

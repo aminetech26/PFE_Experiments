@@ -33,9 +33,9 @@
 ### MAAT upstream-style architecture variant
 
 - Observation: the local MAAT variant uses independent per-layer Mamba blocks in parallel with anomaly attention, while upstream MAAT reuses one shared Mamba block after each attention layer.
-- Decision: add `architecture_variant=upstream_shared_mamba` as an explicit controlled variant while preserving the tested changes: linear token embedding, full Gaussian prior, `train_stride=5`, and `score_reduction=max`.
+- Decision: test an upstream-style shared-Mamba variant while preserving the tested changes: linear token embedding, full Gaussian prior, `train_stride=5`, and `score_reduction=max`.
 - Result: the upstream-style shared-Mamba variant reached `test_pr_auc=0.9152`, `test_roc_auc=0.9016`, `test_f1=0.8235`, `fit_time_s=420.62` on Costa Path A with the same best parameters and 37,304 training windows.
-- Consequence: upstream-style placement improves neither ranking nor threshold transfer over the local parallel-Mamba result (`test_pr_auc=0.9224`, `test_roc_auc=0.9295`, `test_f1=0.8818`), so `local_parallel_mamba` remains the canonical MAAT variant.
+- Consequence: upstream-style placement improves neither ranking nor threshold transfer over the local parallel-Mamba result (`test_pr_auc=0.9224`, `test_roc_auc=0.9295`, `test_f1=0.8818`), so the runtime switch was removed and the local parallel-Mamba architecture remains canonical.
 
 ## 2026-05-01
 

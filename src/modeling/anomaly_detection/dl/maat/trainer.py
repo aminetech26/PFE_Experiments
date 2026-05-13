@@ -66,8 +66,7 @@ def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
     relevant = {
         k: maat_cfg.get(k)
         for k in ("win_size", "block_size", "d_model", "n_heads", "e_layers",
-                  "d_ff", "dropout", "k", "temperature", "score_reduction",
-                  "architecture_variant")
+                  "d_ff", "dropout", "k", "temperature", "score_reduction")
     }
     relevant["hpo_stage1"] = maat_cfg.get("hpo_stage1", {})
     relevant["hpo_stage2"] = maat_cfg.get("hpo_stage2", {})
@@ -173,6 +172,31 @@ def _macro_fault_pr_auc(
     return float(np.mean(values)) if values else 0.0
 
 
+def _logsumexp_pair(a: np.ndarray, b: np.ndarray, tau: float) -> np.ndarray:
+    stacked = np.stack([a / tau, b / tau], axis=0)
+    max_vals = np.max(stacked, axis=0)
+    return tau * (max_vals + np.log(np.exp(stacked - max_vals).sum(axis=0)))
+
+
+def _add_score_entry(
+    report: dict,
+    name: str,
+    val_scores: np.ndarray,
+    test_scores: np.ndarray,
+    val_labels: np.ndarray,
+    test_labels: np.ndarray,
+    val_original_labels: np.ndarray,
+    test_original_labels: np.ndarray,
+) -> None:
+    threshold, _, _, _ = _calibrate_threshold(val_scores, val_labels)
+    report["scores"][name] = {
+        "val_macro_fault_pr_auc": _macro_fault_pr_auc(val_original_labels, val_scores),
+        "test_macro_fault_pr_auc": _macro_fault_pr_auc(test_original_labels, test_scores),
+        "val": _score_metrics(val_scores, val_labels, threshold),
+        "test": _score_metrics(test_scores, test_labels, threshold),
+    }
+
+
 def _build_score_decomposition_report(
     val_parts: dict[str, np.ndarray],
     test_parts: dict[str, np.ndarray],
@@ -181,11 +205,7 @@ def _build_score_decomposition_report(
     val_original_labels: np.ndarray,
     test_original_labels: np.ndarray,
 ) -> dict:
-    report: dict = {
-        "scores": {},
-        "additive_alpha_grid": [0.0, 0.25, 0.5, 1.0, 2.0],
-        "product_fusion_alpha_grid": [0.0, 0.25, 0.5, 1.0, 2.0],
-    }
+    report: dict = {"scores": {}}
 
     for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
         threshold, _, _, _ = _calibrate_threshold(val_parts[name], val_labels)
@@ -197,74 +217,30 @@ def _build_score_decomposition_report(
     val_recon_z, test_recon_z = _zscore_from_val(
         val_parts["reconstruction"], test_parts["reconstruction"]
     )
-    val_affinity_z, test_affinity_z = _zscore_from_val(
-        val_parts["association_affinity"], test_parts["association_affinity"]
-    )
-
-    best_alpha = 0.0
-    best_val_pr_auc = -np.inf
-    additive_trials: list[dict] = []
-    for alpha in report["additive_alpha_grid"]:
-        val_add = val_recon_z + float(alpha) * val_affinity_z
-        pr_auc = _safe_pr_auc(val_labels, val_add)
-        threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_add, val_labels)
-        additive_trials.append({
-            "alpha": float(alpha),
-            "val_pr_auc": pr_auc,
-            "val_f1_at_threshold": float(val_f1),
-            "val_precision_at_threshold": float(val_prec),
-            "val_recall_at_threshold": float(val_rec),
-            "threshold": float(threshold),
-        })
-        if pr_auc > best_val_pr_auc:
-            best_val_pr_auc = pr_auc
-            best_alpha = float(alpha)
-
-    val_add = val_recon_z + best_alpha * val_affinity_z
-    test_add = test_recon_z + best_alpha * test_affinity_z
-    threshold, _, _, _ = _calibrate_threshold(val_add, val_labels)
-    report["additive_trials"] = additive_trials
-    report["scores"]["additive_z_recon_plus_alpha_association_affinity"] = {
-        "selected_alpha": best_alpha,
-        "selection_metric": "val_pr_auc",
-        "val": _score_metrics(val_add, val_labels, threshold),
-        "test": _score_metrics(test_add, test_labels, threshold),
-    }
-
     val_product_z, test_product_z = _zscore_from_val(val_parts["product"], test_parts["product"])
-    product_fusion_trials: list[dict] = []
-    best_product_alpha = 0.0
-    best_macro_pr_auc = -np.inf
-    for alpha in report["product_fusion_alpha_grid"]:
-        val_fused = val_recon_z + float(alpha) * val_product_z
-        macro_pr_auc = _macro_fault_pr_auc(val_original_labels, val_fused)
-        global_pr_auc = _safe_pr_auc(val_labels, val_fused)
-        threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_fused, val_labels)
-        product_fusion_trials.append({
-            "alpha": float(alpha),
-            "val_macro_fault_pr_auc": macro_pr_auc,
-            "val_global_pr_auc": global_pr_auc,
-            "val_f1_at_threshold": float(val_f1),
-            "val_precision_at_threshold": float(val_prec),
-            "val_recall_at_threshold": float(val_rec),
-            "threshold": float(threshold),
-        })
-        if macro_pr_auc > best_macro_pr_auc:
-            best_macro_pr_auc = macro_pr_auc
-            best_product_alpha = float(alpha)
-
-    val_product_fused = val_recon_z + best_product_alpha * val_product_z
-    test_product_fused = test_recon_z + best_product_alpha * test_product_z
-    threshold, _, _, _ = _calibrate_threshold(val_product_fused, val_labels)
-    report["product_fusion_trials"] = product_fusion_trials
-    report["scores"]["macro_selected_z_recon_plus_alpha_product"] = {
-        "selected_alpha": best_product_alpha,
-        "selection_metric": "val_macro_fault_pr_auc",
-        "val_macro_fault_pr_auc": _macro_fault_pr_auc(val_original_labels, val_product_fused),
-        "test_macro_fault_pr_auc": _macro_fault_pr_auc(test_original_labels, test_product_fused),
-        "val": _score_metrics(val_product_fused, val_labels, threshold),
-        "test": _score_metrics(test_product_fused, test_labels, threshold),
-    }
+    val_clean_max = np.maximum(val_recon_z, val_product_z)
+    test_clean_max = np.maximum(test_recon_z, test_product_z)
+    _add_score_entry(
+        report,
+        "clean_max_z_recon_product",
+        val_clean_max,
+        test_clean_max,
+        val_labels,
+        test_labels,
+        val_original_labels,
+        test_original_labels,
+    )
+    for tau in (0.5, 1.0):
+        _add_score_entry(
+            report,
+            f"clean_logsumexp_z_recon_product_tau_{tau:g}",
+            _logsumexp_pair(val_recon_z, val_product_z, tau=tau),
+            _logsumexp_pair(test_recon_z, test_product_z, tau=tau),
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
 
     by_fault: dict[str, dict] = {}
     for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
@@ -283,10 +259,7 @@ def _build_score_decomposition_report(
             "association_affinity_pr_auc": _safe_pr_auc(
                 labels, test_parts["association_affinity"][mask]
             ),
-            "additive_pr_auc": _safe_pr_auc(labels, test_add[mask]),
-            "macro_selected_product_fusion_pr_auc": _safe_pr_auc(
-                labels, test_product_fused[mask]
-            ),
+            "clean_max_pr_auc": _safe_pr_auc(labels, test_clean_max[mask]),
         }
     report["test_by_fault_vs_normal"] = by_fault
     return report
@@ -409,8 +382,6 @@ class MAATLightningModule(pl.LightningModule):
         """Reduce [B, W] scores to [B] per-window scalars."""
         if self.score_reduction == "mean":
             return scores.mean(dim=1)
-        if self.score_reduction == "median":
-            return scores.median(dim=1).values
         if self.score_reduction == "max":
             return scores.max(dim=1).values
         # default: center
@@ -680,7 +651,6 @@ def _build_model(maat_cfg: dict, n_features: int) -> MambaAnomalyTransformer:
         d_ff=int(maat_cfg["d_ff"]),
         dropout=float(maat_cfg["dropout"]),
         block_size=int(maat_cfg["block_size"]),
-        architecture_variant=str(maat_cfg.get("architecture_variant", "local_parallel_mamba")),
     )
 
 
@@ -885,10 +855,7 @@ def run_maat(config: dict | None = None) -> None:
 
         fixed_arch = {
             k: maat_cfg[k]
-            for k in (
-                "win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff",
-                "architecture_variant",
-            )
+            for k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff")
         }
 
         def objective_builder(stage: HPOStageConfig, frozen_params: dict):
@@ -1020,7 +987,7 @@ def run_maat(config: dict | None = None) -> None:
     final_training_cfg = dict(training_cfg)
     for k, v in best_params.items():
         if k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff",
-                 "dropout", "k", "temperature", "score_reduction", "architecture_variant"):
+                 "dropout", "k", "temperature", "score_reduction"):
             final_maat_cfg[k] = v
         elif k == "learning_rate":
             final_training_cfg["lr"] = v
@@ -1196,12 +1163,10 @@ def run_maat(config: dict | None = None) -> None:
         decomposition_path.write_text(
             json.dumps(decomposition_report, indent=2, default=str), encoding="utf-8"
         )
-        best_add = decomposition_report["scores"][
-            "additive_z_recon_plus_alpha_association_affinity"
-        ]
+        clean_max = decomposition_report["scores"]["clean_max_z_recon_product"]
         logger.info(
-            "Score decomposition — additive alpha={} test_pr_auc={:.4f}",
-            best_add["selected_alpha"], best_add["test"]["pr_auc"],
+            "Score decomposition — clean max test_pr_auc={:.4f} test_macro_fault_pr_auc={:.4f}",
+            clean_max["test"]["pr_auc"], clean_max["test_macro_fault_pr_auc"],
         )
 
     if stage_results:

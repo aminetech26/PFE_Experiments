@@ -107,7 +107,6 @@ anomaly_detection:
         train_stride: 5
         eval_stride: 1
         score_reduction: max
-        architecture_variant: local_parallel_mamba  # local_parallel_mamba | upstream_shared_mamba
         scaling: standard
         hpo_stage1:
           learning_rate: {type: float, low: 1.0e-5, high: 1.0e-3, log: true}
