@@ -110,8 +110,14 @@ anomaly_detection:
         scaling: standard
         physics:
           enabled: true
-          lambda_phys: 0.05
           huber_delta: 0.05
+          irr_floor: 1.0
+          symmetry:
+            enabled: true
+            lambda: 0.05
+          v_under:
+            enabled: true
+            lambda: 0.05
         hpo_stage1:
           learning_rate: {type: float, low: 1.0e-5, high: 1.0e-3, log: true}
           weight_decay: {type: float, low: 1.0e-6, high: 1.0e-4, log: true}

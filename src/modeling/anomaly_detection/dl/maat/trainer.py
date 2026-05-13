@@ -37,6 +37,7 @@ from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
     compute_association_discrepancy,
     compute_maat_scores,
+    fit_vmpp_baseline,
     physics_consistency_loss,
 )
 from src.modeling.anomaly_detection.dl.maat.model import MambaAnomalyTransformer
@@ -393,11 +394,16 @@ class MAATLightningModule(pl.LightningModule):
         drift_feature_idx: int | None = None,
         voltage_drop_feature_idx: int | None = None,
         physics_enabled: bool = False,
-        lambda_phys: float = 0.0,
+        physics_huber_delta: float = 0.05,
         physics_feature_idx: dict[str, int] | None = None,
         scaler_mean: torch.Tensor | None = None,
         scaler_scale: torch.Tensor | None = None,
-        physics_huber_delta: float = 0.05,
+        enable_symmetry: bool = False,
+        lambda_symmetry: float = 0.0,
+        enable_v_under: bool = False,
+        lambda_v_under: float = 0.0,
+        vmpp_baseline: torch.Tensor | None = None,
+        irr_floor: float = 1.0,
     ) -> None:
         super().__init__()
         self.model = model
@@ -411,11 +417,16 @@ class MAATLightningModule(pl.LightningModule):
         self.drift_feature_idx = drift_feature_idx
         self.voltage_drop_feature_idx = voltage_drop_feature_idx
         self.physics_enabled = physics_enabled
-        self.lambda_phys = lambda_phys
-        self.physics_feature_idx = physics_feature_idx or {}
         self.physics_huber_delta = physics_huber_delta
+        self.physics_feature_idx = physics_feature_idx or {}
         self.scaler_mean = scaler_mean
         self.scaler_scale = scaler_scale
+        self.enable_symmetry = enable_symmetry
+        self.lambda_symmetry = lambda_symmetry
+        self.enable_v_under = enable_v_under
+        self.lambda_v_under = lambda_v_under
+        self.vmpp_baseline = vmpp_baseline
+        self.irr_floor = irr_floor
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -448,23 +459,32 @@ class MAATLightningModule(pl.LightningModule):
         phys_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if (
             self.physics_enabled
-            and self.lambda_phys > 0.0
             and self.scaler_mean is not None
             and self.scaler_scale is not None
             and self.physics_feature_idx
         ):
             scaler_mean = self.scaler_mean.to(device=x_hat.device, dtype=x_hat.dtype)
             scaler_scale = self.scaler_scale.to(device=x_hat.device, dtype=x_hat.dtype)
+            vmpp = (
+                self.vmpp_baseline.to(device=x_hat.device, dtype=x_hat.dtype)
+                if self.vmpp_baseline is not None else None
+            )
             phys_loss = physics_consistency_loss(
                 x_hat_scaled=x_hat,
                 scaler_mean=scaler_mean,
                 scaler_scale=scaler_scale,
                 feature_idx=self.physics_feature_idx,
                 huber_delta=self.physics_huber_delta,
+                enable_symmetry=self.enable_symmetry,
+                lambda_symmetry=self.lambda_symmetry,
+                enable_v_under=self.enable_v_under,
+                lambda_v_under=self.lambda_v_under,
+                vmpp_baseline=vmpp,
+                irr_floor=self.irr_floor,
             ).mean()
 
-        loss1 = rec_loss + self.lambda_phys * phys_loss - self.k * s_loss
-        loss2 = rec_loss + self.lambda_phys * phys_loss + self.k * p_loss
+        loss1 = rec_loss + phys_loss - self.k * s_loss
+        loss2 = rec_loss + phys_loss + self.k * p_loss
         return rec_loss, s_loss, p_loss, phys_loss, loss1, loss2
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
@@ -854,11 +874,16 @@ def _build_lightning_module(
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
     physics_enabled: bool,
-    lambda_phys: float,
+    physics_huber_delta: float,
     physics_feature_idx: dict[str, int],
     scaler_mean: torch.Tensor,
     scaler_scale: torch.Tensor,
-    physics_huber_delta: float,
+    enable_symmetry: bool,
+    lambda_symmetry: float,
+    enable_v_under: bool,
+    lambda_v_under: float,
+    vmpp_baseline: torch.Tensor | None,
+    irr_floor: float,
 ) -> MAATLightningModule:
     return MAATLightningModule(
         model=model,
@@ -872,11 +897,16 @@ def _build_lightning_module(
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
         physics_enabled=physics_enabled,
-        lambda_phys=lambda_phys,
+        physics_huber_delta=physics_huber_delta,
         physics_feature_idx=physics_feature_idx,
         scaler_mean=scaler_mean,
         scaler_scale=scaler_scale,
-        physics_huber_delta=physics_huber_delta,
+        enable_symmetry=enable_symmetry,
+        lambda_symmetry=lambda_symmetry,
+        enable_v_under=enable_v_under,
+        lambda_v_under=lambda_v_under,
+        vmpp_baseline=vmpp_baseline,
+        irr_floor=irr_floor,
     )
 
 
@@ -889,11 +919,16 @@ def _train_and_eval(
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
     physics_enabled: bool,
-    lambda_phys: float,
+    physics_huber_delta: float,
     physics_feature_idx: dict[str, int],
     scaler_mean: torch.Tensor,
     scaler_scale: torch.Tensor,
-    physics_huber_delta: float,
+    enable_symmetry: bool,
+    lambda_symmetry: float,
+    enable_v_under: bool,
+    lambda_v_under: float,
+    vmpp_baseline: torch.Tensor | None,
+    irr_floor: float,
     max_epochs: int,
     patience: int,
     seed: int,
@@ -911,11 +946,16 @@ def _train_and_eval(
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
         physics_enabled=physics_enabled,
-        lambda_phys=lambda_phys,
+        physics_huber_delta=physics_huber_delta,
         physics_feature_idx=physics_feature_idx,
         scaler_mean=scaler_mean,
         scaler_scale=scaler_scale,
-        physics_huber_delta=physics_huber_delta,
+        enable_symmetry=enable_symmetry,
+        lambda_symmetry=lambda_symmetry,
+        enable_v_under=enable_v_under,
+        lambda_v_under=lambda_v_under,
+        vmpp_baseline=vmpp_baseline,
+        irr_floor=irr_floor,
     )
 
     ckpt_callback: ModelCheckpoint | None = None
@@ -1035,36 +1075,73 @@ def run_maat(config: dict | None = None) -> None:
         f"test: {len(test_df):,} (faults: {y_test.sum():,}) | features: {n_features}"
     )
 
+    # ── Physics config (read early so V_mpp baseline can be fit on physical units) ──
+    physics_cfg = maat_cfg.get("physics", {})
+    physics_enabled = bool(physics_cfg.get("enabled", False))
+    physics_huber_delta = float(physics_cfg.get("huber_delta", 0.05))
+    irr_floor = float(physics_cfg.get("irr_floor", 1.0))
+
+    sym_cfg = physics_cfg.get("symmetry", {})
+    enable_symmetry = physics_enabled and bool(sym_cfg.get("enabled", True))
+    lambda_symmetry = float(sym_cfg.get("lambda", 0.05))
+
+    vunder_cfg = physics_cfg.get("v_under", {})
+    enable_v_under = physics_enabled and bool(vunder_cfg.get("enabled", False))
+    lambda_v_under = float(vunder_cfg.get("lambda", 0.05))
+
+    # Required features: symmetry needs vdc1/2, idc1/2; v_under additionally needs irr, pvt.
+    physics_feature_names = ["vdc1", "vdc2", "idc1", "idc2"]
+    if enable_v_under:
+        physics_feature_names += ["irr", "pvt"]
+    if physics_enabled:
+        missing = [n for n in physics_feature_names if n not in features]
+        if missing:
+            raise ValueError(
+                f"MAAT physics.enabled=true requires features {physics_feature_names}. "
+                f"Missing from manifest: {missing}"
+            )
+
     # ── Scale ──────────────────────────────────────────────────────────────────
     scaler = StandardScaler()
     train_df = train_df.copy()
     val_df = val_df.copy()
     test_df = test_df.copy()
+
+    # Pre-fit gray-box V_mpp baseline on training normals BEFORE scaling.
+    # fit_vmpp_baseline expects physical units; doing it after fit_transform would
+    # silently miscalibrate (a, b, c) against z-scored inputs.
+    vmpp_baseline_t: torch.Tensor | None = None
+    if enable_v_under:
+        train_normals = train_df.loc[train_df[label_col] == 0]
+        if len(train_normals) == 0:
+            raise ValueError(
+                "MAAT v_under enabled but no rows with label == 0 in train_df; "
+                "cannot fit V_mpp baseline."
+            )
+        (a_v, b_v, c_v), vmpp_diag = fit_vmpp_baseline(train_normals, irr_floor=irr_floor)
+        vmpp_baseline_t = torch.tensor([a_v, b_v, c_v], dtype=torch.float32)
+        logger.info(
+            "V_mpp baseline fit | a={:.3f} b={:.4f} c={:.3f} | "
+            "R²={:.4f} RMSE={:.2f}V p99|res|={:.2f}V n={}",
+            a_v, b_v, c_v,
+            vmpp_diag["r2"], vmpp_diag["rmse_phys"],
+            vmpp_diag["residual_p99_phys"], int(vmpp_diag["n_samples"]),
+        )
+
     train_df[features] = scaler.fit_transform(train_df[features])
     val_df[features] = scaler.transform(val_df[features])
     test_df[features] = scaler.transform(test_df[features])
 
-    physics_cfg = maat_cfg.get("physics", {})
-    physics_enabled = bool(physics_cfg.get("enabled", False))
-    lambda_phys = float(physics_cfg.get("lambda_phys", 0.0))
-    physics_huber_delta = float(physics_cfg.get("huber_delta", 0.05))
-    physics_feature_names = ["vdc1", "vdc2", "idc1", "idc2"]
-    physics_feature_idx = {name: features.index(name) for name in physics_feature_names if name in features}
-    if physics_enabled:
-        missing = [name for name in physics_feature_names if name not in physics_feature_idx]
-        if missing:
-            raise ValueError(
-                "MAAT physics.enabled=true requires all symmetry features in final_features. "
-                f"Missing: {missing}"
-            )
+    physics_feature_idx = {n: features.index(n) for n in physics_feature_names if n in features}
     scaler_mean_t = torch.tensor(scaler.mean_, dtype=torch.float32)
     scaler_scale_t = torch.tensor(scaler.scale_, dtype=torch.float32)
+
     if physics_enabled:
         logger.info(
-            "Physics regularizer enabled | lambda_phys={} huber_delta={} features={}",
-            lambda_phys,
+            "Physics regularizer | symmetry={} λ={} | v_under={} λ={} | huber_delta={}",
+            enable_symmetry, lambda_symmetry,
+            enable_v_under, lambda_v_under,
             physics_huber_delta,
-            sorted(physics_feature_idx.keys()),
         )
 
     # ── Window config ──────────────────────────────────────────────────────────
@@ -1159,9 +1236,11 @@ def run_maat(config: dict | None = None) -> None:
                     lit, _ = _train_and_eval(
                         trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
                         n_features, drift_feature_idx, voltage_drop_feature_idx,
-                        physics_enabled, lambda_phys, physics_feature_idx,
+                        physics_enabled, physics_huber_delta, physics_feature_idx,
                         scaler_mean_t, scaler_scale_t,
-                        physics_huber_delta,
+                        enable_symmetry, lambda_symmetry,
+                        enable_v_under, lambda_v_under,
+                        vmpp_baseline_t, irr_floor,
                         hpo_epochs, hpo_patience, seed, trial=trial,
                     )
                     pr_auc = lit.best_val_pr_auc
@@ -1293,11 +1372,16 @@ def run_maat(config: dict | None = None) -> None:
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
         physics_enabled=physics_enabled,
-        lambda_phys=lambda_phys,
+        physics_huber_delta=physics_huber_delta,
         physics_feature_idx=physics_feature_idx,
         scaler_mean=scaler_mean_t,
         scaler_scale=scaler_scale_t,
-        physics_huber_delta=physics_huber_delta,
+        enable_symmetry=enable_symmetry,
+        lambda_symmetry=lambda_symmetry,
+        enable_v_under=enable_v_under,
+        lambda_v_under=lambda_v_under,
+        vmpp_baseline=vmpp_baseline_t,
+        irr_floor=irr_floor,
         max_epochs=max_epochs,
         patience=patience,
         seed=seed,
