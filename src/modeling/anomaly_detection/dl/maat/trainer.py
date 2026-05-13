@@ -640,11 +640,11 @@ class MAATLightningModule(pl.LightningModule):
         mismatch_scores = None
         mismatch_parts: list[torch.Tensor] = []
         if self.power_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).mean(dim=1))
+            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).max(dim=1).values)
         if self.current_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).mean(dim=1))
+            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).max(dim=1).values)
         if self.voltage_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).mean(dim=1))
+            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).max(dim=1).values)
         if mismatch_parts:
             mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         center_labels = labels.cpu()
@@ -763,11 +763,11 @@ class MAATLightningModule(pl.LightningModule):
         mismatch_scores = None
         mismatch_parts: list[torch.Tensor] = []
         if self.power_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).mean(dim=1))
+            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).max(dim=1).values)
         if self.current_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).mean(dim=1))
+            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).max(dim=1).values)
         if self.voltage_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).mean(dim=1))
+            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).max(dim=1).values)
         if mismatch_parts:
             mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         self._test_outputs.append({
