@@ -16,7 +16,6 @@ import optuna
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import yaml
 from loguru import logger
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -36,10 +35,8 @@ from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
-    build_factorized_corruptions,
     compute_association_discrepancy,
     compute_maat_scores,
-    pairwise_margin_loss,
 )
 from src.modeling.anomaly_detection.dl.maat.model import MambaAnomalyTransformer
 from src.modeling.common.feature_loader import load_features_for_task
@@ -350,6 +347,57 @@ def _build_score_decomposition_report(
                 test_original_labels,
             )
 
+    if (
+        "mismatch_imbalance" in val_parts
+        and "mismatch_imbalance" in test_parts
+        and "voltage_drop_vdc2" in val_parts
+        and "voltage_drop_vdc2" in test_parts
+    ):
+        _add_score_entry(
+            report,
+            "mismatch_imbalance",
+            val_parts["mismatch_imbalance"],
+            test_parts["mismatch_imbalance"],
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        val_mismatch_z, test_mismatch_z = _zscore_from_val(
+            val_parts["mismatch_imbalance"], test_parts["mismatch_imbalance"]
+        )
+        _add_score_entry(
+            report,
+            "clean_max_z_recon_product_voltage_mismatch",
+            np.maximum(np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z), val_mismatch_z),
+            np.maximum(np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z), test_mismatch_z),
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        for tau in (0.5, 1.0):
+            val_dvm = _logsumexp_pair(
+                _logsumexp_pair(val_recon_z, val_product_z, tau=tau),
+                _logsumexp_pair(val_vdrop_z, val_mismatch_z, tau=tau),
+                tau=tau,
+            )
+            test_dvm = _logsumexp_pair(
+                _logsumexp_pair(test_recon_z, test_product_z, tau=tau),
+                _logsumexp_pair(test_vdrop_z, test_mismatch_z, tau=tau),
+                tau=tau,
+            )
+            _add_score_entry(
+                report,
+                f"clean_logsumexp_z_recon_product_voltage_mismatch_tau_{tau:g}",
+                val_dvm,
+                test_dvm,
+                val_labels,
+                test_labels,
+                val_original_labels,
+                test_original_labels,
+            )
+
     by_fault: dict[str, dict] = {}
     for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
         mask = (test_original_labels == fault_label) | (test_original_labels == 0)
@@ -376,6 +424,10 @@ def _build_score_decomposition_report(
         if "voltage_drop_vdc2" in test_parts:
             by_fault[f"{fault_label:g}"]["voltage_drop_vdc2_pr_auc"] = _safe_pr_auc(
                 labels, test_parts["voltage_drop_vdc2"][mask]
+            )
+        if "mismatch_imbalance" in test_parts:
+            by_fault[f"{fault_label:g}"]["mismatch_imbalance_pr_auc"] = _safe_pr_auc(
+                labels, test_parts["mismatch_imbalance"][mask]
             )
     report["test_by_fault_vs_normal"] = by_fault
     return report
@@ -406,6 +458,9 @@ class MAATLightningModule(pl.LightningModule):
         score_reduction: str = "center",
         drift_feature_idx: int | None = None,
         voltage_drop_feature_idx: int | None = None,
+        power_imbalance_feature_idx: int | None = None,
+        current_imbalance_feature_idx: int | None = None,
+        voltage_imbalance_feature_idx: int | None = None,
         factorized_enabled: bool = False,
         factorized_feature_idx: dict[str, int] | None = None,
         factorized_margin: float = 1.0,
@@ -426,6 +481,9 @@ class MAATLightningModule(pl.LightningModule):
         self.score_reduction = score_reduction
         self.drift_feature_idx = drift_feature_idx
         self.voltage_drop_feature_idx = voltage_drop_feature_idx
+        self.power_imbalance_feature_idx = power_imbalance_feature_idx
+        self.current_imbalance_feature_idx = current_imbalance_feature_idx
+        self.voltage_imbalance_feature_idx = voltage_imbalance_feature_idx
         self.factorized_enabled = factorized_enabled
         self.factorized_feature_idx = factorized_feature_idx or {}
         self.factorized_margin = factorized_margin
@@ -447,6 +505,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_assoc_affinity_scores_np: np.ndarray | None = None
         self._val_drift_scores_np: np.ndarray | None = None
         self._val_voltage_drop_scores_np: np.ndarray | None = None
+        self._val_mismatch_scores_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_product_scores_np: np.ndarray | None = None
@@ -456,83 +515,20 @@ class MAATLightningModule(pl.LightningModule):
         self._test_assoc_affinity_scores_np: np.ndarray | None = None
         self._test_drift_scores_np: np.ndarray | None = None
         self._test_voltage_drop_scores_np: np.ndarray | None = None
+        self._test_mismatch_scores_np: np.ndarray | None = None
         self._test_original_labels_np: np.ndarray | None = None
         self._nan_count: int = 0
 
     def _compute_step(
         self, x: torch.Tensor
     ) -> dict[str, torch.Tensor]:
+        x_hat, series_list, prior_list, _ = self.model(x)
         family_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         rank_voltage = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         rank_mismatch = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         rank_dynamic = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         family_classification = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         clean_family_penalty = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-
-        if self.factorized_enabled:
-            corruptions = build_factorized_corruptions(x, self.factorized_feature_idx)
-            x_all = torch.cat([x, corruptions["voltage"], corruptions["mismatch"], corruptions["dynamic"]], dim=0)
-            out = self.model(x_all)
-            batch_size = x.size(0)
-
-            x_hat = out["x_hat"][:batch_size]
-            series_list = [s[:batch_size] for s in out["series_list"]]
-            prior_list = [p[:batch_size] for p in out["prior_list"]]
-            logits_split = {
-                name: torch.split(logits, batch_size, dim=0)
-                for name, logits in out["family_logits"].items()
-            }
-            clean_logits = {name: parts[0] for name, parts in logits_split.items()}
-            voltage_logits = {name: parts[1] for name, parts in logits_split.items()}
-            mismatch_logits = {name: parts[2] for name, parts in logits_split.items()}
-            dynamic_logits = {name: parts[3] for name, parts in logits_split.items()}
-
-            rank_voltage = pairwise_margin_loss(
-                clean_logits["voltage"], voltage_logits["voltage"], self.factorized_margin
-            )
-            rank_mismatch = pairwise_margin_loss(
-                clean_logits["mismatch"], mismatch_logits["mismatch"], self.factorized_margin
-            )
-            rank_dynamic = pairwise_margin_loss(
-                clean_logits["dynamic"], dynamic_logits["dynamic"], self.factorized_margin
-            )
-
-            voltage_family_logits = torch.stack(
-                [voltage_logits["voltage"], voltage_logits["mismatch"], voltage_logits["dynamic"]], dim=1
-            )
-            mismatch_family_logits = torch.stack(
-                [mismatch_logits["voltage"], mismatch_logits["mismatch"], mismatch_logits["dynamic"]], dim=1
-            )
-            dynamic_family_logits = torch.stack(
-                [dynamic_logits["voltage"], dynamic_logits["mismatch"], dynamic_logits["dynamic"]], dim=1
-            )
-            family_classification = (
-                F.cross_entropy(voltage_family_logits, torch.zeros(batch_size, device=x.device, dtype=torch.long))
-                + F.cross_entropy(mismatch_family_logits, torch.ones(batch_size, device=x.device, dtype=torch.long))
-                + F.cross_entropy(dynamic_family_logits, torch.full((batch_size,), 2, device=x.device, dtype=torch.long))
-            ) / 3.0
-
-            clean_logits_stack = torch.stack([
-                clean_logits["voltage"],
-                clean_logits["mismatch"],
-                clean_logits["dynamic"],
-            ], dim=1)
-            clean_family_penalty = (
-                clean_logits_stack + (self.factorized_margin / 2.0)
-            ).pow(2).mean()
-
-            family_loss = (
-                self.lambda_voltage * rank_voltage
-                + self.lambda_mismatch * rank_mismatch
-                + self.lambda_dynamic * rank_dynamic
-                + self.lambda_family_classification * family_classification
-                + self.lambda_clean * clean_family_penalty
-            )
-        else:
-            out = self.model(x)
-            x_hat = out["x_hat"]
-            series_list = out["series_list"]
-            prior_list = out["prior_list"]
 
         rec_loss = nn.functional.mse_loss(x_hat, x)
         s_loss, p_loss = association_losses(series_list, prior_list)
@@ -563,11 +559,6 @@ class MAATLightningModule(pl.LightningModule):
         family_loss = step["family_loss"]
         loss1 = step["loss1"]
         loss2 = step["loss2"]
-
-        if not torch.isfinite(family_loss):
-            self._nan_count += 1
-            self.log("factorized_nan_detected", 1.0, prog_bar=False)
-            return
 
         if not (torch.isfinite(loss1) and torch.isfinite(loss2)):
             self._nan_count += 1
@@ -602,22 +593,6 @@ class MAATLightningModule(pl.LightningModule):
         self.log("train_prior_kl", p_loss, on_step=False, on_epoch=True)
         self.log("train_loss1", loss1, on_step=False, on_epoch=True)
         self.log("train_loss2", loss2, on_step=False, on_epoch=True)
-        self.log("train_family_loss", family_loss, on_step=False, on_epoch=True)
-        self.log("train_rank_voltage", step["rank_voltage"], on_step=False, on_epoch=True)
-        self.log("train_rank_mismatch", step["rank_mismatch"], on_step=False, on_epoch=True)
-        self.log("train_rank_dynamic", step["rank_dynamic"], on_step=False, on_epoch=True)
-        self.log(
-            "train_family_classification",
-            step["family_classification"],
-            on_step=False,
-            on_epoch=True,
-        )
-        self.log(
-            "train_clean_family_penalty",
-            step["clean_family_penalty"],
-            on_step=False,
-            on_epoch=True,
-        )
         self.log("grad_norm", grad_norm, on_step=False, on_epoch=True)
 
     def on_train_epoch_end(self) -> None:
@@ -646,10 +621,7 @@ class MAATLightningModule(pl.LightningModule):
             x, labels = batch
             original_labels = labels
         with torch.no_grad():
-            out = self.model(x)
-            x_hat = out["x_hat"]
-            series_list = out["series_list"]
-            prior_list = out["prior_list"]
+            x_hat, series_list, prior_list, _ = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
         assoc_dis = compute_association_discrepancy(series_list, prior_list)  # [B, W]
@@ -664,15 +636,17 @@ class MAATLightningModule(pl.LightningModule):
             voltage_drop_scores = vdrop_series.mean(dim=1)
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         product_window_scores = self._reduce_scores(product_scores)
-        if self.factorized_enabled:
-            family_stack = torch.stack([
-                out["family_logits"]["voltage"],
-                out["family_logits"]["mismatch"],
-                out["family_logits"]["dynamic"],
-            ], dim=1)
-            center_scores = torch.logsumexp(family_stack, dim=1).cpu()
-        else:
-            center_scores = product_window_scores.cpu()
+        center_scores = product_window_scores.cpu()
+        mismatch_scores = None
+        mismatch_parts: list[torch.Tensor] = []
+        if self.power_imbalance_feature_idx is not None:
+            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).mean(dim=1))
+        if self.current_imbalance_feature_idx is not None:
+            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).mean(dim=1))
+        if self.voltage_imbalance_feature_idx is not None:
+            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).mean(dim=1))
+        if mismatch_parts:
+            mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         center_labels = labels.cpu()
 
         rec_loss = nn.functional.mse_loss(x_hat, x)
@@ -688,6 +662,7 @@ class MAATLightningModule(pl.LightningModule):
             "voltage_drop_scores": (
                 voltage_drop_scores.cpu() if voltage_drop_scores is not None else None
             ),
+            "mismatch_scores": mismatch_scores.cpu() if mismatch_scores is not None else None,
             "labels": center_labels,
             "original_labels": original_labels.cpu(),
             "rec_loss": rec_loss.item(),
@@ -708,12 +683,17 @@ class MAATLightningModule(pl.LightningModule):
         ).numpy()
         drift_present = self._val_outputs[0].get("drift_scores") is not None
         vdrop_present = self._val_outputs[0].get("voltage_drop_scores") is not None
+        mismatch_present = self._val_outputs[0].get("mismatch_scores") is not None
         all_drift_scores = (
             torch.cat([o["drift_scores"] for o in self._val_outputs]).numpy() if drift_present else None
         )
         all_voltage_drop_scores = (
             torch.cat([o["voltage_drop_scores"] for o in self._val_outputs]).numpy()
             if vdrop_present else None
+        )
+        all_mismatch_scores = (
+            torch.cat([o["mismatch_scores"] for o in self._val_outputs]).numpy()
+            if mismatch_present else None
         )
         all_labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._val_outputs]).numpy()
@@ -743,6 +723,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_assoc_affinity_scores_np = all_assoc_affinity_scores
         self._val_drift_scores_np = all_drift_scores
         self._val_voltage_drop_scores_np = all_voltage_drop_scores
+        self._val_mismatch_scores_np = all_mismatch_scores
         self._val_original_labels_np = all_original_labels
 
         self.log("val_pr_auc", val_pr_auc, prog_bar=True)
@@ -763,10 +744,7 @@ class MAATLightningModule(pl.LightningModule):
             x, labels = batch
             original_labels = labels
         with torch.no_grad():
-            out = self.model(x)
-            x_hat = out["x_hat"]
-            series_list = out["series_list"]
-            prior_list = out["prior_list"]
+            x_hat, series_list, prior_list, _ = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         assoc_dis = compute_association_discrepancy(series_list, prior_list)
@@ -781,15 +759,17 @@ class MAATLightningModule(pl.LightningModule):
             voltage_drop_scores = vdrop_series.mean(dim=1)
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         product_window_scores = self._reduce_scores(product_scores)
-        if self.factorized_enabled:
-            family_stack = torch.stack([
-                out["family_logits"]["voltage"],
-                out["family_logits"]["mismatch"],
-                out["family_logits"]["dynamic"],
-            ], dim=1)
-            window_scores = torch.logsumexp(family_stack, dim=1)
-        else:
-            window_scores = product_window_scores
+        window_scores = product_window_scores
+        mismatch_scores = None
+        mismatch_parts: list[torch.Tensor] = []
+        if self.power_imbalance_feature_idx is not None:
+            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).mean(dim=1))
+        if self.current_imbalance_feature_idx is not None:
+            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).mean(dim=1))
+        if self.voltage_imbalance_feature_idx is not None:
+            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).mean(dim=1))
+        if mismatch_parts:
+            mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         self._test_outputs.append({
             "scores": window_scores.cpu(),
             "product_scores": product_window_scores.cpu(),
@@ -800,6 +780,7 @@ class MAATLightningModule(pl.LightningModule):
             "voltage_drop_scores": (
                 voltage_drop_scores.cpu() if voltage_drop_scores is not None else None
             ),
+            "mismatch_scores": mismatch_scores.cpu() if mismatch_scores is not None else None,
             "labels": labels.cpu(),
             "original_labels": original_labels.cpu(),
         })
@@ -817,12 +798,17 @@ class MAATLightningModule(pl.LightningModule):
         ).numpy()
         drift_present = self._test_outputs[0].get("drift_scores") is not None
         vdrop_present = self._test_outputs[0].get("voltage_drop_scores") is not None
+        mismatch_present = self._test_outputs[0].get("mismatch_scores") is not None
         all_drift_scores = (
             torch.cat([o["drift_scores"] for o in self._test_outputs]).numpy() if drift_present else None
         )
         all_voltage_drop_scores = (
             torch.cat([o["voltage_drop_scores"] for o in self._test_outputs]).numpy()
             if vdrop_present else None
+        )
+        all_mismatch_scores = (
+            torch.cat([o["mismatch_scores"] for o in self._test_outputs]).numpy()
+            if mismatch_present else None
         )
         all_labels = torch.cat([o["labels"] for o in self._test_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._test_outputs]).numpy()
@@ -836,6 +822,7 @@ class MAATLightningModule(pl.LightningModule):
         self._test_assoc_affinity_scores_np = all_assoc_affinity_scores
         self._test_drift_scores_np = all_drift_scores
         self._test_voltage_drop_scores_np = all_voltage_drop_scores
+        self._test_mismatch_scores_np = all_mismatch_scores
         self._test_original_labels_np = all_original_labels
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
@@ -990,6 +977,9 @@ def _build_lightning_module(
     max_epochs: int,
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
+    power_imbalance_feature_idx: int | None,
+    current_imbalance_feature_idx: int | None,
+    voltage_imbalance_feature_idx: int | None,
     factorized_enabled: bool,
     factorized_feature_idx: dict[str, int],
     factorized_margin: float,
@@ -1010,6 +1000,9 @@ def _build_lightning_module(
         score_reduction=str(maat_cfg.get("score_reduction", "center")),
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
+        power_imbalance_feature_idx=power_imbalance_feature_idx,
+        current_imbalance_feature_idx=current_imbalance_feature_idx,
+        voltage_imbalance_feature_idx=voltage_imbalance_feature_idx,
         factorized_enabled=factorized_enabled,
         factorized_feature_idx=factorized_feature_idx,
         factorized_margin=factorized_margin,
@@ -1029,6 +1022,9 @@ def _train_and_eval(
     n_features: int,
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
+    power_imbalance_feature_idx: int | None,
+    current_imbalance_feature_idx: int | None,
+    voltage_imbalance_feature_idx: int | None,
     factorized_enabled: bool,
     factorized_feature_idx: dict[str, int],
     factorized_margin: float,
@@ -1053,6 +1049,9 @@ def _train_and_eval(
         max_epochs=max_epochs,
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
+        power_imbalance_feature_idx=power_imbalance_feature_idx,
+        current_imbalance_feature_idx=current_imbalance_feature_idx,
+        voltage_imbalance_feature_idx=voltage_imbalance_feature_idx,
         factorized_enabled=factorized_enabled,
         factorized_feature_idx=factorized_feature_idx,
         factorized_margin=factorized_margin,
@@ -1166,6 +1165,16 @@ def run_maat(config: dict | None = None) -> None:
         logger.info(
             f"Voltage-drop channel disabled: missing feature '{voltage_drop_feature_name}' in manifest"
         )
+
+    power_imbalance_feature_idx: int | None = None
+    current_imbalance_feature_idx: int | None = None
+    voltage_imbalance_feature_idx: int | None = None
+    if "power_imbalance" in features:
+        power_imbalance_feature_idx = int(features.index("power_imbalance"))
+    if "current_imbalance" in features:
+        current_imbalance_feature_idx = int(features.index("current_imbalance"))
+    if "voltage_imbalance" in features:
+        voltage_imbalance_feature_idx = int(features.index("voltage_imbalance"))
 
     y_train = (train_df[label_col].to_numpy() != 0).astype(int)
     y_val = (val_df[label_col].to_numpy() != 0).astype(int)
@@ -1313,7 +1322,12 @@ def run_maat(config: dict | None = None) -> None:
                 try:
                     lit, _ = _train_and_eval(
                         trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
-                        n_features, drift_feature_idx, voltage_drop_feature_idx,
+                        n_features,
+                        drift_feature_idx,
+                        voltage_drop_feature_idx,
+                        power_imbalance_feature_idx,
+                        current_imbalance_feature_idx,
+                        voltage_imbalance_feature_idx,
                         factorized_enabled, factorized_feature_idx, factorized_margin,
                         lambda_voltage, lambda_mismatch, lambda_dynamic,
                         lambda_family_classification, lambda_clean,
@@ -1447,6 +1461,9 @@ def run_maat(config: dict | None = None) -> None:
         n_features=n_features,
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
+        power_imbalance_feature_idx=power_imbalance_feature_idx,
+        current_imbalance_feature_idx=current_imbalance_feature_idx,
+        voltage_imbalance_feature_idx=voltage_imbalance_feature_idx,
         factorized_enabled=factorized_enabled,
         factorized_feature_idx=factorized_feature_idx,
         factorized_margin=factorized_margin,
@@ -1506,6 +1523,8 @@ def run_maat(config: dict | None = None) -> None:
     test_drift_scores = final_lit._test_drift_scores_np
     val_voltage_drop_scores = final_lit._val_voltage_drop_scores_np
     test_voltage_drop_scores = final_lit._test_voltage_drop_scores_np
+    val_mismatch_scores = final_lit._val_mismatch_scores_np
+    test_mismatch_scores = final_lit._test_mismatch_scores_np
     test_original_labels = final_lit._test_original_labels_np
 
     if val_scores is None or test_scores is None:
@@ -1588,36 +1607,42 @@ def run_maat(config: dict | None = None) -> None:
             val_recon_scores,
             val_assoc_scores,
             val_assoc_affinity_scores,
-            val_drift_scores,
             val_original_labels,
             test_recon_scores,
             test_assoc_scores,
             test_assoc_affinity_scores,
-            test_drift_scores,
+            val_mismatch_scores,
+            test_mismatch_scores,
             val_voltage_drop_scores,
             test_voltage_drop_scores,
             test_original_labels,
         )
     ):
+        val_parts = {
+            "product": val_product_scores,
+            "factorized_fusion": val_scores,
+            "reconstruction": val_recon_scores,
+            "association_discrepancy": val_assoc_scores,
+            "association_affinity": val_assoc_affinity_scores,
+            "voltage_drop_vdc2": val_voltage_drop_scores,
+            "mismatch_imbalance": val_mismatch_scores,
+        }
+        test_parts = {
+            "product": test_product_scores,
+            "factorized_fusion": test_scores,
+            "reconstruction": test_recon_scores,
+            "association_discrepancy": test_assoc_scores,
+            "association_affinity": test_assoc_affinity_scores,
+            "voltage_drop_vdc2": test_voltage_drop_scores,
+            "mismatch_imbalance": test_mismatch_scores,
+        }
+        if val_drift_scores is not None and test_drift_scores is not None:
+            val_parts["drift_efficiency"] = val_drift_scores
+            test_parts["drift_efficiency"] = test_drift_scores
+
         decomposition_report = _build_score_decomposition_report(
-            val_parts={
-                "product": val_product_scores,
-                "factorized_fusion": val_scores,
-                "reconstruction": val_recon_scores,
-                "association_discrepancy": val_assoc_scores,
-                "association_affinity": val_assoc_affinity_scores,
-                "drift_efficiency": val_drift_scores,
-                "voltage_drop_vdc2": val_voltage_drop_scores,
-            },
-            test_parts={
-                "product": test_product_scores,
-                "factorized_fusion": test_scores,
-                "reconstruction": test_recon_scores,
-                "association_discrepancy": test_assoc_scores,
-                "association_affinity": test_assoc_affinity_scores,
-                "drift_efficiency": test_drift_scores,
-                "voltage_drop_vdc2": test_voltage_drop_scores,
-            },
+            val_parts=val_parts,
+            test_parts=test_parts,
             val_labels=val_labels,
             test_labels=test_labels,
             val_original_labels=val_original_labels,

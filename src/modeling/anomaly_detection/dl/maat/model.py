@@ -146,43 +146,13 @@ class MambaAnomalyTransformer(nn.Module):
             ]
         )
 
-        pooled_dim = 2 * d_model
-        self.family_heads = nn.ModuleDict({
-            "voltage": nn.Sequential(
-                nn.LayerNorm(pooled_dim),
-                nn.Linear(pooled_dim, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, 1),
-            ),
-            "mismatch": nn.Sequential(
-                nn.LayerNorm(pooled_dim),
-                nn.Linear(pooled_dim, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, 1),
-            ),
-            "dynamic": nn.Sequential(
-                nn.LayerNorm(pooled_dim),
-                nn.Linear(pooled_dim, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, 1),
-            ),
-        })
         self.projection = nn.Linear(d_model, c_out, bias=True)
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor | list]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, list, list, list]:
         # x: [B, W, F]
         enc_out = self.enc_embedding(x)  # [B, W, d_model]
         enc_out, series_list, prior_list, sigma_list = self.encoder(enc_out)
         dec_out = self.projection(enc_out)  # [B, W, F]
-        pooled = torch.cat([enc_out.mean(dim=1), enc_out.max(dim=1).values], dim=-1)
-        family_logits = {
-            name: head(pooled).squeeze(-1) for name, head in self.family_heads.items()
-        }
-        return {
-            "x_hat": dec_out,
-            "series_list": series_list,
-            "prior_list": prior_list,
-            "sigma_list": sigma_list,
-            "enc_out": enc_out,
-            "family_logits": family_logits,
-        }
+        return dec_out, series_list, prior_list, sigma_list
