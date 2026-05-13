@@ -242,6 +242,52 @@ def _build_score_decomposition_report(
             test_original_labels,
         )
 
+    if "drift_efficiency" in val_parts and "drift_efficiency" in test_parts:
+        _add_score_entry(
+            report,
+            "drift_efficiency",
+            val_parts["drift_efficiency"],
+            test_parts["drift_efficiency"],
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        val_drift_z, test_drift_z = _zscore_from_val(
+            val_parts["drift_efficiency"], test_parts["drift_efficiency"]
+        )
+        _add_score_entry(
+            report,
+            "clean_max_z_product_drift",
+            np.maximum(val_product_z, val_drift_z),
+            np.maximum(test_product_z, test_drift_z),
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        _add_score_entry(
+            report,
+            "clean_max_z_recon_product_drift",
+            np.maximum(np.maximum(val_recon_z, val_product_z), val_drift_z),
+            np.maximum(np.maximum(test_recon_z, test_product_z), test_drift_z),
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
+        for tau in (0.5, 1.0):
+            _add_score_entry(
+                report,
+                f"clean_logsumexp_z_product_drift_tau_{tau:g}",
+                _logsumexp_pair(val_product_z, val_drift_z, tau=tau),
+                _logsumexp_pair(test_product_z, test_drift_z, tau=tau),
+                val_labels,
+                test_labels,
+                val_original_labels,
+                test_original_labels,
+            )
+
     by_fault: dict[str, dict] = {}
     for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
         mask = (test_original_labels == fault_label) | (test_original_labels == 0)
@@ -288,6 +334,7 @@ class MAATLightningModule(pl.LightningModule):
         gradient_clip_val: float | None = 1.0,
         max_epochs: int = 100,
         score_reduction: str = "center",
+        drift_feature_idx: int | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -298,6 +345,7 @@ class MAATLightningModule(pl.LightningModule):
         self.gradient_clip_val = gradient_clip_val
         self.max_epochs = max_epochs
         self.score_reduction = score_reduction
+        self.drift_feature_idx = drift_feature_idx
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -308,12 +356,14 @@ class MAATLightningModule(pl.LightningModule):
         self._val_recon_scores_np: np.ndarray | None = None
         self._val_assoc_scores_np: np.ndarray | None = None
         self._val_assoc_affinity_scores_np: np.ndarray | None = None
+        self._val_drift_scores_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
         self._test_recon_scores_np: np.ndarray | None = None
         self._test_assoc_scores_np: np.ndarray | None = None
         self._test_assoc_affinity_scores_np: np.ndarray | None = None
+        self._test_drift_scores_np: np.ndarray | None = None
         self._test_original_labels_np: np.ndarray | None = None
         self._nan_count: int = 0
 
@@ -399,6 +449,10 @@ class MAATLightningModule(pl.LightningModule):
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
         assoc_dis = compute_association_discrepancy(series_list, prior_list)  # [B, W]
         assoc_affinity = torch.softmax(-assoc_dis * self.temperature, dim=-1)
+        drift_scores = None
+        if self.drift_feature_idx is not None:
+            drift_series = torch.clamp(-x[:, :, self.drift_feature_idx], min=0.0)
+            drift_scores = drift_series.mean(dim=1)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         center_scores = self._reduce_scores(scores).cpu()
         center_labels = labels.cpu()
@@ -411,6 +465,7 @@ class MAATLightningModule(pl.LightningModule):
             "recon_scores": self._reduce_scores(recon_error).cpu(),
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
+            "drift_scores": drift_scores.cpu() if drift_scores is not None else None,
             "labels": center_labels,
             "original_labels": original_labels.cpu(),
             "rec_loss": rec_loss.item(),
@@ -428,6 +483,10 @@ class MAATLightningModule(pl.LightningModule):
         all_assoc_affinity_scores = torch.cat(
             [o["assoc_affinity_scores"] for o in self._val_outputs]
         ).numpy()
+        drift_present = self._val_outputs[0].get("drift_scores") is not None
+        all_drift_scores = (
+            torch.cat([o["drift_scores"] for o in self._val_outputs]).numpy() if drift_present else None
+        )
         all_labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._val_outputs]).numpy()
         mean_rec = float(np.mean([o["rec_loss"] for o in self._val_outputs]))
@@ -453,6 +512,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_recon_scores_np = all_recon_scores
         self._val_assoc_scores_np = all_assoc_scores
         self._val_assoc_affinity_scores_np = all_assoc_affinity_scores
+        self._val_drift_scores_np = all_drift_scores
         self._val_original_labels_np = all_original_labels
 
         self.log("val_pr_auc", val_pr_auc, prog_bar=True)
@@ -478,12 +538,17 @@ class MAATLightningModule(pl.LightningModule):
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         assoc_dis = compute_association_discrepancy(series_list, prior_list)
         assoc_affinity = torch.softmax(-assoc_dis * self.temperature, dim=-1)
+        drift_scores = None
+        if self.drift_feature_idx is not None:
+            drift_series = torch.clamp(-x[:, :, self.drift_feature_idx], min=0.0)
+            drift_scores = drift_series.mean(dim=1)
         scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         self._test_outputs.append({
             "scores": self._reduce_scores(scores).cpu(),
             "recon_scores": self._reduce_scores(recon_error).cpu(),
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
+            "drift_scores": drift_scores.cpu() if drift_scores is not None else None,
             "labels": labels.cpu(),
             "original_labels": original_labels.cpu(),
         })
@@ -498,6 +563,10 @@ class MAATLightningModule(pl.LightningModule):
         all_assoc_affinity_scores = torch.cat(
             [o["assoc_affinity_scores"] for o in self._test_outputs]
         ).numpy()
+        drift_present = self._test_outputs[0].get("drift_scores") is not None
+        all_drift_scores = (
+            torch.cat([o["drift_scores"] for o in self._test_outputs]).numpy() if drift_present else None
+        )
         all_labels = torch.cat([o["labels"] for o in self._test_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._test_outputs]).numpy()
         self._test_outputs.clear()
@@ -507,6 +576,7 @@ class MAATLightningModule(pl.LightningModule):
         self._test_recon_scores_np = all_recon_scores
         self._test_assoc_scores_np = all_assoc_scores
         self._test_assoc_affinity_scores_np = all_assoc_affinity_scores
+        self._test_drift_scores_np = all_drift_scores
         self._test_original_labels_np = all_original_labels
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
@@ -659,6 +729,7 @@ def _build_lightning_module(
     maat_cfg: dict,
     training_cfg: dict,
     max_epochs: int,
+    drift_feature_idx: int | None,
 ) -> MAATLightningModule:
     return MAATLightningModule(
         model=model,
@@ -669,6 +740,7 @@ def _build_lightning_module(
         gradient_clip_val=float(training_cfg.get("gradient_clip_val", 1.0)),
         max_epochs=max_epochs,
         score_reduction=str(maat_cfg.get("score_reduction", "center")),
+        drift_feature_idx=drift_feature_idx,
     )
 
 
@@ -678,6 +750,7 @@ def _train_and_eval(
     train_dl: DataLoader,
     val_dl: DataLoader,
     n_features: int,
+    drift_feature_idx: int | None,
     max_epochs: int,
     patience: int,
     seed: int,
@@ -687,7 +760,7 @@ def _train_and_eval(
     pl.seed_everything(seed, workers=True)
 
     model = _build_model(maat_cfg, n_features)
-    lit = _build_lightning_module(model, maat_cfg, training_cfg, max_epochs)
+    lit = _build_lightning_module(model, maat_cfg, training_cfg, max_epochs, drift_feature_idx)
 
     ckpt_callback: ModelCheckpoint | None = None
     callbacks: list = [
@@ -772,6 +845,13 @@ def run_maat(config: dict | None = None) -> None:
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
     n_features = len(features)
+    drift_feature_name = "pdc_temp_corrected_norm_irr"
+    drift_feature_idx: int | None = None
+    if drift_feature_name in features:
+        drift_feature_idx = int(features.index(drift_feature_name))
+        logger.info(f"Drift channel enabled on feature: {drift_feature_name} (idx={drift_feature_idx})")
+    else:
+        logger.info(f"Drift channel disabled: missing feature '{drift_feature_name}' in manifest")
 
     y_train = (train_df[label_col].to_numpy() != 0).astype(int)
     y_val = (val_df[label_col].to_numpy() != 0).astype(int)
@@ -886,7 +966,7 @@ def run_maat(config: dict | None = None) -> None:
                 try:
                     lit, _ = _train_and_eval(
                         trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
-                        n_features, hpo_epochs, hpo_patience, seed, trial=trial,
+                        n_features, drift_feature_idx, hpo_epochs, hpo_patience, seed, trial=trial,
                     )
                     pr_auc = lit.best_val_pr_auc
                 except optuna.exceptions.TrialPruned:
@@ -1014,6 +1094,7 @@ def run_maat(config: dict | None = None) -> None:
     final_lit, best_ckpt_path = _train_and_eval(
         final_maat_cfg, final_training_cfg, train_dl, val_dl,
         n_features=n_features,
+        drift_feature_idx=drift_feature_idx,
         max_epochs=max_epochs,
         patience=patience,
         seed=seed,
@@ -1059,6 +1140,8 @@ def run_maat(config: dict | None = None) -> None:
     test_recon_scores = final_lit._test_recon_scores_np
     test_assoc_scores = final_lit._test_assoc_scores_np
     test_assoc_affinity_scores = final_lit._test_assoc_affinity_scores_np
+    val_drift_scores = final_lit._val_drift_scores_np
+    test_drift_scores = final_lit._test_drift_scores_np
     test_original_labels = final_lit._test_original_labels_np
 
     if val_scores is None or test_scores is None:
@@ -1135,10 +1218,12 @@ def run_maat(config: dict | None = None) -> None:
             val_recon_scores,
             val_assoc_scores,
             val_assoc_affinity_scores,
+            val_drift_scores,
             val_original_labels,
             test_recon_scores,
             test_assoc_scores,
             test_assoc_affinity_scores,
+            test_drift_scores,
             test_original_labels,
         )
     ):
@@ -1148,12 +1233,14 @@ def run_maat(config: dict | None = None) -> None:
                 "reconstruction": val_recon_scores,
                 "association_discrepancy": val_assoc_scores,
                 "association_affinity": val_assoc_affinity_scores,
+                "drift_efficiency": val_drift_scores,
             },
             test_parts={
                 "product": test_scores,
                 "reconstruction": test_recon_scores,
                 "association_discrepancy": test_assoc_scores,
                 "association_affinity": test_assoc_affinity_scores,
+                "drift_efficiency": test_drift_scores,
             },
             val_labels=val_labels,
             test_labels=test_labels,
