@@ -16,6 +16,7 @@ import optuna
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from loguru import logger
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
@@ -35,10 +36,10 @@ from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
+    build_factorized_corruptions,
     compute_association_discrepancy,
     compute_maat_scores,
-    fit_vmpp_baseline,
-    physics_consistency_loss,
+    pairwise_margin_loss,
 )
 from src.modeling.anomaly_detection.dl.maat.model import MambaAnomalyTransformer
 from src.modeling.common.feature_loader import load_features_for_task
@@ -72,7 +73,7 @@ def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
     }
     relevant["hpo_stage1"] = maat_cfg.get("hpo_stage1", {})
     relevant["hpo_stage2"] = maat_cfg.get("hpo_stage2", {})
-    relevant["physics"] = maat_cfg.get("physics", {})
+    relevant["factorized"] = maat_cfg.get("factorized", {})
     relevant["seed"] = seed
     raw = json.dumps(relevant, sort_keys=True, default=str).encode()
     return hashlib.sha1(raw).hexdigest()[:8]
@@ -209,6 +210,18 @@ def _build_score_decomposition_report(
     test_original_labels: np.ndarray,
 ) -> dict:
     report: dict = {"scores": {}}
+
+    if "factorized_fusion" in val_parts and "factorized_fusion" in test_parts:
+        _add_score_entry(
+            report,
+            "factorized_fusion",
+            val_parts["factorized_fusion"],
+            test_parts["factorized_fusion"],
+            val_labels,
+            test_labels,
+            val_original_labels,
+            test_original_labels,
+        )
 
     for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
         threshold, _, _, _ = _calibrate_threshold(val_parts[name], val_labels)
@@ -393,17 +406,14 @@ class MAATLightningModule(pl.LightningModule):
         score_reduction: str = "center",
         drift_feature_idx: int | None = None,
         voltage_drop_feature_idx: int | None = None,
-        physics_enabled: bool = False,
-        physics_huber_delta: float = 0.05,
-        physics_feature_idx: dict[str, int] | None = None,
-        scaler_mean: torch.Tensor | None = None,
-        scaler_scale: torch.Tensor | None = None,
-        enable_symmetry: bool = False,
-        lambda_symmetry: float = 0.0,
-        enable_v_under: bool = False,
-        lambda_v_under: float = 0.0,
-        vmpp_baseline: torch.Tensor | None = None,
-        irr_floor: float = 1.0,
+        factorized_enabled: bool = False,
+        factorized_feature_idx: dict[str, int] | None = None,
+        factorized_margin: float = 1.0,
+        lambda_voltage: float = 1.0,
+        lambda_mismatch: float = 1.0,
+        lambda_dynamic: float = 1.0,
+        lambda_family_classification: float = 0.25,
+        lambda_clean: float = 0.1,
     ) -> None:
         super().__init__()
         self.model = model
@@ -416,23 +426,21 @@ class MAATLightningModule(pl.LightningModule):
         self.score_reduction = score_reduction
         self.drift_feature_idx = drift_feature_idx
         self.voltage_drop_feature_idx = voltage_drop_feature_idx
-        self.physics_enabled = physics_enabled
-        self.physics_huber_delta = physics_huber_delta
-        self.physics_feature_idx = physics_feature_idx or {}
-        self.scaler_mean = scaler_mean
-        self.scaler_scale = scaler_scale
-        self.enable_symmetry = enable_symmetry
-        self.lambda_symmetry = lambda_symmetry
-        self.enable_v_under = enable_v_under
-        self.lambda_v_under = lambda_v_under
-        self.vmpp_baseline = vmpp_baseline
-        self.irr_floor = irr_floor
+        self.factorized_enabled = factorized_enabled
+        self.factorized_feature_idx = factorized_feature_idx or {}
+        self.factorized_margin = factorized_margin
+        self.lambda_voltage = lambda_voltage
+        self.lambda_mismatch = lambda_mismatch
+        self.lambda_dynamic = lambda_dynamic
+        self.lambda_family_classification = lambda_family_classification
+        self.lambda_clean = lambda_clean
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
         self.best_val_pr_auc: float = 0.0
         self.val_threshold: float = 0.5
         self._val_scores_np: np.ndarray | None = None
+        self._val_product_scores_np: np.ndarray | None = None
         self._val_labels_np: np.ndarray | None = None
         self._val_recon_scores_np: np.ndarray | None = None
         self._val_assoc_scores_np: np.ndarray | None = None
@@ -441,6 +449,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_voltage_drop_scores_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
+        self._test_product_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
         self._test_recon_scores_np: np.ndarray | None = None
         self._test_assoc_scores_np: np.ndarray | None = None
@@ -452,50 +461,112 @@ class MAATLightningModule(pl.LightningModule):
 
     def _compute_step(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_hat, series_list, prior_list, _ = self.model(x)
+    ) -> dict[str, torch.Tensor]:
+        family_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        rank_voltage = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        rank_mismatch = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        rank_dynamic = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        family_classification = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        clean_family_penalty = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+        if self.factorized_enabled:
+            corruptions = build_factorized_corruptions(x, self.factorized_feature_idx)
+            x_all = torch.cat([x, corruptions["voltage"], corruptions["mismatch"], corruptions["dynamic"]], dim=0)
+            out = self.model(x_all)
+            batch_size = x.size(0)
+
+            x_hat = out["x_hat"][:batch_size]
+            series_list = [s[:batch_size] for s in out["series_list"]]
+            prior_list = [p[:batch_size] for p in out["prior_list"]]
+            logits_split = {
+                name: torch.split(logits, batch_size, dim=0)
+                for name, logits in out["family_logits"].items()
+            }
+            clean_logits = {name: parts[0] for name, parts in logits_split.items()}
+            voltage_logits = {name: parts[1] for name, parts in logits_split.items()}
+            mismatch_logits = {name: parts[2] for name, parts in logits_split.items()}
+            dynamic_logits = {name: parts[3] for name, parts in logits_split.items()}
+
+            rank_voltage = pairwise_margin_loss(
+                clean_logits["voltage"], voltage_logits["voltage"], self.factorized_margin
+            )
+            rank_mismatch = pairwise_margin_loss(
+                clean_logits["mismatch"], mismatch_logits["mismatch"], self.factorized_margin
+            )
+            rank_dynamic = pairwise_margin_loss(
+                clean_logits["dynamic"], dynamic_logits["dynamic"], self.factorized_margin
+            )
+
+            voltage_family_logits = torch.stack(
+                [voltage_logits["voltage"], voltage_logits["mismatch"], voltage_logits["dynamic"]], dim=1
+            )
+            mismatch_family_logits = torch.stack(
+                [mismatch_logits["voltage"], mismatch_logits["mismatch"], mismatch_logits["dynamic"]], dim=1
+            )
+            dynamic_family_logits = torch.stack(
+                [dynamic_logits["voltage"], dynamic_logits["mismatch"], dynamic_logits["dynamic"]], dim=1
+            )
+            family_classification = (
+                F.cross_entropy(voltage_family_logits, torch.zeros(batch_size, device=x.device, dtype=torch.long))
+                + F.cross_entropy(mismatch_family_logits, torch.ones(batch_size, device=x.device, dtype=torch.long))
+                + F.cross_entropy(dynamic_family_logits, torch.full((batch_size,), 2, device=x.device, dtype=torch.long))
+            ) / 3.0
+
+            clean_logits_stack = torch.stack([
+                clean_logits["voltage"],
+                clean_logits["mismatch"],
+                clean_logits["dynamic"],
+            ], dim=1)
+            clean_family_penalty = (
+                clean_logits_stack + (self.factorized_margin / 2.0)
+            ).pow(2).mean()
+
+            family_loss = (
+                self.lambda_voltage * rank_voltage
+                + self.lambda_mismatch * rank_mismatch
+                + self.lambda_dynamic * rank_dynamic
+                + self.lambda_family_classification * family_classification
+                + self.lambda_clean * clean_family_penalty
+            )
+        else:
+            out = self.model(x)
+            x_hat = out["x_hat"]
+            series_list = out["series_list"]
+            prior_list = out["prior_list"]
+
         rec_loss = nn.functional.mse_loss(x_hat, x)
         s_loss, p_loss = association_losses(series_list, prior_list)
-        phys_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        if (
-            self.physics_enabled
-            and self.scaler_mean is not None
-            and self.scaler_scale is not None
-            and self.physics_feature_idx
-        ):
-            scaler_mean = self.scaler_mean.to(device=x_hat.device, dtype=x_hat.dtype)
-            scaler_scale = self.scaler_scale.to(device=x_hat.device, dtype=x_hat.dtype)
-            vmpp = (
-                self.vmpp_baseline.to(device=x_hat.device, dtype=x_hat.dtype)
-                if self.vmpp_baseline is not None else None
-            )
-            phys_loss = physics_consistency_loss(
-                x_hat_scaled=x_hat,
-                scaler_mean=scaler_mean,
-                scaler_scale=scaler_scale,
-                feature_idx=self.physics_feature_idx,
-                huber_delta=self.physics_huber_delta,
-                enable_symmetry=self.enable_symmetry,
-                lambda_symmetry=self.lambda_symmetry,
-                enable_v_under=self.enable_v_under,
-                lambda_v_under=self.lambda_v_under,
-                vmpp_baseline=vmpp,
-                irr_floor=self.irr_floor,
-            ).mean()
-
-        loss1 = rec_loss + phys_loss - self.k * s_loss
-        loss2 = rec_loss + phys_loss + self.k * p_loss
-        return rec_loss, s_loss, p_loss, phys_loss, loss1, loss2
+        loss1 = rec_loss + family_loss - self.k * s_loss
+        loss2 = rec_loss + family_loss + self.k * p_loss
+        return {
+            "rec_loss": rec_loss,
+            "series_loss": s_loss,
+            "prior_loss": p_loss,
+            "family_loss": family_loss,
+            "rank_voltage": rank_voltage,
+            "rank_mismatch": rank_mismatch,
+            "rank_dynamic": rank_dynamic,
+            "family_classification": family_classification,
+            "clean_family_penalty": clean_family_penalty,
+            "loss1": loss1,
+            "loss2": loss2,
+        }
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         x, _ = batch
         opt = self.optimizers()
 
-        rec_loss, s_loss, p_loss, phys_loss, loss1, loss2 = self._compute_step(x)
+        step = self._compute_step(x)
+        rec_loss = step["rec_loss"]
+        s_loss = step["series_loss"]
+        p_loss = step["prior_loss"]
+        family_loss = step["family_loss"]
+        loss1 = step["loss1"]
+        loss2 = step["loss2"]
 
-        if not torch.isfinite(phys_loss):
+        if not torch.isfinite(family_loss):
             self._nan_count += 1
-            self.log("physics_nan_detected", 1.0, prog_bar=False)
+            self.log("factorized_nan_detected", 1.0, prog_bar=False)
             return
 
         if not (torch.isfinite(loss1) and torch.isfinite(loss2)):
@@ -531,7 +602,22 @@ class MAATLightningModule(pl.LightningModule):
         self.log("train_prior_kl", p_loss, on_step=False, on_epoch=True)
         self.log("train_loss1", loss1, on_step=False, on_epoch=True)
         self.log("train_loss2", loss2, on_step=False, on_epoch=True)
-        self.log("train_phys_loss", phys_loss, on_step=False, on_epoch=True)
+        self.log("train_family_loss", family_loss, on_step=False, on_epoch=True)
+        self.log("train_rank_voltage", step["rank_voltage"], on_step=False, on_epoch=True)
+        self.log("train_rank_mismatch", step["rank_mismatch"], on_step=False, on_epoch=True)
+        self.log("train_rank_dynamic", step["rank_dynamic"], on_step=False, on_epoch=True)
+        self.log(
+            "train_family_classification",
+            step["family_classification"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train_clean_family_penalty",
+            step["clean_family_penalty"],
+            on_step=False,
+            on_epoch=True,
+        )
         self.log("grad_norm", grad_norm, on_step=False, on_epoch=True)
 
     def on_train_epoch_end(self) -> None:
@@ -560,7 +646,10 @@ class MAATLightningModule(pl.LightningModule):
             x, labels = batch
             original_labels = labels
         with torch.no_grad():
-            x_hat, series_list, prior_list, _ = self.model(x)
+            out = self.model(x)
+            x_hat = out["x_hat"]
+            series_list = out["series_list"]
+            prior_list = out["prior_list"]
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
         assoc_dis = compute_association_discrepancy(series_list, prior_list)  # [B, W]
@@ -573,8 +662,17 @@ class MAATLightningModule(pl.LightningModule):
         if self.voltage_drop_feature_idx is not None:
             vdrop_series = torch.clamp(-x[:, :, self.voltage_drop_feature_idx], min=0.0)
             voltage_drop_scores = vdrop_series.mean(dim=1)
-        scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
-        center_scores = self._reduce_scores(scores).cpu()
+        product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
+        product_window_scores = self._reduce_scores(product_scores)
+        if self.factorized_enabled:
+            family_stack = torch.stack([
+                out["family_logits"]["voltage"],
+                out["family_logits"]["mismatch"],
+                out["family_logits"]["dynamic"],
+            ], dim=1)
+            center_scores = torch.logsumexp(family_stack, dim=1).cpu()
+        else:
+            center_scores = product_window_scores.cpu()
         center_labels = labels.cpu()
 
         rec_loss = nn.functional.mse_loss(x_hat, x)
@@ -582,6 +680,7 @@ class MAATLightningModule(pl.LightningModule):
 
         self._val_outputs.append({
             "scores": center_scores,
+            "product_scores": product_window_scores.cpu(),
             "recon_scores": self._reduce_scores(recon_error).cpu(),
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
@@ -601,6 +700,7 @@ class MAATLightningModule(pl.LightningModule):
             return
 
         all_scores = torch.cat([o["scores"] for o in self._val_outputs]).numpy()
+        all_product_scores = torch.cat([o["product_scores"] for o in self._val_outputs]).numpy()
         all_recon_scores = torch.cat([o["recon_scores"] for o in self._val_outputs]).numpy()
         all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._val_outputs]).numpy()
         all_assoc_affinity_scores = torch.cat(
@@ -636,6 +736,7 @@ class MAATLightningModule(pl.LightningModule):
         self.best_val_pr_auc = max(self.best_val_pr_auc, val_pr_auc)
         self.val_threshold = threshold
         self._val_scores_np = all_scores
+        self._val_product_scores_np = all_product_scores
         self._val_labels_np = all_labels
         self._val_recon_scores_np = all_recon_scores
         self._val_assoc_scores_np = all_assoc_scores
@@ -662,7 +763,10 @@ class MAATLightningModule(pl.LightningModule):
             x, labels = batch
             original_labels = labels
         with torch.no_grad():
-            x_hat, series_list, prior_list, _ = self.model(x)
+            out = self.model(x)
+            x_hat = out["x_hat"]
+            series_list = out["series_list"]
+            prior_list = out["prior_list"]
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         assoc_dis = compute_association_discrepancy(series_list, prior_list)
@@ -675,9 +779,20 @@ class MAATLightningModule(pl.LightningModule):
         if self.voltage_drop_feature_idx is not None:
             vdrop_series = torch.clamp(-x[:, :, self.voltage_drop_feature_idx], min=0.0)
             voltage_drop_scores = vdrop_series.mean(dim=1)
-        scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
+        product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
+        product_window_scores = self._reduce_scores(product_scores)
+        if self.factorized_enabled:
+            family_stack = torch.stack([
+                out["family_logits"]["voltage"],
+                out["family_logits"]["mismatch"],
+                out["family_logits"]["dynamic"],
+            ], dim=1)
+            window_scores = torch.logsumexp(family_stack, dim=1)
+        else:
+            window_scores = product_window_scores
         self._test_outputs.append({
-            "scores": self._reduce_scores(scores).cpu(),
+            "scores": window_scores.cpu(),
+            "product_scores": product_window_scores.cpu(),
             "recon_scores": self._reduce_scores(recon_error).cpu(),
             "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
             "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
@@ -694,6 +809,7 @@ class MAATLightningModule(pl.LightningModule):
             return
 
         all_scores = torch.cat([o["scores"] for o in self._test_outputs]).numpy()
+        all_product_scores = torch.cat([o["product_scores"] for o in self._test_outputs]).numpy()
         all_recon_scores = torch.cat([o["recon_scores"] for o in self._test_outputs]).numpy()
         all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._test_outputs]).numpy()
         all_assoc_affinity_scores = torch.cat(
@@ -713,6 +829,7 @@ class MAATLightningModule(pl.LightningModule):
         self._test_outputs.clear()
 
         self._test_scores_np = all_scores
+        self._test_product_scores_np = all_product_scores
         self._test_labels_np = all_labels
         self._test_recon_scores_np = all_recon_scores
         self._test_assoc_scores_np = all_assoc_scores
@@ -873,17 +990,14 @@ def _build_lightning_module(
     max_epochs: int,
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
-    physics_enabled: bool,
-    physics_huber_delta: float,
-    physics_feature_idx: dict[str, int],
-    scaler_mean: torch.Tensor,
-    scaler_scale: torch.Tensor,
-    enable_symmetry: bool,
-    lambda_symmetry: float,
-    enable_v_under: bool,
-    lambda_v_under: float,
-    vmpp_baseline: torch.Tensor | None,
-    irr_floor: float,
+    factorized_enabled: bool,
+    factorized_feature_idx: dict[str, int],
+    factorized_margin: float,
+    lambda_voltage: float,
+    lambda_mismatch: float,
+    lambda_dynamic: float,
+    lambda_family_classification: float,
+    lambda_clean: float,
 ) -> MAATLightningModule:
     return MAATLightningModule(
         model=model,
@@ -896,17 +1010,14 @@ def _build_lightning_module(
         score_reduction=str(maat_cfg.get("score_reduction", "center")),
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
-        physics_enabled=physics_enabled,
-        physics_huber_delta=physics_huber_delta,
-        physics_feature_idx=physics_feature_idx,
-        scaler_mean=scaler_mean,
-        scaler_scale=scaler_scale,
-        enable_symmetry=enable_symmetry,
-        lambda_symmetry=lambda_symmetry,
-        enable_v_under=enable_v_under,
-        lambda_v_under=lambda_v_under,
-        vmpp_baseline=vmpp_baseline,
-        irr_floor=irr_floor,
+        factorized_enabled=factorized_enabled,
+        factorized_feature_idx=factorized_feature_idx,
+        factorized_margin=factorized_margin,
+        lambda_voltage=lambda_voltage,
+        lambda_mismatch=lambda_mismatch,
+        lambda_dynamic=lambda_dynamic,
+        lambda_family_classification=lambda_family_classification,
+        lambda_clean=lambda_clean,
     )
 
 
@@ -918,17 +1029,14 @@ def _train_and_eval(
     n_features: int,
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
-    physics_enabled: bool,
-    physics_huber_delta: float,
-    physics_feature_idx: dict[str, int],
-    scaler_mean: torch.Tensor,
-    scaler_scale: torch.Tensor,
-    enable_symmetry: bool,
-    lambda_symmetry: float,
-    enable_v_under: bool,
-    lambda_v_under: float,
-    vmpp_baseline: torch.Tensor | None,
-    irr_floor: float,
+    factorized_enabled: bool,
+    factorized_feature_idx: dict[str, int],
+    factorized_margin: float,
+    lambda_voltage: float,
+    lambda_mismatch: float,
+    lambda_dynamic: float,
+    lambda_family_classification: float,
+    lambda_clean: float,
     max_epochs: int,
     patience: int,
     seed: int,
@@ -945,17 +1053,14 @@ def _train_and_eval(
         max_epochs=max_epochs,
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
-        physics_enabled=physics_enabled,
-        physics_huber_delta=physics_huber_delta,
-        physics_feature_idx=physics_feature_idx,
-        scaler_mean=scaler_mean,
-        scaler_scale=scaler_scale,
-        enable_symmetry=enable_symmetry,
-        lambda_symmetry=lambda_symmetry,
-        enable_v_under=enable_v_under,
-        lambda_v_under=lambda_v_under,
-        vmpp_baseline=vmpp_baseline,
-        irr_floor=irr_floor,
+        factorized_enabled=factorized_enabled,
+        factorized_feature_idx=factorized_feature_idx,
+        factorized_margin=factorized_margin,
+        lambda_voltage=lambda_voltage,
+        lambda_mismatch=lambda_mismatch,
+        lambda_dynamic=lambda_dynamic,
+        lambda_family_classification=lambda_family_classification,
+        lambda_clean=lambda_clean,
     )
 
     ckpt_callback: ModelCheckpoint | None = None
@@ -1075,29 +1180,22 @@ def run_maat(config: dict | None = None) -> None:
         f"test: {len(test_df):,} (faults: {y_test.sum():,}) | features: {n_features}"
     )
 
-    # ── Physics config (read early so V_mpp baseline can be fit on physical units) ──
-    physics_cfg = maat_cfg.get("physics", {})
-    physics_enabled = bool(physics_cfg.get("enabled", False))
-    physics_huber_delta = float(physics_cfg.get("huber_delta", 0.05))
-    irr_floor = float(physics_cfg.get("irr_floor", 1.0))
-
-    sym_cfg = physics_cfg.get("symmetry", {})
-    enable_symmetry = physics_enabled and bool(sym_cfg.get("enabled", True))
-    lambda_symmetry = float(sym_cfg.get("lambda", 0.05))
-
-    vunder_cfg = physics_cfg.get("v_under", {})
-    enable_v_under = physics_enabled and bool(vunder_cfg.get("enabled", False))
-    lambda_v_under = float(vunder_cfg.get("lambda", 0.05))
-
-    # Required features: symmetry needs vdc1/2, idc1/2; v_under additionally needs irr, pvt.
-    physics_feature_names = ["vdc1", "vdc2", "idc1", "idc2"]
-    if enable_v_under:
-        physics_feature_names += ["irr", "pvt"]
-    if physics_enabled:
-        missing = [n for n in physics_feature_names if n not in features]
+    factorized_cfg = maat_cfg.get("factorized", {})
+    factorized_enabled = bool(factorized_cfg.get("enabled", False))
+    factorized_margin = float(factorized_cfg.get("margin", 1.0))
+    lambda_voltage = float(factorized_cfg.get("lambda_voltage", 1.0))
+    lambda_mismatch = float(factorized_cfg.get("lambda_mismatch", 1.0))
+    lambda_dynamic = float(factorized_cfg.get("lambda_dynamic", 1.0))
+    lambda_family_classification = float(
+        factorized_cfg.get("lambda_family_classification", 0.25)
+    )
+    lambda_clean = float(factorized_cfg.get("lambda_clean", 0.1))
+    factorized_feature_names = ["vdc1", "vdc2", "idc1", "idc2", "pdc1", "pdc2"]
+    if factorized_enabled:
+        missing = [n for n in factorized_feature_names if n not in features]
         if missing:
             raise ValueError(
-                f"MAAT physics.enabled=true requires features {physics_feature_names}. "
+                f"MAAT factorized.enabled=true requires features {factorized_feature_names}. "
                 f"Missing from manifest: {missing}"
             )
 
@@ -1107,41 +1205,21 @@ def run_maat(config: dict | None = None) -> None:
     val_df = val_df.copy()
     test_df = test_df.copy()
 
-    # Pre-fit gray-box V_mpp baseline on training normals BEFORE scaling.
-    # fit_vmpp_baseline expects physical units; doing it after fit_transform would
-    # silently miscalibrate (a, b, c) against z-scored inputs.
-    vmpp_baseline_t: torch.Tensor | None = None
-    if enable_v_under:
-        train_normals = train_df.loc[train_df[label_col] == 0]
-        if len(train_normals) == 0:
-            raise ValueError(
-                "MAAT v_under enabled but no rows with label == 0 in train_df; "
-                "cannot fit V_mpp baseline."
-            )
-        (a_v, b_v, c_v), vmpp_diag = fit_vmpp_baseline(train_normals, irr_floor=irr_floor)
-        vmpp_baseline_t = torch.tensor([a_v, b_v, c_v], dtype=torch.float32)
-        logger.info(
-            "V_mpp baseline fit | a={:.3f} b={:.4f} c={:.3f} | "
-            "R²={:.4f} RMSE={:.2f}V p99|res|={:.2f}V n={}",
-            a_v, b_v, c_v,
-            vmpp_diag["r2"], vmpp_diag["rmse_phys"],
-            vmpp_diag["residual_p99_phys"], int(vmpp_diag["n_samples"]),
-        )
-
     train_df[features] = scaler.fit_transform(train_df[features])
     val_df[features] = scaler.transform(val_df[features])
     test_df[features] = scaler.transform(test_df[features])
 
-    physics_feature_idx = {n: features.index(n) for n in physics_feature_names if n in features}
-    scaler_mean_t = torch.tensor(scaler.mean_, dtype=torch.float32)
-    scaler_scale_t = torch.tensor(scaler.scale_, dtype=torch.float32)
+    factorized_feature_idx = {n: features.index(n) for n in factorized_feature_names if n in features}
 
-    if physics_enabled:
+    if factorized_enabled:
         logger.info(
-            "Physics regularizer | symmetry={} λ={} | v_under={} λ={} | huber_delta={}",
-            enable_symmetry, lambda_symmetry,
-            enable_v_under, lambda_v_under,
-            physics_huber_delta,
+            "Factorized anomaly training | margin={} λV={} λM={} λD={} λcls={} λclean={}",
+            factorized_margin,
+            lambda_voltage,
+            lambda_mismatch,
+            lambda_dynamic,
+            lambda_family_classification,
+            lambda_clean,
         )
 
     # ── Window config ──────────────────────────────────────────────────────────
@@ -1236,11 +1314,9 @@ def run_maat(config: dict | None = None) -> None:
                     lit, _ = _train_and_eval(
                         trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
                         n_features, drift_feature_idx, voltage_drop_feature_idx,
-                        physics_enabled, physics_huber_delta, physics_feature_idx,
-                        scaler_mean_t, scaler_scale_t,
-                        enable_symmetry, lambda_symmetry,
-                        enable_v_under, lambda_v_under,
-                        vmpp_baseline_t, irr_floor,
+                        factorized_enabled, factorized_feature_idx, factorized_margin,
+                        lambda_voltage, lambda_mismatch, lambda_dynamic,
+                        lambda_family_classification, lambda_clean,
                         hpo_epochs, hpo_patience, seed, trial=trial,
                     )
                     pr_auc = lit.best_val_pr_auc
@@ -1371,17 +1447,14 @@ def run_maat(config: dict | None = None) -> None:
         n_features=n_features,
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
-        physics_enabled=physics_enabled,
-        physics_huber_delta=physics_huber_delta,
-        physics_feature_idx=physics_feature_idx,
-        scaler_mean=scaler_mean_t,
-        scaler_scale=scaler_scale_t,
-        enable_symmetry=enable_symmetry,
-        lambda_symmetry=lambda_symmetry,
-        enable_v_under=enable_v_under,
-        lambda_v_under=lambda_v_under,
-        vmpp_baseline=vmpp_baseline_t,
-        irr_floor=irr_floor,
+        factorized_enabled=factorized_enabled,
+        factorized_feature_idx=factorized_feature_idx,
+        factorized_margin=factorized_margin,
+        lambda_voltage=lambda_voltage,
+        lambda_mismatch=lambda_mismatch,
+        lambda_dynamic=lambda_dynamic,
+        lambda_family_classification=lambda_family_classification,
+        lambda_clean=lambda_clean,
         max_epochs=max_epochs,
         patience=patience,
         seed=seed,
@@ -1417,8 +1490,10 @@ def run_maat(config: dict | None = None) -> None:
     )
 
     val_scores = final_lit._val_scores_np
+    val_product_scores = final_lit._val_product_scores_np
     val_labels = final_lit._val_labels_np
     test_scores = final_lit._test_scores_np
+    test_product_scores = final_lit._test_product_scores_np
     test_labels = final_lit._test_labels_np
     val_recon_scores = final_lit._val_recon_scores_np
     val_assoc_scores = final_lit._val_assoc_scores_np
@@ -1438,11 +1513,13 @@ def run_maat(config: dict | None = None) -> None:
         return
 
     threshold = final_lit.val_threshold
+    score_mode = "factorized_fusion" if factorized_enabled else "product"
     val_pr_auc = float(average_precision_score(val_labels, val_scores))
     val_roc_auc = float(roc_auc_score(val_labels, val_scores))
     _, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, val_labels)
     val_preds = (val_scores >= threshold).astype(int)
     val_acc = float(accuracy_score(val_labels, val_preds))
+    product_val_pr_auc = float(average_precision_score(val_labels, val_product_scores))
 
     test_pr_auc = float(average_precision_score(test_labels, test_scores))
     test_roc_auc = float(roc_auc_score(test_labels, test_scores))
@@ -1451,6 +1528,7 @@ def run_maat(config: dict | None = None) -> None:
     test_acc = float(accuracy_score(test_labels, test_preds))
     test_prec = float(precision_score(test_labels, test_preds, zero_division=0))
     test_rec = float(recall_score(test_labels, test_preds, zero_division=0))
+    product_test_pr_auc = float(average_precision_score(test_labels, test_product_scores))
 
     logger.info(
         f"Test — PR-AUC={test_pr_auc:.4f}  ROC-AUC={test_roc_auc:.4f}  "
@@ -1465,8 +1543,11 @@ def run_maat(config: dict | None = None) -> None:
         "val_precision_at_threshold": val_prec,
         "val_recall_at_threshold": val_rec,
         "threshold": threshold,
+        "score_mode": score_mode,
+        "product_val_pr_auc": product_val_pr_auc,
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
+        "product_test_pr_auc": product_test_pr_auc,
         "test_f1_at_threshold": test_f1,
         "test_accuracy_at_threshold": test_acc,
         "test_precision_at_threshold": test_prec,
@@ -1520,7 +1601,8 @@ def run_maat(config: dict | None = None) -> None:
     ):
         decomposition_report = _build_score_decomposition_report(
             val_parts={
-                "product": val_scores,
+                "product": val_product_scores,
+                "factorized_fusion": val_scores,
                 "reconstruction": val_recon_scores,
                 "association_discrepancy": val_assoc_scores,
                 "association_affinity": val_assoc_affinity_scores,
@@ -1528,7 +1610,8 @@ def run_maat(config: dict | None = None) -> None:
                 "voltage_drop_vdc2": val_voltage_drop_scores,
             },
             test_parts={
-                "product": test_scores,
+                "product": test_product_scores,
+                "factorized_fusion": test_scores,
                 "reconstruction": test_recon_scores,
                 "association_discrepancy": test_assoc_scores,
                 "association_affinity": test_assoc_affinity_scores,
@@ -1577,6 +1660,7 @@ def run_maat(config: dict | None = None) -> None:
                 "hpo_enabled": run_hpo,
                 "run_type": run_type,
                 "score_reduction": final_maat_cfg.get("score_reduction", "center"),
+                "score_mode": score_mode,
             })
             mlflow.log_metrics(metrics)
             for p in (metrics_path, scaler_path, params_path, config_path,
@@ -1603,6 +1687,7 @@ def run_maat(config: dict | None = None) -> None:
                 "feature_profile": str(args.profile),
                 "feature_run_dir": str(resolved_run_dir),
                 "hpo_enabled": run_hpo,
+                "score_mode": score_mode,
                 "hpo_stage_budgets": hpo_cfg.get("trial_budget", {}),
                 "best_params": best_params,
                 "n_features": n_features,

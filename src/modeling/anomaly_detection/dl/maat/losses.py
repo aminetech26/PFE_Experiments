@@ -1,21 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-import numpy as np
 import torch
 import torch.nn.functional as F
 
-if TYPE_CHECKING:
-    import pandas as pd
-
 
 def maat_kl_loss(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """KL(p || q) summed over the last dimension.
-
-    Numerically stable: uses log(p + eps) - log(q + eps).
-    Input shapes: [..., W, W] → output: [..., W].
-    """
+    """KL(p || q) summed over the last dimension."""
     eps = 1e-9
     return (p * (torch.log(p + eps) - torch.log(q + eps))).sum(dim=-1)
 
@@ -29,27 +19,18 @@ def association_losses(
     series_list: list[torch.Tensor],
     prior_list: list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-layer KL losses for the minimax objective.
-
-    Returns:
-        series_loss: KL(S || P.detach()) + KL(P.detach() || S) — gradients through S only.
-        prior_loss:  KL(P || S.detach()) + KL(S.detach() || P) — gradients through P only.
-    Both are scalar means over layers, heads, positions, and batch.
-    """
+    """Compute per-layer KL losses for the MAAT minimax objective."""
     series_loss: torch.Tensor = torch.tensor(0.0, device=series_list[0].device)
     prior_loss: torch.Tensor = torch.tensor(0.0, device=prior_list[0].device)
 
     for s, p in zip(series_list, prior_list):
         p_norm = normalize_prior(p)
-
-        # series_loss: gradients only through S
-        kl_sp = maat_kl_loss(s, p_norm.detach())          # [B, H, W]
-        kl_ps = maat_kl_loss(p_norm.detach(), s)          # [B, H, W]
+        kl_sp = maat_kl_loss(s, p_norm.detach())
+        kl_ps = maat_kl_loss(p_norm.detach(), s)
         series_loss = series_loss + (kl_sp + kl_ps).mean()
 
-        # prior_loss: gradients only through P
-        kl_ps2 = maat_kl_loss(p_norm, s.detach())         # [B, H, W]
-        kl_sp2 = maat_kl_loss(s.detach(), p_norm)         # [B, H, W]
+        kl_ps2 = maat_kl_loss(p_norm, s.detach())
+        kl_sp2 = maat_kl_loss(s.detach(), p_norm)
         prior_loss = prior_loss + (kl_ps2 + kl_sp2).mean()
 
     n = len(series_list)
@@ -62,22 +43,11 @@ def compute_maat_scores(
     recon_error: torch.Tensor,
     temperature: float,
 ) -> torch.Tensor:
-    """Compute per-window MAAT anomaly scores.
-
-    Args:
-        series_list: list of [B, H, W, W] tensors (one per encoder layer)
-        prior_list:  list of [B, H, W, W] tensors (one per encoder layer)
-        recon_error: [B, W] per-timestep MSE
-        temperature: scaling factor for association discrepancy
-
-    Returns:
-        scores: [B, W] — higher = more anomalous
-    """
+    """Compute per-timestep MAAT product scores."""
     ass_dis = compute_association_discrepancy(series_list, prior_list)
     ass_dis = ass_dis * temperature
-
-    metric = torch.softmax(-ass_dis, dim=-1)  # [B, W]
-    return metric * recon_error               # [B, W]
+    metric = torch.softmax(-ass_dis, dim=-1)
+    return metric * recon_error
 
 
 def compute_association_discrepancy(
@@ -88,218 +58,154 @@ def compute_association_discrepancy(
     kl_per_layer: list[torch.Tensor] = []
     for s, p in zip(series_list, prior_list):
         p_norm = normalize_prior(p)
-        kl_sp = maat_kl_loss(s, p_norm)    # [B, H, W]
-        kl_ps = maat_kl_loss(p_norm, s)    # [B, H, W]
-        kl_per_layer.append((kl_sp + kl_ps).mean(dim=1))  # [B, W]
+        kl_sp = maat_kl_loss(s, p_norm)
+        kl_ps = maat_kl_loss(p_norm, s)
+        kl_per_layer.append((kl_sp + kl_ps).mean(dim=1))
 
-    return torch.stack(kl_per_layer, dim=0).mean(dim=0)  # [B, W]
+    return torch.stack(kl_per_layer, dim=0).mean(dim=0)
 
 
-def inverse_standardize(
-    x_scaled: torch.Tensor,
-    mean: torch.Tensor,
-    scale: torch.Tensor,
+def pairwise_margin_loss(
+    clean_logits: torch.Tensor,
+    corrupt_logits: torch.Tensor,
+    margin: float,
 ) -> torch.Tensor:
-    """Invert StandardScaler normalization for [B, W, F] inputs."""
-    return x_scaled * scale + mean
+    """Rank corrupted windows above clean windows for a family head."""
+    return F.softplus(margin - (corrupt_logits - clean_logits)).mean()
 
 
-def physics_consistency_loss(
-    x_hat_scaled: torch.Tensor,
-    scaler_mean: torch.Tensor,
-    scaler_scale: torch.Tensor,
+def _uniform(
+    batch_size: int,
+    low: float,
+    high: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return low + (high - low) * torch.rand(batch_size, device=device, dtype=dtype)
+
+
+def _sample_span_mask(
+    batch_size: int,
+    window_size: int,
+    *,
+    device: torch.device,
+    min_frac: float,
+    max_frac: float,
+) -> torch.Tensor:
+    lengths = torch.round(
+        _uniform(batch_size, min_frac * window_size, max_frac * window_size, device=device, dtype=torch.float32)
+    ).to(torch.long).clamp(min=1, max=window_size)
+    max_start = (window_size - lengths).clamp(min=0)
+    starts = torch.floor(
+        torch.rand(batch_size, device=device) * (max_start.to(torch.float32) + 1.0)
+    ).to(torch.long)
+    steps = torch.arange(window_size, device=device).unsqueeze(0)
+    return (steps >= starts.unsqueeze(1)) & (steps < (starts + lengths).unsqueeze(1))
+
+
+def _apply_shift(
+    x: torch.Tensor,
+    channel_idx: int,
+    per_sample_shift: torch.Tensor,
+    sample_mask: torch.Tensor,
+    time_mask: torch.Tensor,
+) -> None:
+    active = sample_mask.unsqueeze(1) & time_mask
+    x[:, :, channel_idx] = x[:, :, channel_idx] + active.to(x.dtype) * per_sample_shift.unsqueeze(1)
+
+
+def build_factorized_corruptions(
+    x: torch.Tensor,
     feature_idx: dict[str, int],
-    huber_delta: float = 0.05,
-    enable_symmetry: bool = True,
-    lambda_symmetry: float = 1.0,
-    enable_v_under: bool = False,
-    lambda_v_under: float = 0.0,
-    vmpp_baseline: torch.Tensor | None = None,
-    irr_floor: float = 1.0,
-) -> torch.Tensor:
-    """Composite PV physics consistency loss on reconstructed outputs.
+) -> dict[str, torch.Tensor]:
+    """Generate physics-grounded synthetic fault families from normal windows.
 
-    Two independent terms, weighted and summed per-window. Each term operates on
-    ``x̂`` after inverse-standardization to physical units; both are dimensionless
-    (residuals normalized by string-symmetric train-normal std).
-
-    Term 1 — string symmetry (``enable_symmetry``):
-        Enforces ``vdc1 ≈ vdc2`` and ``idc1 ≈ idc2`` on the reconstruction.
-        Catches asymmetric DC-side mechanisms (single-string short circuit,
-        open circuit, asymmetric shading). The product symmetry ``pdc1 ≈ pdc2``
-        is *not* a separate term: ``pdc_k = vdc_k · idc_k`` is computed
-        deterministically in this pipeline, so adding it would double-count the
-        same physics with operating-point weighting.
-
-    Term 2 — gray-box V_mpp under-voltage anchor (``enable_v_under``):
-        Enforces ``x̂[vdc_k] ≥ a + b · pvt + c · ln(irr)`` via a one-sided
-        ReLU residual. Functional form is the V_oc / V_mpp temperature-and-
-        log-irradiance dependence; constants ``(a, b, c)`` are calibrated on
-        training-normal data via :func:`fit_vmpp_baseline`. Catches symmetric
-        voltage-loss mechanisms (resistive degradation) that string symmetry
-        cannot see by construction. Over-voltage is not penalized.
-
-    Args:
-        x_hat_scaled:    Reconstruction in standardized space, shape ``[B, W, F]``.
-        scaler_mean:     ``StandardScaler.mean_`` as a tensor, shape ``[F]``.
-        scaler_scale:    ``StandardScaler.scale_`` as a tensor, shape ``[F]``.
-        feature_idx:     Map from feature name to column index in ``x_hat_scaled``.
-                         When ``enable_symmetry``, requires
-                         ``vdc1, vdc2, idc1, idc2``. When ``enable_v_under``,
-                         additionally requires ``irr, pvt``.
-        huber_delta:     Huber transition point applied to each normalized residual.
-        enable_symmetry: If False, skip the symmetry term entirely.
-        lambda_symmetry: Weight for the symmetry term in the returned scalar.
-        enable_v_under:  If False, skip the V_mpp anchor term entirely.
-        lambda_v_under:  Weight for the anchor term in the returned scalar.
-        vmpp_baseline:   Tensor ``[a, b, c]`` from :func:`fit_vmpp_baseline`.
-                         Required when ``enable_v_under`` is True.
-        irr_floor:       Minimum irradiance for the log; clamps both training
-                         (via :func:`fit_vmpp_baseline`) and inference reconstruction.
-                         Costa is already filtered to ``irr ≥ 100`` at ingestion;
-                         the floor is a numeric safety net for ``log(x̂[irr])``.
-
-    Returns:
-        Per-window scalar loss, shape ``[B]``. Already weighted; ready to add
-        directly to the optimizer's total loss.
+    Corruptions are created in standardized feature space so magnitudes are
+    dataset-scaled but still structured:
+    - voltage: localized single-string voltage collapse with coupled power/current drop
+    - mismatch: persistent inter-string asymmetry across voltage/current/power
+    - dynamic: post-break temporal rupture / flatline across electrical channels
     """
-    if not enable_symmetry and not enable_v_under:
-        return torch.zeros(
-            x_hat_scaled.size(0),
-            device=x_hat_scaled.device,
-            dtype=x_hat_scaled.dtype,
-        )
+    batch_size, window_size, _ = x.shape
+    device = x.device
+    dtype = x.dtype
 
-    x_hat_phys = inverse_standardize(x_hat_scaled, scaler_mean, scaler_scale)  # [B, W, F]
-    bsz = x_hat_phys.size(0)
-    loss = torch.zeros(bsz, device=x_hat_phys.device, dtype=x_hat_phys.dtype)
+    voltage = x.clone()
+    mismatch = x.clone()
+    dynamic = x.clone()
 
-    if enable_symmetry:
-        vdc1 = x_hat_phys[:, :, feature_idx["vdc1"]]
-        vdc2 = x_hat_phys[:, :, feature_idx["vdc2"]]
-        idc1 = x_hat_phys[:, :, feature_idx["idc1"]]
-        idc2 = x_hat_phys[:, :, feature_idx["idc2"]]
+    v_mask = _sample_span_mask(batch_size, window_size, device=device, min_frac=0.25, max_frac=0.55)
+    m_mask = _sample_span_mask(batch_size, window_size, device=device, min_frac=0.50, max_frac=1.00)
 
-        vdc_scale = (
-            (scaler_scale[feature_idx["vdc1"]] + scaler_scale[feature_idx["vdc2"]]) / 2.0
-        ).abs().clamp(min=1.0)
-        idc_scale = (
-            (scaler_scale[feature_idx["idc1"]] + scaler_scale[feature_idx["idc2"]]) / 2.0
-        ).abs().clamp(min=1.0)
+    choose_first = torch.rand(batch_size, device=device) < 0.5
+    choose_second = ~choose_first
+    symmetric_voltage = torch.rand(batch_size, device=device) < 0.5
+    asymmetric_voltage = ~symmetric_voltage
+    asym_first = asymmetric_voltage & choose_first
+    asym_second = asymmetric_voltage & choose_second
 
-        r_v = (vdc1 - vdc2) / vdc_scale
-        r_i = (idc1 - idc2) / idc_scale
+    v_amp = _uniform(batch_size, 2.0, 4.0, device=device, dtype=dtype)
+    i_amp = _uniform(batch_size, 0.5, 1.5, device=device, dtype=dtype)
+    p_amp = _uniform(batch_size, 1.0, 2.5, device=device, dtype=dtype)
 
-        sym_per_window = 0.5 * (
-            F.huber_loss(r_v, torch.zeros_like(r_v), delta=huber_delta, reduction="none").mean(dim=1)
-            + F.huber_loss(r_i, torch.zeros_like(r_i), delta=huber_delta, reduction="none").mean(dim=1)
-        )
-        loss = loss + lambda_symmetry * sym_per_window
+    _apply_shift(voltage, feature_idx["vdc1"], -v_amp, asym_first, v_mask)
+    _apply_shift(voltage, feature_idx["vdc2"], -v_amp, asym_second, v_mask)
+    _apply_shift(voltage, feature_idx["idc1"], -i_amp, asym_first, v_mask)
+    _apply_shift(voltage, feature_idx["idc2"], -i_amp, asym_second, v_mask)
+    _apply_shift(voltage, feature_idx["pdc1"], -p_amp, asym_first, v_mask)
+    _apply_shift(voltage, feature_idx["pdc2"], -p_amp, asym_second, v_mask)
 
-    if enable_v_under:
-        if vmpp_baseline is None:
-            raise ValueError("enable_v_under=True requires vmpp_baseline tensor [a, b, c].")
+    _apply_shift(voltage, feature_idx["vdc1"], -v_amp, symmetric_voltage, v_mask)
+    _apply_shift(voltage, feature_idx["vdc2"], -v_amp, symmetric_voltage, v_mask)
+    _apply_shift(voltage, feature_idx["idc1"], -i_amp, symmetric_voltage, v_mask)
+    _apply_shift(voltage, feature_idx["idc2"], -i_amp, symmetric_voltage, v_mask)
+    _apply_shift(voltage, feature_idx["pdc1"], -p_amp, symmetric_voltage, v_mask)
+    _apply_shift(voltage, feature_idx["pdc2"], -p_amp, symmetric_voltage, v_mask)
 
-        a = vmpp_baseline[0]
-        b = vmpp_baseline[1]
-        c = vmpp_baseline[2]
+    mis_i = _uniform(batch_size, 1.5, 3.0, device=device, dtype=dtype)
+    mis_p = _uniform(batch_size, 1.5, 3.0, device=device, dtype=dtype)
+    mis_v = _uniform(batch_size, 0.5, 1.5, device=device, dtype=dtype)
 
-        irr_phys = x_hat_phys[:, :, feature_idx["irr"]].clamp(min=irr_floor)
-        pvt_phys = x_hat_phys[:, :, feature_idx["pvt"]]
-        log_irr = torch.log(irr_phys)
-        vdc_pred = a + b * pvt_phys + c * log_irr  # [B, W]
+    partner_coeff = _uniform(batch_size, 0.0, 0.7, device=device, dtype=dtype)
 
-        vdc1 = x_hat_phys[:, :, feature_idx["vdc1"]]
-        vdc2 = x_hat_phys[:, :, feature_idx["vdc2"]]
+    _apply_shift(mismatch, feature_idx["idc1"], -mis_i, choose_first, m_mask)
+    _apply_shift(mismatch, feature_idx["idc2"], partner_coeff * mis_i, choose_first, m_mask)
+    _apply_shift(mismatch, feature_idx["pdc1"], -mis_p, choose_first, m_mask)
+    _apply_shift(mismatch, feature_idx["pdc2"], partner_coeff * mis_p, choose_first, m_mask)
+    _apply_shift(mismatch, feature_idx["vdc1"], -mis_v, choose_first, m_mask)
+    _apply_shift(mismatch, feature_idx["vdc2"], partner_coeff * mis_v, choose_first, m_mask)
 
-        vdc_scale = (
-            (scaler_scale[feature_idx["vdc1"]] + scaler_scale[feature_idx["vdc2"]]) / 2.0
-        ).abs().clamp(min=1.0)
+    _apply_shift(mismatch, feature_idx["idc2"], -mis_i, choose_second, m_mask)
+    _apply_shift(mismatch, feature_idx["idc1"], partner_coeff * mis_i, choose_second, m_mask)
+    _apply_shift(mismatch, feature_idx["pdc2"], -mis_p, choose_second, m_mask)
+    _apply_shift(mismatch, feature_idx["pdc1"], partner_coeff * mis_p, choose_second, m_mask)
+    _apply_shift(mismatch, feature_idx["vdc2"], -mis_v, choose_second, m_mask)
+    _apply_shift(mismatch, feature_idx["vdc1"], partner_coeff * mis_v, choose_second, m_mask)
 
-        # One-sided: penalize only when reconstruction is below the V_mpp baseline.
-        r1 = torch.relu(vdc_pred - vdc1) / vdc_scale
-        r2 = torch.relu(vdc_pred - vdc2) / vdc_scale
+    min_break = max(1, window_size // 4)
+    max_break = max(min_break + 1, (3 * window_size) // 4)
+    break_idx = torch.randint(min_break, max_break, (batch_size,), device=device)
+    steps = torch.arange(window_size, device=device).unsqueeze(0)
+    post_mask = steps >= break_idx.unsqueeze(1)
+    boundary_vals = dynamic[torch.arange(batch_size, device=device), break_idx.clamp(max=window_size - 1)]
+    dyn_channels = [
+        feature_idx["vdc1"],
+        feature_idx["vdc2"],
+        feature_idx["idc1"],
+        feature_idx["idc2"],
+        feature_idx["pdc1"],
+        feature_idx["pdc2"],
+    ]
+    for idx in dyn_channels:
+        dynamic[:, :, idx] = torch.where(post_mask, boundary_vals[:, None, idx], dynamic[:, :, idx])
 
-        v_under_per_window = 0.5 * (
-            F.huber_loss(r1, torch.zeros_like(r1), delta=huber_delta, reduction="none").mean(dim=1)
-            + F.huber_loss(r2, torch.zeros_like(r2), delta=huber_delta, reduction="none").mean(dim=1)
-        )
-        loss = loss + lambda_v_under * v_under_per_window
+    dyn_drop = _uniform(batch_size, 1.0, 2.0, device=device, dtype=dtype)
+    for idx in (feature_idx["idc1"], feature_idx["idc2"], feature_idx["pdc1"], feature_idx["pdc2"]):
+        dynamic[:, :, idx] = dynamic[:, :, idx] - post_mask.to(dtype) * dyn_drop.unsqueeze(1)
 
-    return loss
-
-
-def fit_vmpp_baseline(
-    train_df: "pd.DataFrame",
-    irr_floor: float = 1.0,
-) -> tuple[tuple[float, float, float], dict[str, float]]:
-    """Calibrate gray-box V_mpp(irr, pvt) baseline on training-normal data.
-
-    Functional form (physics-grounded):
-
-        vdc ≈ a + b · pvt + c · ln(max(irr, irr_floor))
-
-    V_oc has linear-in-temperature and logarithmic-in-irradiance dependence
-    (Shockley diode equation with temperature dependence of the saturation
-    current); V_mpp tracks V_oc closely under MPPT. The form is dictated by
-    PV physics; the constants ``(a, b, c)`` are calibrated to data so the
-    baseline does not require module datasheet specifics.
-
-    Both strings ``vdc1`` and ``vdc2`` are stacked into a single fit (shared
-    coefficients), consistent with the symmetry assumption used in the loss.
-
-    Args:
-        train_df: DataFrame in *physical units* containing columns
-                  ``vdc1, vdc2, irr, pvt``. Expected to be normal-only
-                  (semi-supervised convention).
-        irr_floor: Lower bound applied before taking the log. Matches the
-                   Costa ingestion floor (100 W/m²) is unnecessary here:
-                   1.0 is enough as a numerical safety net.
-
-    Returns:
-        Tuple ``((a, b, c), diagnostics)`` where ``diagnostics`` contains
-        ``r2``, ``rmse_phys``, ``residual_std_phys``, ``residual_p99_phys``,
-        ``mean_vdc_phys``, ``std_vdc_phys``, ``n_samples`` for first-run
-        sanity checking.
-    """
-    required = {"vdc1", "vdc2", "irr", "pvt"}
-    missing = required - set(train_df.columns)
-    if missing:
-        raise KeyError(f"fit_vmpp_baseline: missing columns {sorted(missing)} in train_df.")
-
-    irr = train_df["irr"].to_numpy(dtype=np.float64)
-    pvt = train_df["pvt"].to_numpy(dtype=np.float64)
-    vdc1 = train_df["vdc1"].to_numpy(dtype=np.float64)
-    vdc2 = train_df["vdc2"].to_numpy(dtype=np.float64)
-
-    log_irr = np.log(np.clip(irr, a_min=irr_floor, a_max=None))
-
-    # Stack both strings as separate samples sharing (a, b, c).
-    y = np.concatenate([vdc1, vdc2])
-    pvt_stack = np.concatenate([pvt, pvt])
-    log_irr_stack = np.concatenate([log_irr, log_irr])
-    X = np.column_stack([np.ones_like(y), pvt_stack, log_irr_stack])
-
-    coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
-    a_c, b_c, c_c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
-
-    pred = X @ coeffs
-    residuals = y - pred
-    ss_res = float(np.sum(residuals ** 2))
-    ss_tot = float(np.sum((y - y.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    rmse = float(np.sqrt(ss_res / len(y)))
-    residual_std = float(residuals.std(ddof=1))
-    residual_p99 = float(np.quantile(np.abs(residuals), 0.99))
-
-    diagnostics: dict[str, float] = {
-        "r2": r2,
-        "rmse_phys": rmse,
-        "residual_std_phys": residual_std,
-        "residual_p99_phys": residual_p99,
-        "mean_vdc_phys": float(y.mean()),
-        "std_vdc_phys": float(y.std(ddof=1)),
-        "n_samples": float(len(y) // 2),  # number of timesteps (each contributes vdc1, vdc2)
-        "irr_floor": float(irr_floor),
+    return {
+        "voltage": voltage,
+        "mismatch": mismatch,
+        "dynamic": dynamic,
     }
-    return (a_c, b_c, c_c), diagnostics
