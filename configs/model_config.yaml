@@ -108,14 +108,6 @@ anomaly_detection:
         eval_stride: 1
         score_reduction: max
         scaling: standard
-        factorized:
-          enabled: true
-          margin: 1.0
-          lambda_voltage: 1.0
-          lambda_mismatch: 1.0
-          lambda_dynamic: 1.0
-          lambda_family_classification: 0.25
-          lambda_clean: 0.1
         hpo_stage1:
           learning_rate: {type: float, low: 1.0e-5, high: 1.0e-3, log: true}
           weight_decay: {type: float, low: 1.0e-6, high: 1.0e-4, log: true}

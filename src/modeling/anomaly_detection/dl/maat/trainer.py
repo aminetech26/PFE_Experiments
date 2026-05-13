@@ -208,18 +208,6 @@ def _build_score_decomposition_report(
 ) -> dict:
     report: dict = {"scores": {}}
 
-    if "factorized_fusion" in val_parts and "factorized_fusion" in test_parts:
-        _add_score_entry(
-            report,
-            "factorized_fusion",
-            val_parts["factorized_fusion"],
-            test_parts["factorized_fusion"],
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
-        )
-
     for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
         threshold, _, _, _ = _calibrate_threshold(val_parts[name], val_labels)
         report["scores"][name] = {
@@ -640,11 +628,11 @@ class MAATLightningModule(pl.LightningModule):
         mismatch_scores = None
         mismatch_parts: list[torch.Tensor] = []
         if self.power_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).max(dim=1).values)
+            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).mean(dim=1))
         if self.current_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).max(dim=1).values)
+            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).mean(dim=1))
         if self.voltage_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).max(dim=1).values)
+            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).mean(dim=1))
         if mismatch_parts:
             mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         center_labels = labels.cpu()
@@ -763,11 +751,11 @@ class MAATLightningModule(pl.LightningModule):
         mismatch_scores = None
         mismatch_parts: list[torch.Tensor] = []
         if self.power_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).max(dim=1).values)
+            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).mean(dim=1))
         if self.current_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).max(dim=1).values)
+            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).mean(dim=1))
         if self.voltage_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).max(dim=1).values)
+            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).mean(dim=1))
         if mismatch_parts:
             mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         self._test_outputs.append({
@@ -1532,7 +1520,7 @@ def run_maat(config: dict | None = None) -> None:
         return
 
     threshold = final_lit.val_threshold
-    score_mode = "factorized_fusion" if factorized_enabled else "product"
+    score_mode = "product"
     val_pr_auc = float(average_precision_score(val_labels, val_scores))
     val_roc_auc = float(roc_auc_score(val_labels, val_scores))
     _, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, val_labels)
@@ -1562,7 +1550,6 @@ def run_maat(config: dict | None = None) -> None:
         "val_precision_at_threshold": val_prec,
         "val_recall_at_threshold": val_rec,
         "threshold": threshold,
-        "score_mode": score_mode,
         "product_val_pr_auc": product_val_pr_auc,
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
@@ -1620,7 +1607,6 @@ def run_maat(config: dict | None = None) -> None:
     ):
         val_parts = {
             "product": val_product_scores,
-            "factorized_fusion": val_scores,
             "reconstruction": val_recon_scores,
             "association_discrepancy": val_assoc_scores,
             "association_affinity": val_assoc_affinity_scores,
@@ -1629,7 +1615,6 @@ def run_maat(config: dict | None = None) -> None:
         }
         test_parts = {
             "product": test_product_scores,
-            "factorized_fusion": test_scores,
             "reconstruction": test_recon_scores,
             "association_discrepancy": test_assoc_scores,
             "association_affinity": test_assoc_affinity_scores,
