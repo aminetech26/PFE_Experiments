@@ -1048,7 +1048,7 @@ def run_maat(config: dict | None = None) -> None:
     physics_enabled = bool(physics_cfg.get("enabled", False))
     lambda_phys = float(physics_cfg.get("lambda_phys", 0.0))
     physics_huber_delta = float(physics_cfg.get("huber_delta", 0.05))
-    physics_feature_names = ["pdc1", "pdc2", "vdc1", "vdc2", "idc1", "idc2"]
+    physics_feature_names = ["vdc1", "vdc2", "idc1", "idc2"]
     physics_feature_idx = {name: features.index(name) for name in physics_feature_names if name in features}
     if physics_enabled:
         missing = [name for name in physics_feature_names if name not in physics_feature_idx]

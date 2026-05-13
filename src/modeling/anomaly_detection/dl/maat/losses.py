@@ -107,38 +107,42 @@ def physics_consistency_loss(
 ) -> torch.Tensor:
     """String-symmetry physics loss on reconstructed outputs in physical units.
 
-    Enforces normal-manifold two-string symmetry:
-      pdc1 ~= pdc2, vdc1 ~= vdc2, idc1 ~= idc2
+    Enforces normal-manifold two-string symmetry on the two independent
+    physical observables of the Costa DC array:
+
+        vdc1 ~= vdc2,   idc1 ~= idc2
+
+    The product symmetry pdc1 ~= pdc2 is *not* added as a separate term: in this
+    pipeline pdc_k = vdc_k * idc_k is computed deterministically, so any
+    pdc-side residual is an operating-point-weighted linear combination of the
+    V- and I-residuals above and would double-count the same physics.
+
+    Each residual is normalized by the train-normal std of the corresponding
+    string-symmetric pair, so loss magnitudes are dimensionless and comparable
+    across V and I channels.
 
     Returns a [B] per-window scalar.
     """
     x_hat_phys = inverse_standardize(x_hat_scaled, scaler_mean, scaler_scale)  # [B, W, F]
     bsz = x_hat_phys.size(0)
     loss = torch.zeros(bsz, device=x_hat_phys.device, dtype=x_hat_phys.dtype)
-    n_components = 3
+    n_components = 2
 
-    def _get(name: str) -> torch.Tensor | None:
-        idx = feature_idx.get(name)
-        return x_hat_phys[:, :, idx] if idx is not None else None
+    vdc1 = x_hat_phys[:, :, feature_idx["vdc1"]]
+    vdc2 = x_hat_phys[:, :, feature_idx["vdc2"]]
+    idc1 = x_hat_phys[:, :, feature_idx["idc1"]]
+    idc2 = x_hat_phys[:, :, feature_idx["idc2"]]
 
-    pdc1 = _get("pdc1")
-    pdc2 = _get("pdc2")
-    vdc1 = _get("vdc1")
-    vdc2 = _get("vdc2")
-    idc1 = _get("idc1")
-    idc2 = _get("idc2")
+    vdc_scale = (
+        (scaler_scale[feature_idx["vdc1"]] + scaler_scale[feature_idx["vdc2"]]) / 2.0
+    ).abs().clamp(min=1.0)
+    idc_scale = (
+        (scaler_scale[feature_idx["idc1"]] + scaler_scale[feature_idx["idc2"]]) / 2.0
+    ).abs().clamp(min=1.0)
 
-    pdc_scale = scaler_scale[feature_idx["pdc1"]].abs().clamp(min=1.0)
-    vdc_scale = scaler_scale[feature_idx["vdc1"]].abs().clamp(min=1.0)
-    idc_scale = scaler_scale[feature_idx["idc1"]].abs().clamp(min=1.0)
-
-    r_p = (pdc1 - pdc2) / pdc_scale
     r_v = (vdc1 - vdc2) / vdc_scale
     r_i = (idc1 - idc2) / idc_scale
 
-    loss = loss + F.huber_loss(
-        r_p, torch.zeros_like(r_p), delta=huber_delta, reduction="none"
-    ).mean(dim=1)
     loss = loss + F.huber_loss(
         r_v, torch.zeros_like(r_v), delta=huber_delta, reduction="none"
     ).mean(dim=1)
