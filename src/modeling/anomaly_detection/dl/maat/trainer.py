@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -43,7 +44,7 @@ from src.modeling.common.dl_training_utils import (
     _resolve_loader_runtime,
     _trainer_runtime_kwargs,
 )
-from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
+from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset, _resolve_group_col
 from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
     compute_association_discrepancy,
@@ -65,11 +66,11 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 torch.set_float32_matmul_precision("medium")  # use Tensor Cores on Ampere+
 
 
-def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
+def _hpo_config_fingerprint(maat_cfg: dict, hpo_cfg: dict, seed: int) -> str:
     """8-char hash of HPO-relevant config fields.
 
     Same config+seed resumes existing study; any change creates a new one.
-    Covers: architecture defaults, search spaces, seed, score_reduction.
+    Covers: architecture defaults, search spaces, seed, score_reduction, CV settings.
     Does NOT include train_stride/eval_stride (no effect on trial comparisons).
     score_reduction is included because it changes the trial objective value
     via _reduce_scores(); mixing studies across reduction modes contaminates results.
@@ -81,6 +82,9 @@ def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
     }
     relevant["hpo_stage1"] = maat_cfg.get("hpo_stage1", {})
     relevant["hpo_stage2"] = maat_cfg.get("hpo_stage2", {})
+    relevant["validation_mode"] = hpo_cfg.get("validation_mode", "holdout")
+    relevant["cv_folds"] = hpo_cfg.get("cv_folds")
+    relevant["cv_gap_groups"] = hpo_cfg.get("cv_gap_groups")
     relevant["seed"] = seed
     raw = json.dumps(relevant, sort_keys=True, default=str).encode()
     return hashlib.sha1(raw).hexdigest()[:8]
@@ -502,6 +506,7 @@ class MAATLightningModule(pl.LightningModule):
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
         self.best_val_pr_auc: float = 0.0
+        self.best_val_fused_pr_auc: float = 0.0
         self.val_threshold: float = 0.5
         self._val_scores_np: np.ndarray | None = None
         self._val_product_scores_np: np.ndarray | None = None
@@ -718,7 +723,30 @@ class MAATLightningModule(pl.LightningModule):
         self._val_mismatch_scores_np = all_mismatch_scores
         self._val_original_labels_np = all_original_labels
 
+        # Fused score: logsumexp_z(recon, product, voltage_drop, mismatch) τ=1
+        # This is the HPO objective — matches the channel that achieves best test performance.
+        fused_components = [all_recon_scores, all_product_scores]
+        if all_voltage_drop_scores is not None:
+            fused_components.append(all_voltage_drop_scores)
+        if all_mismatch_scores is not None:
+            fused_components.append(all_mismatch_scores)
+
+        def _z(s: np.ndarray) -> np.ndarray:
+            mu, sd = float(np.mean(s)), float(np.std(s))
+            return (s - mu) / (sd if sd > 1e-12 else 1.0)
+
+        if len(fused_components) >= 2:
+            z_stack = np.stack([_z(c) for c in fused_components], axis=0)  # [C, N]
+            # logsumexp τ=1: log(sum(exp(z_i))) — smooth max over components
+            fused = np.log(np.sum(np.exp(z_stack - z_stack.max(axis=0, keepdims=True)), axis=0)) + z_stack.max(axis=0)
+            val_fused_pr_auc = _safe_pr_auc(all_labels, fused)
+        else:
+            val_fused_pr_auc = val_pr_auc
+
+        self.best_val_fused_pr_auc = max(self.best_val_fused_pr_auc, val_fused_pr_auc)
+
         self.log("val_pr_auc", val_pr_auc, prog_bar=True)
+        self.log("val_fused_pr_auc", val_fused_pr_auc, prog_bar=True)
         self.log("val_roc_auc", val_roc_auc)
         self.log("val_f1_at_threshold", val_f1)
         self.log("val_precision_at_threshold", val_prec)
@@ -1265,7 +1293,122 @@ def run_maat(config: dict | None = None) -> None:
             for k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff")
         }
 
+        use_cv = str(hpo_cfg.get("validation_mode", "holdout")) == "temporal_cv"
+        cv_folds = int(hpo_cfg.get("cv_folds", 3))
+        cv_gap_groups = int(hpo_cfg.get("cv_gap_groups", 1))
+
+        def _resolve_group_boundaries(df) -> tuple[str | None, np.ndarray, np.ndarray]:
+            """Return (group_col, group_starts, group_ends) for the given df.
+
+            If no group column is found, returns (None, [0], [len(df)]) so the
+            caller can detect the row-fallback path.
+            """
+            gcol = _resolve_group_col(df)
+            if gcol is None:
+                return None, np.array([0]), np.array([len(df)])
+            group_values = df[gcol].astype(str).to_numpy()
+            boundaries = np.where(group_values[1:] != group_values[:-1])[0] + 1
+            starts = np.concatenate([[0], boundaries])
+            ends = np.concatenate([boundaries, [len(df)]])
+            return gcol, starts, ends
+
+        def _make_cv_folds(cfg: dict, stride_train: int, stride_eval: int, bs: int):
+            """Group-aware temporal CV folds.
+
+            Splits at group boundaries (episode_id → segment_id → operating_day_id)
+            so atomic groups are never split between train and val. Groups are
+            divided into cv_folds+1 chunks; fold k uses chunks [0..k] as train
+            and chunk k+1 as val (expanding window). cv_gap_groups groups are
+            dropped at the train/val boundary.
+
+            Falls back to row-level temporal split if no group column is found
+            (uses cv_gap_groups * win_size rows as the boundary gap).
+            """
+            n = len(train_df)
+            win = int(cfg.get("win_size", maat_cfg["win_size"]))
+            gcol, group_starts, group_ends = _resolve_group_boundaries(train_df)
+            n_groups = len(group_starts)
+
+            dl_kw = {
+                "drop_last": False,
+                "num_workers": loader_runtime["num_workers"],
+                "pin_memory": loader_runtime["pin_memory"],
+                "persistent_workers": loader_runtime["persistent_workers"],
+            }
+            if loader_runtime["num_workers"] > 0:
+                dl_kw["prefetch_factor"] = loader_runtime["prefetch_factor"]
+
+            def _yield_fold(fold_train_df, fold_val_df):
+                if len(fold_train_df) < win or len(fold_val_df) < win:
+                    return None
+                ds_tr = TimeSeriesDataset(
+                    fold_train_df, features, label_col, win, stride_train, normal_only=True
+                )
+                ds_vl = TimeSeriesDataset(
+                    fold_val_df, features, label_col, win, stride_eval,
+                    normal_only=False, return_original_label=True,
+                )
+                if len(ds_tr) == 0 or len(ds_vl) == 0:
+                    return None
+                return (
+                    DataLoader(ds_tr, batch_size=bs, shuffle=True, **dl_kw),
+                    DataLoader(ds_vl, batch_size=bs, shuffle=False, **dl_kw),
+                )
+
+            if gcol is None or n_groups < cv_folds + 1:
+                if gcol is None:
+                    logger.info("CV fallback: no group column — using row-level temporal split")
+                else:
+                    logger.warning(
+                        f"CV fallback: only {n_groups} groups in '{gcol}' "
+                        f"(need {cv_folds + 1}) — using row-level temporal split"
+                    )
+                # Row-level fallback (sklearn TimeSeriesSplit style)
+                n_chunks = cv_folds + 1
+                chunk_size = n // n_chunks
+                gap_rows = cv_gap_groups * win
+                for fold_idx in range(cv_folds):
+                    train_end = (fold_idx + 1) * chunk_size - gap_rows
+                    val_start = (fold_idx + 1) * chunk_size
+                    val_end = (fold_idx + 2) * chunk_size if fold_idx < cv_folds - 1 else n
+                    if train_end < win:
+                        continue
+                    out = _yield_fold(
+                        train_df.iloc[:train_end], train_df.iloc[val_start:val_end]
+                    )
+                    if out is not None:
+                        yield out
+                return
+
+            # Group-aware split: cut at group boundaries only
+            n_chunks = cv_folds + 1
+            chunk_size = max(1, n_groups // n_chunks)
+            for fold_idx in range(cv_folds):
+                train_group_end = (fold_idx + 1) * chunk_size - cv_gap_groups
+                val_group_start = (fold_idx + 1) * chunk_size
+                val_group_end = (
+                    (fold_idx + 2) * chunk_size if fold_idx < cv_folds - 1 else n_groups
+                )
+                if train_group_end < 1 or val_group_start >= n_groups:
+                    continue
+                train_row_end = int(group_ends[train_group_end - 1])
+                val_row_start = int(group_starts[val_group_start])
+                val_row_end = int(group_ends[min(val_group_end - 1, n_groups - 1)])
+                fold_train_df = train_df.iloc[:train_row_end]
+                fold_val_df = train_df.iloc[val_row_start:val_row_end]
+                logger.debug(
+                    f"CV fold {fold_idx + 1}/{cv_folds} | group_col={gcol} | "
+                    f"train_groups=0..{train_group_end - 1} ({len(fold_train_df)} rows) | "
+                    f"val_groups={val_group_start}..{val_group_end - 1} ({len(fold_val_df)} rows)"
+                )
+                out = _yield_fold(fold_train_df, fold_val_df)
+                if out is not None:
+                    yield out
+
         def objective_builder(stage: HPOStageConfig, frozen_params: dict):
+            # Apply CV to both stages — A100 budget allows it; gives consistent ranking.
+            stage_use_cv = use_cv
+
             def objective(trial: optuna.Trial) -> float:
                 trial_p = suggest_params_from_space(trial, stage.search_space)
                 merged = {**fixed_arch, **frozen_params, **trial_p}
@@ -1286,27 +1429,73 @@ def run_maat(config: dict | None = None) -> None:
                     trial_training_cfg["lr"] = float(merged["learning_rate"])
 
                 trial_bs = int(trial_training_cfg.get("batch_size", min(batch_size, 128)))
-                t_dl, v_dl, _ = _make_dataloaders(
-                    trial_maat_cfg, train_stride, eval_stride, trial_bs
-                )
+                trial_stride = int(merged.get("train_stride", train_stride))
 
                 try:
-                    lit, _ = _train_and_eval(
-                        trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
-                        n_features,
-                        drift_feature_idx,
-                        voltage_drop_feature_idx,
-                        power_imbalance_feature_idx,
-                        current_imbalance_feature_idx,
-                        voltage_imbalance_feature_idx,
-                        hpo_epochs,
-                        hpo_patience,
-                        total_steps=max(1, len(t_dl) * hpo_epochs),
-                        seed=seed,
-                        pruning_warmup_epochs=pruning_warmup_epochs,
-                        trial=trial,
-                    )
-                    pr_auc = lit.best_val_pr_auc
+                    if stage_use_cv:
+                        fold_aucs: list[float] = []
+                        running_sum = 0.0
+                        for fold_idx, (t_dl, v_dl) in enumerate(_make_cv_folds(
+                            trial_maat_cfg, trial_stride, eval_stride, trial_bs
+                        )):
+                            # Per-epoch pruning disabled inside folds (epoch counter
+                            # resets each fold and would conflict with optuna's step
+                            # bookkeeping). Aggregate-per-fold pruning is applied below.
+                            lit, _ = _train_and_eval(
+                                trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
+                                n_features,
+                                drift_feature_idx,
+                                voltage_drop_feature_idx,
+                                power_imbalance_feature_idx,
+                                current_imbalance_feature_idx,
+                                voltage_imbalance_feature_idx,
+                                hpo_epochs,
+                                hpo_patience,
+                                total_steps=max(1, len(t_dl) * hpo_epochs),
+                                seed=seed + fold_idx,
+                                pruning_warmup_epochs=pruning_warmup_epochs,
+                                trial=None,
+                            )
+                            fold_auc = float(lit.best_val_fused_pr_auc)
+                            fold_aucs.append(fold_auc)
+                            running_sum += fold_auc
+                            running_mean = running_sum / (fold_idx + 1)
+
+                            # Free GPU memory between folds
+                            del lit, t_dl, v_dl
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                            # Aggregate-per-fold pruning: report running mean,
+                            # let median pruner decide
+                            trial.report(running_mean, step=fold_idx)
+                            if trial.should_prune():
+                                raise optuna.exceptions.TrialPruned()
+
+                        if not fold_aucs:
+                            raise optuna.TrialPruned()
+                        pr_auc = float(sum(fold_aucs) / len(fold_aucs))
+                    else:
+                        t_dl, v_dl, _ = _make_dataloaders(
+                            trial_maat_cfg, trial_stride, eval_stride, trial_bs
+                        )
+                        lit, _ = _train_and_eval(
+                            trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
+                            n_features,
+                            drift_feature_idx,
+                            voltage_drop_feature_idx,
+                            power_imbalance_feature_idx,
+                            current_imbalance_feature_idx,
+                            voltage_imbalance_feature_idx,
+                            hpo_epochs,
+                            hpo_patience,
+                            total_steps=max(1, len(t_dl) * hpo_epochs),
+                            seed=seed,
+                            pruning_warmup_epochs=pruning_warmup_epochs,
+                            trial=trial,
+                        )
+                        pr_auc = lit.best_val_fused_pr_auc
                 except optuna.exceptions.TrialPruned:
                     raise
                 except Exception as exc:
@@ -1342,7 +1531,7 @@ def run_maat(config: dict | None = None) -> None:
         ]
 
         profile_str = str(args.profile or "default").replace("/", "_").replace("\\", "_")
-        cfg_hash = _hpo_config_fingerprint(maat_cfg, seed)
+        cfg_hash = _hpo_config_fingerprint(maat_cfg, hpo_cfg, seed)
         fingerprinted_prefix = (
             f"{hpo_cfg.get('study_name_prefix', 'anomaly_dl_maat')}"
             f"_{args.dataset}_{args.task}_{args.split_path}_{profile_str}_{cfg_hash}"
@@ -1405,7 +1594,7 @@ def run_maat(config: dict | None = None) -> None:
     final_training_cfg = dict(training_cfg)
     for k, v in best_params.items():
         if k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff",
-                 "dropout", "k", "temperature", "score_reduction"):
+                 "dropout", "k", "temperature", "score_reduction", "train_stride"):
             final_maat_cfg[k] = v
         elif k == "learning_rate":
             final_training_cfg["lr"] = v
@@ -1413,8 +1602,9 @@ def run_maat(config: dict | None = None) -> None:
             final_training_cfg[k] = v
 
     final_batch_size = int(final_training_cfg.get("batch_size", batch_size))
+    final_train_stride = int(final_maat_cfg.get("train_stride", train_stride))
     train_dl, val_dl, test_dl = _make_dataloaders(
-        final_maat_cfg, train_stride, eval_stride, final_batch_size
+        final_maat_cfg, final_train_stride, eval_stride, final_batch_size
     )
 
     # ── Final training ─────────────────────────────────────────────────────────
