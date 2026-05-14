@@ -150,7 +150,7 @@ def _build_pruner(pruner_name: str | None) -> BasePruner:
     if name in {"", "none", "off", "disabled"}:
         return optuna.pruners.NopPruner()
     if name == "median":
-        return optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=5)
+        return optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
     if name in {"successive_halving", "sha", "asha"}:
         return optuna.pruners.SuccessiveHalvingPruner()
     if name == "hyperband":

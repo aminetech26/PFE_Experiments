@@ -1313,18 +1313,16 @@ def run_maat(config: dict | None = None) -> None:
             return gcol, starts, ends
 
         def _make_cv_folds(cfg: dict, stride_train: int, stride_eval: int, bs: int):
-            """Group-aware temporal CV folds.
+            """Walk-forward CV: train on increasing subsets of train_df, validate on val_df.
 
-            Splits at group boundaries (episode_id → segment_id → operating_day_id)
-            so atomic groups are never split between train and val. Groups are
-            divided into cv_folds+1 chunks; fold k uses chunks [0..k] as train
-            and chunk k+1 as val (expanding window). cv_gap_groups groups are
-            dropped at the train/val boundary.
+            train_df is normal-only (semisup). val_df contains faults — required for PR-AUC.
+            Splitting train_df at group boundaries ensures no episode crosses fold boundaries.
+            cv_gap_groups groups are dropped at the end of each train fold to prevent
+            temporal leakage from the train/val boundary.
 
-            Falls back to row-level temporal split if no group column is found
-            (uses cv_gap_groups * win_size rows as the boundary gap).
+            Fold k uses the first (k+1)/(cv_folds+1) fraction of train groups as train.
+            All folds validate on the same val_df (the labeled holdout).
             """
-            n = len(train_df)
             win = int(cfg.get("win_size", maat_cfg["win_size"]))
             gcol, group_starts, group_ends = _resolve_group_boundaries(train_df)
             n_groups = len(group_starts)
@@ -1338,72 +1336,39 @@ def run_maat(config: dict | None = None) -> None:
             if loader_runtime["num_workers"] > 0:
                 dl_kw["prefetch_factor"] = loader_runtime["prefetch_factor"]
 
-            def _yield_fold(fold_train_df, fold_val_df):
-                if len(fold_train_df) < win or len(fold_val_df) < win:
-                    return None
+            n_chunks = cv_folds + 1
+            chunk_size = max(1, n_groups // n_chunks)
+
+            for fold_idx in range(cv_folds):
+                # Train on groups [0 .. (fold_idx+1)*chunk_size - cv_gap_groups)
+                train_group_end = (fold_idx + 1) * chunk_size - cv_gap_groups
+                if train_group_end < 1:
+                    continue
+                train_row_end = int(group_ends[min(train_group_end - 1, n_groups - 1)])
+                fold_train_df = train_df.iloc[:train_row_end]
+
+                if len(fold_train_df) < win:
+                    continue
+
                 ds_tr = TimeSeriesDataset(
                     fold_train_df, features, label_col, win, stride_train, normal_only=True
                 )
                 ds_vl = TimeSeriesDataset(
-                    fold_val_df, features, label_col, win, stride_eval,
+                    val_df, features, label_col, win, stride_eval,
                     normal_only=False, return_original_label=True,
                 )
                 if len(ds_tr) == 0 or len(ds_vl) == 0:
-                    return None
-                return (
-                    DataLoader(ds_tr, batch_size=bs, shuffle=True, **dl_kw),
-                    DataLoader(ds_vl, batch_size=bs, shuffle=False, **dl_kw),
-                )
-
-            if gcol is None or n_groups < cv_folds + 1:
-                if gcol is None:
-                    logger.info("CV fallback: no group column — using row-level temporal split")
-                else:
-                    logger.warning(
-                        f"CV fallback: only {n_groups} groups in '{gcol}' "
-                        f"(need {cv_folds + 1}) — using row-level temporal split"
-                    )
-                # Row-level fallback (sklearn TimeSeriesSplit style)
-                n_chunks = cv_folds + 1
-                chunk_size = n // n_chunks
-                gap_rows = cv_gap_groups * win
-                for fold_idx in range(cv_folds):
-                    train_end = (fold_idx + 1) * chunk_size - gap_rows
-                    val_start = (fold_idx + 1) * chunk_size
-                    val_end = (fold_idx + 2) * chunk_size if fold_idx < cv_folds - 1 else n
-                    if train_end < win:
-                        continue
-                    out = _yield_fold(
-                        train_df.iloc[:train_end], train_df.iloc[val_start:val_end]
-                    )
-                    if out is not None:
-                        yield out
-                return
-
-            # Group-aware split: cut at group boundaries only
-            n_chunks = cv_folds + 1
-            chunk_size = max(1, n_groups // n_chunks)
-            for fold_idx in range(cv_folds):
-                train_group_end = (fold_idx + 1) * chunk_size - cv_gap_groups
-                val_group_start = (fold_idx + 1) * chunk_size
-                val_group_end = (
-                    (fold_idx + 2) * chunk_size if fold_idx < cv_folds - 1 else n_groups
-                )
-                if train_group_end < 1 or val_group_start >= n_groups:
                     continue
-                train_row_end = int(group_ends[train_group_end - 1])
-                val_row_start = int(group_starts[val_group_start])
-                val_row_end = int(group_ends[min(val_group_end - 1, n_groups - 1)])
-                fold_train_df = train_df.iloc[:train_row_end]
-                fold_val_df = train_df.iloc[val_row_start:val_row_end]
+
                 logger.debug(
                     f"CV fold {fold_idx + 1}/{cv_folds} | group_col={gcol} | "
                     f"train_groups=0..{train_group_end - 1} ({len(fold_train_df)} rows) | "
-                    f"val_groups={val_group_start}..{val_group_end - 1} ({len(fold_val_df)} rows)"
+                    f"val=val_df ({len(val_df)} rows, faults={int((val_df[label_col] != 0).sum())})"
                 )
-                out = _yield_fold(fold_train_df, fold_val_df)
-                if out is not None:
-                    yield out
+                yield (
+                    DataLoader(ds_tr, batch_size=bs, shuffle=True, **dl_kw),
+                    DataLoader(ds_vl, batch_size=bs, shuffle=False, **dl_kw),
+                )
 
         def objective_builder(stage: HPOStageConfig, frozen_params: dict):
             # Apply CV to both stages — A100 budget allows it; gives consistent ranking.
