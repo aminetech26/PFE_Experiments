@@ -7,6 +7,14 @@ import torch
 
 
 def _resolve_loader_runtime(threading_cfg: dict, *, hpo_mode: bool) -> dict:
+    if hpo_mode:
+        return {
+            "num_workers": 0,
+            "pin_memory": False,
+            "persistent_workers": False,
+            "prefetch_factor": None,
+        }
+
     cpu_count = max(1, int(os.cpu_count() or 1))
     configured_workers = threading_cfg.get("dl_num_workers", "auto")
     if isinstance(configured_workers, str) and configured_workers.lower() == "auto":
