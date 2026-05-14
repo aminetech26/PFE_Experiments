@@ -148,6 +148,8 @@ def _calibrate_threshold(
 def _safe_pr_auc(labels: np.ndarray, scores: np.ndarray) -> float:
     if labels.sum() == 0 or labels.sum() == len(labels):
         return 0.0
+    if not np.all(np.isfinite(scores)):
+        return 0.0
     return float(average_precision_score(labels, scores))
 
 
@@ -739,7 +741,10 @@ class MAATLightningModule(pl.LightningModule):
             z_stack = np.stack([_z(c) for c in fused_components], axis=0)  # [C, N]
             # logsumexp τ=1: log(sum(exp(z_i))) — smooth max over components
             fused = np.log(np.sum(np.exp(z_stack - z_stack.max(axis=0, keepdims=True)), axis=0)) + z_stack.max(axis=0)
-            val_fused_pr_auc = _safe_pr_auc(all_labels, fused)
+            if not np.all(np.isfinite(fused)):
+                val_fused_pr_auc = val_pr_auc
+            else:
+                val_fused_pr_auc = _safe_pr_auc(all_labels, fused)
         else:
             val_fused_pr_auc = val_pr_auc
 
@@ -1329,12 +1334,11 @@ def run_maat(config: dict | None = None) -> None:
 
             dl_kw = {
                 "drop_last": False,
-                "num_workers": loader_runtime["num_workers"],
-                "pin_memory": loader_runtime["pin_memory"],
-                "persistent_workers": loader_runtime["persistent_workers"],
+                "num_workers": 0,  # must be 0 inside HPO trials — worker processes
+                # outlive their parent PID when a trial ends under Lightning+Optuna,
+                # causing AssertionError: can only test a child process on __del__.
+                "persistent_workers": False,
             }
-            if loader_runtime["num_workers"] > 0:
-                dl_kw["prefetch_factor"] = loader_runtime["prefetch_factor"]
 
             n_chunks = cv_folds + 1
             chunk_size = max(1, n_groups // n_chunks)
@@ -1403,9 +1407,6 @@ def run_maat(config: dict | None = None) -> None:
                         for fold_idx, (t_dl, v_dl) in enumerate(_make_cv_folds(
                             trial_maat_cfg, trial_stride, eval_stride, trial_bs
                         )):
-                            # Per-epoch pruning disabled inside folds (epoch counter
-                            # resets each fold and would conflict with optuna's step
-                            # bookkeeping). Aggregate-per-fold pruning is applied below.
                             lit, _ = _train_and_eval(
                                 trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
                                 n_features,
@@ -1422,9 +1423,6 @@ def run_maat(config: dict | None = None) -> None:
                                 trial=None,
                             )
                             fold_auc = float(lit.best_val_fused_pr_auc)
-                            fold_aucs.append(fold_auc)
-                            running_sum += fold_auc
-                            running_mean = running_sum / (fold_idx + 1)
 
                             # Free GPU memory between folds
                             del lit, t_dl, v_dl
@@ -1432,8 +1430,14 @@ def run_maat(config: dict | None = None) -> None:
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
 
-                            # Aggregate-per-fold pruning: report running mean,
-                            # let median pruner decide
+                            if not math.isfinite(fold_auc) or fold_auc <= 0.0:
+                                # NaN/zero fold — model diverged; skip fold but don't crash trial
+                                continue
+
+                            fold_aucs.append(fold_auc)
+                            running_sum += fold_auc
+                            running_mean = running_sum / len(fold_aucs)
+
                             trial.report(running_mean, step=fold_idx)
                             if trial.should_prune():
                                 raise optuna.exceptions.TrialPruned()
