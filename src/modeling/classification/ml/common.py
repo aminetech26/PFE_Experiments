@@ -22,6 +22,10 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 
+from src.modeling.common.artifact_contract import (
+    build_deployment_manifest,
+    build_run_manifest,
+)
 from src.modeling.common.system_resources import compute_thread_budget, detect_cpu_resources
 from src.utils.paths import get_experiments_root
 
@@ -163,6 +167,9 @@ def resolve_artifact_paths(
 ) -> dict[str, Path]:
     root = Path(artifacts_dir) if artifacts_dir else default_artifacts_dir(model_name, run_name)
     root.mkdir(parents=True, exist_ok=True)
+    resolved_model_path = Path(model_path) if model_path else root / "model.joblib"
+    if not resolved_model_path.suffix:
+        resolved_model_path = resolved_model_path.with_suffix(".joblib")
 
     paths = {
         "artifacts_dir": root,
@@ -170,14 +177,93 @@ def resolve_artifact_paths(
         "leakage_report_path": Path(leakage_report_path)
         if leakage_report_path
         else root / "leakage_report.json",
-        "model_path": Path(model_path) if model_path else root / "model.joblib",
+        "model_path": resolved_model_path,
         "confusion_matrix_path": root / "confusion_matrix.png",
         "confusion_matrix_normalized_path": root / "confusion_matrix_normalized.png",
         "per_class_pr_curve_path": root / "per_class_pr_curve.png",
         "prediction_distribution_path": root / "prediction_distribution.png",
         "feature_importance_path": root / "feature_importance_top20.png",
+        "global_metrics_path": root / "global_metrics.json",
+        "per_class_metrics_path": root / "per_class_metrics.json",
+        "run_manifest_path": root / "run_manifest.json",
+        "deployment_manifest_path": root / "deployment_manifest.json",
+        "classification_report_path": root / "classification_report.json",
+        "features_manifest_path": root / "features_manifest.json",
     }
     return paths
+
+
+def write_classification_contract_artifacts(
+    *,
+    paths: dict[str, Path],
+    args,
+    model_name: str,
+    feature_profile: str,
+    resolved_run_dir: Path,
+    seed: int,
+    run_name: str,
+    features: list[str],
+    label_column: str,
+    classes: np.ndarray,
+    summary_metrics: dict[str, float],
+    pr_auc_by_class: dict[str, float],
+    classification_report_payload: dict[str, Any],
+    features_manifest_payload: dict[str, Any],
+) -> None:
+    global_metrics = {
+        "accuracy": summary_metrics.get("accuracy"),
+        "balanced_accuracy": summary_metrics.get("balanced_accuracy"),
+        "f1_weighted": summary_metrics.get("f1_weighted"),
+        "f1_macro": summary_metrics.get("f1_macro"),
+        "precision_weighted": summary_metrics.get("precision_weighted"),
+        "precision_macro": summary_metrics.get("precision_macro"),
+        "recall_weighted": summary_metrics.get("recall_weighted"),
+        "recall_macro": summary_metrics.get("recall_macro"),
+        "pr_auc_weighted": summary_metrics.get("pr_auc_weighted"),
+    }
+
+    per_class: dict[str, dict[str, Any]] = {}
+    for cls in classes:
+        key = str(cls)
+        report_entry = classification_report_payload.get(key, {})
+        per_class[key] = {
+            "support": report_entry.get("support"),
+            "precision": report_entry.get("precision"),
+            "recall": report_entry.get("recall"),
+            "f1_score": report_entry.get("f1-score"),
+            "pr_auc": pr_auc_by_class.get(key),
+        }
+
+    run_manifest = build_run_manifest(
+        task=str(args.task),
+        model=model_name,
+        model_family="classification_ml",
+        dataset=str(args.dataset),
+        split_path=str(args.split_path),
+        feature_profile=feature_profile,
+        feature_run_dir=str(resolved_run_dir),
+        seed=int(seed),
+        run_type=str(args.run_type),
+        extras={"run_name": run_name},
+    )
+    deployment_manifest = build_deployment_manifest(
+        task=str(args.task),
+        model=model_name,
+        model_family="classification_ml",
+        model_artifact=paths["model_path"].name,
+        scaler_artifact=None,
+        feature_names=features,
+        label_column=label_column,
+        classes=[str(c) for c in classes],
+        extras={"label_encoder_embedded": True},
+    )
+
+    write_json_artifact(paths["global_metrics_path"], global_metrics)
+    write_json_artifact(paths["per_class_metrics_path"], per_class)
+    write_json_artifact(paths["run_manifest_path"], run_manifest)
+    write_json_artifact(paths["deployment_manifest_path"], deployment_manifest)
+    write_json_artifact(paths["classification_report_path"], classification_report_payload)
+    write_json_artifact(paths["features_manifest_path"], features_manifest_payload)
 
 
 def _save_confusion_matrix_plot(

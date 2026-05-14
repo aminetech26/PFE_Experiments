@@ -1,4 +1,51 @@
 deployment:
-  model_name: pfe_placeholder
-  opset_version: 17
-  dynamic_batch: true
+  artifact_contract_version: 1
+  target: jetson_nano
+
+  runtime:
+    default: sklearn_joblib
+    supported: [sklearn_joblib, pytorch_ckpt, onnx]
+
+  input:
+    dtype: float32
+    missing_value_policy: reject
+    require_exact_feature_order: true
+
+  anomaly:
+    score_direction: higher_is_more_anomalous
+    threshold_source: deployment_manifest
+    alarm_policy:
+      consecutive_windows: 3
+      cooldown_seconds: 60
+
+  classification:
+    output: class_probabilities
+    unknown_policy: max_probability_threshold
+    min_confidence: 0.5
+
+  windowing:
+    enabled: true
+    window_size_source: deployment_manifest
+    stride_source: deployment_manifest
+
+  export:
+    onnx:
+      enabled: false
+      opset_version: 17
+      dynamic_batch: true
+    quantization:
+      enabled: false
+      mode: dynamic
+
+  profiling:
+    warmup_runs: 20
+    measured_runs: 200
+    batch_sizes: [1, 8, 32]
+    latency_percentiles: [50, 90, 95, 99]
+    memory_tracking: true
+
+  acceptance:
+    max_p95_latency_ms: 100
+    max_memory_mb: 1024
+    require_metric_parity: true
+    max_score_drift_abs: 1.0e-5

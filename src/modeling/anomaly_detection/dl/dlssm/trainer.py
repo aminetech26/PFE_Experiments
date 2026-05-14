@@ -28,11 +28,20 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 import optuna
-from optuna.pruners import SuccessiveHalvingPruner
-from optuna.samplers import TPESampler
 from pytorch_lightning.callbacks import Callback
 
 from src.mlflow_setup import init_tracking
+from src.modeling.common.artifact_contract import (
+    build_deployment_manifest,
+    build_run_manifest,
+    compute_anomaly_per_class_metrics,
+    write_json,
+)
+from src.modeling.common.dl_training_utils import (
+    _build_warmup_cosine_scheduler,
+    _resolve_loader_runtime,
+    _trainer_runtime_kwargs,
+)
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
     apply_pv_safe_augmentation,
@@ -46,7 +55,11 @@ from src.modeling.anomaly_detection.dl.dlssm.losses import (
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
 from src.modeling.common.feature_loader import load_features_for_task
-from src.modeling.common.hyperparameter_optimizer import suggest_params_from_space
+from src.modeling.common.hyperparameter_optimizer import (
+    _build_pruner,
+    _build_sampler,
+    suggest_params_from_space,
+)
 from src.utils.paths import get_experiments_root
 
 # trainer.py is under dl/dlssm/, so PROJECT_ROOT is 5 levels up
@@ -113,12 +126,17 @@ def _calibrate_threshold(
 class _OptunaPruningCallback(Callback):
     """Minimal ASHA pruning callback — no optuna-integration dependency."""
 
-    def __init__(self, trial: optuna.Trial, monitor: str = "val_pr_auc") -> None:
+    def __init__(
+        self, trial: optuna.Trial, monitor: str = "val_pr_auc", warmup_epochs: int = 3
+    ) -> None:
         self._trial = trial
         self._monitor = monitor
+        self._warmup_epochs = int(warmup_epochs)
 
     def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if trainer.sanity_checking:
+            return
+        if trainer.current_epoch < self._warmup_epochs:
             return
         logged = trainer.callback_metrics.get(self._monitor)
         if logged is None:
@@ -131,6 +149,7 @@ class _OptunaPruningCallback(Callback):
 def _run_hpo(
     base_cfg: dict,
     hpo_cfg: dict,
+    training_cfg: dict,
     train_dl: "DataLoader",
     val_dl: "DataLoader",
     scaler_mean_t: torch.Tensor,
@@ -151,9 +170,16 @@ def _run_hpo(
     search_space = hpo_cfg.get("search_space", {})
     n_trials = n_trials_override or int(hpo_cfg.get("n_trials", 40))
     timeout = hpo_cfg.get("timeout_seconds", None)
-    # HPO uses shorter max_epochs for speed; use 15 or half of full budget
-    hpo_epochs = max(10, int(base_cfg.get("max_epochs", 60)) // 4)
-    hpo_patience = max(5, hpo_epochs // 3)
+    full_epochs = int(base_cfg.get("max_epochs", training_cfg.get("max_epochs", 100)))
+    hpo_epochs = max(
+        int(hpo_cfg.get("min_hpo_epochs", 10)),
+        int(full_epochs * float(hpo_cfg.get("max_epochs_fraction", 0.25))),
+    )
+    hpo_patience = max(
+        int(hpo_cfg.get("min_hpo_patience", 5)),
+        int(int(training_cfg.get("patience", 15)) * float(hpo_cfg.get("patience_fraction", 0.33))),
+    )
+    pruning_warmup_epochs = int(hpo_cfg.get("pruning_warmup_epochs", 3))
 
     def objective(trial: optuna.Trial) -> float:
         suggested = suggest_params_from_space(trial, search_space)
@@ -180,6 +206,9 @@ def _run_hpo(
             weight_decay=float(suggested.get("weight_decay", cfg.get("weight_decay", 1e-5))),
             gradient_clip_val=float(cfg.get("gradient_clip_val", 1.0)),
             max_epochs=hpo_epochs,
+            total_steps=max(1, len(train_dl) * hpo_epochs),
+            warmup_steps=int(training_cfg.get("warmup_steps", 0)),
+            min_lr_ratio=float(training_cfg.get("min_lr_ratio", 0.01)),
             beta_kl=float(cfg.get("beta_kl", 0.1)),
             kl_warmup_epochs=int(cfg.get("kl_warmup_epochs", 5)),
             lambda_phys=float(suggested.get("lambda_phys", cfg.get("lambda_phys", 0.1))),
@@ -210,7 +239,9 @@ def _run_hpo(
             max_epochs=hpo_epochs,
             callbacks=[
                 EarlyStopping(monitor="val_pr_auc", patience=hpo_patience, mode="max", verbose=False),
-                _OptunaPruningCallback(trial, monitor="val_pr_auc"),
+                _OptunaPruningCallback(
+                    trial, monitor="val_pr_auc", warmup_epochs=pruning_warmup_epochs
+                ),
             ],
             enable_progress_bar=False,
             enable_model_summary=False,
@@ -218,7 +249,7 @@ def _run_hpo(
             logger=False,
             deterministic=False,
             gradient_clip_val=float(cfg.get("gradient_clip_val", 1.0)),
-            accelerator=str(cfg.get("accelerator", "auto")),
+            **_trainer_runtime_kwargs(training_cfg, cfg),
         )
         try:
             hpo_trainer.fit(hpo_lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
@@ -226,8 +257,8 @@ def _run_hpo(
             raise
         return float(hpo_lit.best_val_pr_auc)
 
-    sampler = TPESampler(seed=seed)
-    pruner = SuccessiveHalvingPruner()
+    sampler = _build_sampler(str(hpo_cfg.get("sampler", "tpe")), seed=seed)
+    pruner = _build_pruner(str(hpo_cfg.get("pruner", "asha")))
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
@@ -262,6 +293,9 @@ class DLSSMLightningModule(pl.LightningModule):
         weight_decay: float = 1e-5,
         gradient_clip_val: float = 1.0,
         max_epochs: int = 30,
+        total_steps: int = 1,
+        warmup_steps: int = 0,
+        min_lr_ratio: float = 0.01,
         beta_kl: float = 0.1,
         kl_warmup_epochs: int = 5,
         lambda_phys: float = 0.05,
@@ -297,6 +331,9 @@ class DLSSMLightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.gradient_clip_val = gradient_clip_val
         self.max_epochs = max_epochs
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.min_lr_ratio = min_lr_ratio
         self.beta_kl = beta_kl
         self.kl_warmup_epochs = kl_warmup_epochs
         self.lambda_phys = lambda_phys
@@ -566,16 +603,25 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("test_precision_at_threshold", test_prec)
         self.log("test_recall_at_threshold", test_rec)
 
+    @torch.no_grad()
+    def score_windows(self, x: torch.Tensor) -> torch.Tensor:
+        """Score a batch of windows [B, W, F] → anomaly scores [B]."""
+        out = self.model(x, self._extract_condition(x))
+        return self._score_batch(x, out)
+
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=self.max_epochs, eta_min=self.learning_rate * 0.01
+        sch = _build_warmup_cosine_scheduler(
+            opt,
+            warmup_steps=self.warmup_steps,
+            total_steps=self.total_steps,
+            min_lr_ratio=self.min_lr_ratio,
         )
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "epoch"}}
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "interval": "step"}}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -742,6 +788,8 @@ def run_dlssm(config: dict | None = None) -> None:
         config = _load_config()
 
     dlssm_cfg: dict = config["anomaly_detection"]["dl"]["models"]["dlssm"]
+    training_cfg: dict = config.get("training", {})
+    threading_cfg: dict = config.get("training", {}).get("threading", {})
     seed: int = args.seed
     is_smoke: bool = args.smoke
 
@@ -808,9 +856,9 @@ def run_dlssm(config: dict | None = None) -> None:
     win_size = int(dlssm_cfg["win_size"])
     train_stride = int(dlssm_cfg.get("train_stride", 1))
     eval_stride = int(dlssm_cfg.get("eval_stride", 1))
-    batch_size = int(dlssm_cfg.get("batch_size", 256))
-    max_epochs = int(dlssm_cfg.get("max_epochs", 30))
-    patience = 10
+    batch_size = int(dlssm_cfg.get("batch_size", training_cfg.get("batch_size", 256)))
+    max_epochs = int(dlssm_cfg.get("max_epochs", training_cfg.get("max_epochs", 100)))
+    patience = int(dlssm_cfg.get("patience", training_cfg.get("patience", 15)))
 
     if is_smoke:
         train_stride = max(train_stride, win_size // 2)
@@ -819,11 +867,29 @@ def run_dlssm(config: dict | None = None) -> None:
         patience = 1
         logger.info("Smoke mode: 1 epoch, large strides")
 
+    loader_runtime = _resolve_loader_runtime(
+        threading_cfg, hpo_mode=bool(getattr(args, "hpo", False))
+    )
+    logger.info(
+        "DataLoader runtime | workers={} pin_memory={} persistent_workers={} prefetch_factor={}",
+        loader_runtime["num_workers"],
+        loader_runtime["pin_memory"],
+        loader_runtime["persistent_workers"],
+        loader_runtime["prefetch_factor"],
+    )
+
     def _make_dataloaders(stride_train: int, stride_eval: int, bs: int):
         ds_train = TimeSeriesDataset(train_df, features, label_col, win_size, stride_train, normal_only=True)
         ds_val = TimeSeriesDataset(val_df, features, label_col, win_size, stride_eval, normal_only=False)
         ds_test = TimeSeriesDataset(test_df, features, label_col, win_size, stride_eval, normal_only=False)
-        kw = dict(drop_last=False, num_workers=0)
+        kw = {
+            "drop_last": False,
+            "num_workers": loader_runtime["num_workers"],
+            "pin_memory": loader_runtime["pin_memory"],
+            "persistent_workers": loader_runtime["persistent_workers"],
+        }
+        if loader_runtime["num_workers"] > 0:
+            kw["prefetch_factor"] = loader_runtime["prefetch_factor"]
         return (
             DataLoader(ds_train, batch_size=bs, shuffle=True, **kw),
             DataLoader(ds_val, batch_size=bs, shuffle=False, **kw),
@@ -874,6 +940,7 @@ def run_dlssm(config: dict | None = None) -> None:
         hpo_params, _hpo_n_completed = _run_hpo(
             base_cfg=dlssm_cfg,
             hpo_cfg=hpo_cfg,
+            training_cfg=training_cfg,
             cvae_enabled=cvae_enabled,
             condition_idx=condition_idx,
             condition_dim=condition_dim,
@@ -921,6 +988,9 @@ def run_dlssm(config: dict | None = None) -> None:
         weight_decay=float(dlssm_cfg.get("weight_decay", 1e-5)),
         gradient_clip_val=float(dlssm_cfg.get("gradient_clip_val", 1.0)),
         max_epochs=max_epochs,
+        total_steps=max(1, len(train_dl) * max_epochs),
+        warmup_steps=int(training_cfg.get("warmup_steps", 0)),
+        min_lr_ratio=float(training_cfg.get("min_lr_ratio", 0.01)),
         beta_kl=float(dlssm_cfg.get("beta_kl", 0.1)),
         kl_warmup_epochs=int(dlssm_cfg.get("kl_warmup_epochs", 5)),
         lambda_phys=float(dlssm_cfg.get("lambda_phys", 0.05)),
@@ -966,11 +1036,10 @@ def run_dlssm(config: dict | None = None) -> None:
             monitor="val_pr_auc",
             mode="max",
             save_top_k=1,
+            save_last=True,
         ),
     ]
 
-    accelerator = str(dlssm_cfg.get("accelerator", "auto"))
-    precision_cfg = dlssm_cfg.get("precision", None)  # e.g. "16-mixed" or None
     trainer_kwargs: dict = dict(
         max_epochs=max_epochs,
         callbacks=callbacks,
@@ -980,10 +1049,8 @@ def run_dlssm(config: dict | None = None) -> None:
         logger=False,
         deterministic=False,
         gradient_clip_val=float(dlssm_cfg.get("gradient_clip_val", 1.0)),
-        accelerator=accelerator,
+        **_trainer_runtime_kwargs(training_cfg, dlssm_cfg),
     )
-    if precision_cfg is not None:
-        trainer_kwargs["precision"] = precision_cfg
     trainer = pl.Trainer(**trainer_kwargs)
 
     logger.info(
@@ -1060,6 +1127,7 @@ def run_dlssm(config: dict | None = None) -> None:
         "n_features": n_features,
         "fit_time_s": round(fit_time, 2),
     }
+    run_name = f"anomaly_dlssm_{variant.lower().replace('-', '_')}_{ts}"
 
     # Save artifacts
     run_params = {
@@ -1078,6 +1146,10 @@ def run_dlssm(config: dict | None = None) -> None:
     }
 
     metrics_path = artifacts_dir / "metrics.json"
+    global_metrics_path = artifacts_dir / "global_metrics.json"
+    per_class_metrics_path = artifacts_dir / "per_class_metrics.json"
+    run_manifest_path = artifacts_dir / "run_manifest.json"
+    deployment_manifest_path = artifacts_dir / "deployment_manifest.json"
     params_path = artifacts_dir / "run_params.json"
     hpo_params_path = artifacts_dir / "hpo_best_params.json"
     scaler_path = artifacts_dir / "scaler.joblib"
@@ -1088,12 +1160,48 @@ def run_dlssm(config: dict | None = None) -> None:
     pred_residual_path = artifacts_dir / "prediction_residual_decomposition.png"
 
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    write_json(global_metrics_path, metrics)
     params_path.write_text(json.dumps(run_params, indent=2, default=str), encoding="utf-8")
     if hpo_params:
         hpo_params_path.write_text(json.dumps(hpo_params, indent=2, default=str), encoding="utf-8")
         logger.info("Best HPO params saved → {}  (pass with --best-params for multi-seed)", hpo_params_path)
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     joblib.dump(scaler, scaler_path)
+    per_class_metrics = compute_anomaly_per_class_metrics(
+        labels=test_labels,
+        scores=test_scores,
+        threshold=threshold,
+    )
+    run_manifest = build_run_manifest(
+        task=args.task,
+        model="dlssm",
+        model_family="anomaly_dl",
+        dataset=args.dataset,
+        split_path=args.split_path,
+        feature_profile=str(args.profile),
+        feature_run_dir=str(resolved_run_dir),
+        seed=seed,
+        run_type=run_type,
+        extras={"run_name": run_name, "variant": variant},
+    )
+    model_artifact_rel = "checkpoints/best.ckpt" if best_ckpt_path else "checkpoints/last.ckpt"
+    deployment_manifest = build_deployment_manifest(
+        task=args.task,
+        model="dlssm",
+        model_family="anomaly_dl",
+        model_artifact=model_artifact_rel,
+        scaler_artifact=scaler_path.name,
+        feature_names=features,
+        label_column=label_col,
+        threshold=threshold,
+        window_size=win_size,
+        score_direction="higher_is_more_anomalous",
+        classes=["0", "1"],
+        extras={"checkpoint_available": bool(best_ckpt_path)},
+    )
+    write_json(per_class_metrics_path, per_class_metrics)
+    write_json(run_manifest_path, run_manifest)
+    write_json(deployment_manifest_path, deployment_manifest)
 
     _save_pr_curve(val_scores, val_labels, test_scores, test_labels, pr_curve_path, model_name=variant)
     _save_score_histogram(val_scores, val_labels, threshold, histogram_path, model_name=variant)
@@ -1109,7 +1217,6 @@ def run_dlssm(config: dict | None = None) -> None:
     logger.info("Artifacts saved → {}", artifacts_dir)
 
     # MLflow
-    run_name = f"anomaly_dlssm_{variant.lower().replace('-', '_')}_{ts}"
     try:
         init_tracking("anomaly")
         with mlflow.start_run(run_name=run_name):
@@ -1131,8 +1238,21 @@ def run_dlssm(config: dict | None = None) -> None:
                 if not isinstance(v, (dict, list))
             })
             mlflow.log_metrics(metrics)
-            for p in (metrics_path, params_path, hpo_params_path, scaler_path, manifest_path,
-                      pr_curve_path, histogram_path, timeline_path, pred_residual_path):
+            for p in (
+                metrics_path,
+                global_metrics_path,
+                per_class_metrics_path,
+                run_manifest_path,
+                deployment_manifest_path,
+                params_path,
+                hpo_params_path,
+                scaler_path,
+                manifest_path,
+                pr_curve_path,
+                histogram_path,
+                timeline_path,
+                pred_residual_path,
+            ):
                 if p.exists():
                     mlflow.log_artifact(str(p))
             if best_ckpt_path and Path(best_ckpt_path).exists():

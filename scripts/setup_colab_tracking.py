@@ -37,13 +37,15 @@ def main() -> None:
 
     print("Tracking bootstrap complete.")
     print(f"Base directory: {base_dir}")
+    print("Set artifact root env for default model outputs:")
+    print(f"export PFE_ARTIFACTS_ROOT='{targets['artifacts'].as_posix()}'")
     print("Use these model_config.yaml values:")
     print(
         "classification.ml.hpo.storage_url: "
         f'"sqlite:////{ml_db.as_posix().lstrip("/")}"'
     )
     print(
-        "classification.dl.hpo.storage_url: "
+        "anomaly_detection.dl.hpo.storage_url: "
         f'"sqlite:////{dl_db.as_posix().lstrip("/")}"'
     )
 

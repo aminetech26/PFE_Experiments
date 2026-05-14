@@ -32,6 +32,17 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 from src.mlflow_setup import init_tracking
+from src.modeling.common.artifact_contract import (
+    build_deployment_manifest,
+    build_run_manifest,
+    compute_anomaly_per_class_metrics,
+    write_json,
+)
+from src.modeling.common.dl_training_utils import (
+    _build_warmup_cosine_scheduler,
+    _resolve_loader_runtime,
+    _trainer_runtime_kwargs,
+)
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
@@ -70,7 +81,6 @@ def _hpo_config_fingerprint(maat_cfg: dict, seed: int) -> str:
     }
     relevant["hpo_stage1"] = maat_cfg.get("hpo_stage1", {})
     relevant["hpo_stage2"] = maat_cfg.get("hpo_stage2", {})
-    relevant["factorized"] = maat_cfg.get("factorized", {})
     relevant["seed"] = seed
     raw = json.dumps(relevant, sort_keys=True, default=str).encode()
     return hashlib.sha1(raw).hexdigest()[:8]
@@ -206,7 +216,25 @@ def _build_score_decomposition_report(
     val_original_labels: np.ndarray,
     test_original_labels: np.ndarray,
 ) -> dict:
-    report: dict = {"scores": {}}
+    report: dict = {
+        "version": 2,
+        "naming": {
+            "channels": {
+                "product": "MAAT product score",
+                "reconstruction": "MAAT reconstruction score",
+                "association_discrepancy": "MAAT association discrepancy score",
+                "association_affinity": "MAAT association affinity score",
+                "voltage_drop_vdc2": "Physics voltage-drop score (vdc2)",
+                "mismatch_imbalance": "Physics mismatch/imbalance score",
+                "drift_efficiency": "Drift/efficiency score",
+            },
+            "fusions": {
+                "max_z_*": "Element-wise max of z-scored components",
+                "logsumexp_z_*": "Smooth max (logsumexp) over z-scored components",
+            },
+        },
+        "scores": {},
+    }
 
     for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
         threshold, _, _, _ = _calibrate_threshold(val_parts[name], val_labels)
@@ -223,7 +251,7 @@ def _build_score_decomposition_report(
     test_clean_max = np.maximum(test_recon_z, test_product_z)
     _add_score_entry(
         report,
-        "clean_max_z_recon_product",
+        "max_z_recon_product",
         val_clean_max,
         test_clean_max,
         val_labels,
@@ -234,7 +262,7 @@ def _build_score_decomposition_report(
     for tau in (0.5, 1.0):
         _add_score_entry(
             report,
-            f"clean_logsumexp_z_recon_product_tau_{tau:g}",
+            f"logsumexp_z_recon_product_tau_{tau:g}",
             _logsumexp_pair(val_recon_z, val_product_z, tau=tau),
             _logsumexp_pair(test_recon_z, test_product_z, tau=tau),
             val_labels,
@@ -259,7 +287,7 @@ def _build_score_decomposition_report(
         )
         _add_score_entry(
             report,
-            "clean_max_z_product_drift",
+            "max_z_product_drift",
             np.maximum(val_product_z, val_drift_z),
             np.maximum(test_product_z, test_drift_z),
             val_labels,
@@ -269,7 +297,7 @@ def _build_score_decomposition_report(
         )
         _add_score_entry(
             report,
-            "clean_max_z_recon_product_drift",
+            "max_z_recon_product_drift",
             np.maximum(np.maximum(val_recon_z, val_product_z), val_drift_z),
             np.maximum(np.maximum(test_recon_z, test_product_z), test_drift_z),
             val_labels,
@@ -280,7 +308,7 @@ def _build_score_decomposition_report(
         for tau in (0.5, 1.0):
             _add_score_entry(
                 report,
-                f"clean_logsumexp_z_product_drift_tau_{tau:g}",
+                f"logsumexp_z_product_drift_tau_{tau:g}",
                 _logsumexp_pair(val_product_z, val_drift_z, tau=tau),
                 _logsumexp_pair(test_product_z, test_drift_z, tau=tau),
                 val_labels,
@@ -305,7 +333,7 @@ def _build_score_decomposition_report(
         )
         _add_score_entry(
             report,
-            "clean_max_z_product_voltage",
+            "max_z_product_voltage",
             np.maximum(val_product_z, val_vdrop_z),
             np.maximum(test_product_z, test_vdrop_z),
             val_labels,
@@ -315,7 +343,7 @@ def _build_score_decomposition_report(
         )
         _add_score_entry(
             report,
-            "clean_max_z_recon_product_voltage",
+            "max_z_recon_product_voltage",
             np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z),
             np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z),
             val_labels,
@@ -326,7 +354,7 @@ def _build_score_decomposition_report(
         for tau in (0.5, 1.0):
             _add_score_entry(
                 report,
-                f"clean_logsumexp_z_product_voltage_tau_{tau:g}",
+                f"logsumexp_z_product_voltage_tau_{tau:g}",
                 _logsumexp_pair(val_product_z, val_vdrop_z, tau=tau),
                 _logsumexp_pair(test_product_z, test_vdrop_z, tau=tau),
                 val_labels,
@@ -356,7 +384,7 @@ def _build_score_decomposition_report(
         )
         _add_score_entry(
             report,
-            "clean_max_z_recon_product_voltage_mismatch",
+            "max_z_recon_product_voltage_mismatch",
             np.maximum(np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z), val_mismatch_z),
             np.maximum(np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z), test_mismatch_z),
             val_labels,
@@ -377,7 +405,7 @@ def _build_score_decomposition_report(
             )
             _add_score_entry(
                 report,
-                f"clean_logsumexp_z_recon_product_voltage_mismatch_tau_{tau:g}",
+                f"logsumexp_z_recon_product_voltage_mismatch_tau_{tau:g}",
                 val_dvm,
                 test_dvm,
                 val_labels,
@@ -403,7 +431,7 @@ def _build_score_decomposition_report(
             "association_affinity_pr_auc": _safe_pr_auc(
                 labels, test_parts["association_affinity"][mask]
             ),
-            "clean_max_pr_auc": _safe_pr_auc(labels, test_clean_max[mask]),
+            "max_z_recon_product_pr_auc": _safe_pr_auc(labels, test_clean_max[mask]),
         }
         if "drift_efficiency" in test_parts:
             by_fault[f"{fault_label:g}"]["drift_efficiency_pr_auc"] = _safe_pr_auc(
@@ -443,20 +471,15 @@ class MAATLightningModule(pl.LightningModule):
         weight_decay: float = 1e-2,
         gradient_clip_val: float | None = 1.0,
         max_epochs: int = 100,
+        total_steps: int = 1,
+        warmup_steps: int = 0,
+        min_lr_ratio: float = 0.01,
         score_reduction: str = "center",
         drift_feature_idx: int | None = None,
         voltage_drop_feature_idx: int | None = None,
         power_imbalance_feature_idx: int | None = None,
         current_imbalance_feature_idx: int | None = None,
         voltage_imbalance_feature_idx: int | None = None,
-        factorized_enabled: bool = False,
-        factorized_feature_idx: dict[str, int] | None = None,
-        factorized_margin: float = 1.0,
-        lambda_voltage: float = 1.0,
-        lambda_mismatch: float = 1.0,
-        lambda_dynamic: float = 1.0,
-        lambda_family_classification: float = 0.25,
-        lambda_clean: float = 0.1,
     ) -> None:
         super().__init__()
         self.model = model
@@ -466,20 +489,15 @@ class MAATLightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.gradient_clip_val = gradient_clip_val
         self.max_epochs = max_epochs
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.min_lr_ratio = min_lr_ratio
         self.score_reduction = score_reduction
         self.drift_feature_idx = drift_feature_idx
         self.voltage_drop_feature_idx = voltage_drop_feature_idx
         self.power_imbalance_feature_idx = power_imbalance_feature_idx
         self.current_imbalance_feature_idx = current_imbalance_feature_idx
         self.voltage_imbalance_feature_idx = voltage_imbalance_feature_idx
-        self.factorized_enabled = factorized_enabled
-        self.factorized_feature_idx = factorized_feature_idx or {}
-        self.factorized_margin = factorized_margin
-        self.lambda_voltage = lambda_voltage
-        self.lambda_mismatch = lambda_mismatch
-        self.lambda_dynamic = lambda_dynamic
-        self.lambda_family_classification = lambda_family_classification
-        self.lambda_clean = lambda_clean
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -511,27 +529,14 @@ class MAATLightningModule(pl.LightningModule):
         self, x: torch.Tensor
     ) -> dict[str, torch.Tensor]:
         x_hat, series_list, prior_list, _ = self.model(x)
-        family_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        rank_voltage = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        rank_mismatch = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        rank_dynamic = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        family_classification = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        clean_family_penalty = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-
         rec_loss = nn.functional.mse_loss(x_hat, x)
         s_loss, p_loss = association_losses(series_list, prior_list)
-        loss1 = rec_loss + family_loss - self.k * s_loss
-        loss2 = rec_loss + family_loss + self.k * p_loss
+        loss1 = rec_loss - self.k * s_loss
+        loss2 = rec_loss + self.k * p_loss
         return {
             "rec_loss": rec_loss,
             "series_loss": s_loss,
             "prior_loss": p_loss,
-            "family_loss": family_loss,
-            "rank_voltage": rank_voltage,
-            "rank_mismatch": rank_mismatch,
-            "rank_dynamic": rank_dynamic,
-            "family_classification": family_classification,
-            "clean_family_penalty": clean_family_penalty,
             "loss1": loss1,
             "loss2": loss2,
         }
@@ -544,7 +549,6 @@ class MAATLightningModule(pl.LightningModule):
         rec_loss = step["rec_loss"]
         s_loss = step["series_loss"]
         p_loss = step["prior_loss"]
-        family_loss = step["family_loss"]
         loss1 = step["loss1"]
         loss2 = step["loss2"]
 
@@ -575,6 +579,9 @@ class MAATLightningModule(pl.LightningModule):
                 return
 
         opt.step()
+        sch = self.lr_schedulers()
+        if sch is not None:
+            sch.step()
 
         self.log("train_rec_loss", rec_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_series_kl", s_loss, on_step=False, on_epoch=True)
@@ -584,9 +591,6 @@ class MAATLightningModule(pl.LightningModule):
         self.log("grad_norm", grad_norm, on_step=False, on_epoch=True)
 
     def on_train_epoch_end(self) -> None:
-        sch = self.lr_schedulers()
-        if sch is not None:
-            sch.step()
         try:
             current_lr = self.optimizers().param_groups[0]["lr"]
             self.log("learning_rate", current_lr)
@@ -832,19 +836,28 @@ class MAATLightningModule(pl.LightningModule):
         self.log("test_precision_at_threshold", test_prec)
         self.log("test_recall_at_threshold", test_rec)
 
+    @torch.no_grad()
+    def score_windows(self, x: torch.Tensor) -> torch.Tensor:
+        """Score a batch of windows [B, W, F] → anomaly scores [B]."""
+        x_hat, series_list, prior_list, _ = self.model(x)
+        recon_error = ((x - x_hat) ** 2).mean(dim=-1)
+        product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
+        return self._reduce_scores(product_scores)
+
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+        sch = _build_warmup_cosine_scheduler(
             opt,
-            T_max=self.max_epochs,
-            eta_min=self.learning_rate * 0.01,
+            warmup_steps=self.warmup_steps,
+            total_steps=self.total_steps,
+            min_lr_ratio=self.min_lr_ratio,
         )
         # With automatic_optimization=False, Lightning does not step the scheduler
-        # automatically. We step it manually in on_train_epoch_end.
+        # automatically. We step it manually after each optimizer step.
         return [opt], [sch]
 
 
@@ -963,19 +976,12 @@ def _build_lightning_module(
     maat_cfg: dict,
     training_cfg: dict,
     max_epochs: int,
+    total_steps: int,
     drift_feature_idx: int | None,
     voltage_drop_feature_idx: int | None,
     power_imbalance_feature_idx: int | None,
     current_imbalance_feature_idx: int | None,
     voltage_imbalance_feature_idx: int | None,
-    factorized_enabled: bool,
-    factorized_feature_idx: dict[str, int],
-    factorized_margin: float,
-    lambda_voltage: float,
-    lambda_mismatch: float,
-    lambda_dynamic: float,
-    lambda_family_classification: float,
-    lambda_clean: float,
 ) -> MAATLightningModule:
     return MAATLightningModule(
         model=model,
@@ -985,20 +991,15 @@ def _build_lightning_module(
         weight_decay=float(training_cfg.get("weight_decay", 1e-2)),
         gradient_clip_val=float(training_cfg.get("gradient_clip_val", 1.0)),
         max_epochs=max_epochs,
+        total_steps=total_steps,
+        warmup_steps=int(training_cfg.get("warmup_steps", 0)),
+        min_lr_ratio=float(training_cfg.get("min_lr_ratio", 0.01)),
         score_reduction=str(maat_cfg.get("score_reduction", "center")),
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
         power_imbalance_feature_idx=power_imbalance_feature_idx,
         current_imbalance_feature_idx=current_imbalance_feature_idx,
         voltage_imbalance_feature_idx=voltage_imbalance_feature_idx,
-        factorized_enabled=factorized_enabled,
-        factorized_feature_idx=factorized_feature_idx,
-        factorized_margin=factorized_margin,
-        lambda_voltage=lambda_voltage,
-        lambda_mismatch=lambda_mismatch,
-        lambda_dynamic=lambda_dynamic,
-        lambda_family_classification=lambda_family_classification,
-        lambda_clean=lambda_clean,
     )
 
 
@@ -1013,17 +1014,11 @@ def _train_and_eval(
     power_imbalance_feature_idx: int | None,
     current_imbalance_feature_idx: int | None,
     voltage_imbalance_feature_idx: int | None,
-    factorized_enabled: bool,
-    factorized_feature_idx: dict[str, int],
-    factorized_margin: float,
-    lambda_voltage: float,
-    lambda_mismatch: float,
-    lambda_dynamic: float,
-    lambda_family_classification: float,
-    lambda_clean: float,
     max_epochs: int,
     patience: int,
+    total_steps: int,
     seed: int,
+    pruning_warmup_epochs: int = 3,
     ckpt_dir: Path | None = None,
     trial: optuna.Trial | None = None,
 ) -> tuple[MAATLightningModule, str | None]:
@@ -1035,19 +1030,12 @@ def _train_and_eval(
         maat_cfg=maat_cfg,
         training_cfg=training_cfg,
         max_epochs=max_epochs,
+        total_steps=total_steps,
         drift_feature_idx=drift_feature_idx,
         voltage_drop_feature_idx=voltage_drop_feature_idx,
         power_imbalance_feature_idx=power_imbalance_feature_idx,
         current_imbalance_feature_idx=current_imbalance_feature_idx,
         voltage_imbalance_feature_idx=voltage_imbalance_feature_idx,
-        factorized_enabled=factorized_enabled,
-        factorized_feature_idx=factorized_feature_idx,
-        factorized_margin=factorized_margin,
-        lambda_voltage=lambda_voltage,
-        lambda_mismatch=lambda_mismatch,
-        lambda_dynamic=lambda_dynamic,
-        lambda_family_classification=lambda_family_classification,
-        lambda_clean=lambda_clean,
     )
 
     ckpt_callback: ModelCheckpoint | None = None
@@ -1061,10 +1049,11 @@ def _train_and_eval(
             monitor="val_pr_auc",
             mode="max",
             save_top_k=1,
+            save_last=True,
         )
         callbacks.append(ckpt_callback)
     if trial is not None:
-        callbacks.append(_OptunaPruningCallback(trial, warmup_epochs=3))
+        callbacks.append(_OptunaPruningCallback(trial, warmup_epochs=pruning_warmup_epochs))
 
     trainer = pl.Trainer(
         max_epochs=max_epochs,
@@ -1074,6 +1063,7 @@ def _train_and_eval(
         enable_checkpointing=(ckpt_dir is not None),
         logger=False,
         deterministic=False,
+        **_trainer_runtime_kwargs(training_cfg),
     )
     trainer.fit(lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
 
@@ -1177,24 +1167,6 @@ def run_maat(config: dict | None = None) -> None:
         f"test: {len(test_df):,} (faults: {y_test.sum():,}) | features: {n_features}"
     )
 
-    factorized_cfg = maat_cfg.get("factorized", {})
-    factorized_enabled = bool(factorized_cfg.get("enabled", False))
-    factorized_margin = float(factorized_cfg.get("margin", 1.0))
-    lambda_voltage = float(factorized_cfg.get("lambda_voltage", 1.0))
-    lambda_mismatch = float(factorized_cfg.get("lambda_mismatch", 1.0))
-    lambda_dynamic = float(factorized_cfg.get("lambda_dynamic", 1.0))
-    lambda_family_classification = float(
-        factorized_cfg.get("lambda_family_classification", 0.25)
-    )
-    lambda_clean = float(factorized_cfg.get("lambda_clean", 0.1))
-    factorized_feature_names = ["vdc1", "vdc2", "idc1", "idc2", "pdc1", "pdc2"]
-    if factorized_enabled:
-        missing = [n for n in factorized_feature_names if n not in features]
-        if missing:
-            raise ValueError(
-                f"MAAT factorized.enabled=true requires features {factorized_feature_names}. "
-                f"Missing from manifest: {missing}"
-            )
 
     # ── Scale ──────────────────────────────────────────────────────────────────
     scaler = StandardScaler()
@@ -1205,19 +1177,6 @@ def run_maat(config: dict | None = None) -> None:
     train_df[features] = scaler.fit_transform(train_df[features])
     val_df[features] = scaler.transform(val_df[features])
     test_df[features] = scaler.transform(test_df[features])
-
-    factorized_feature_idx = {n: features.index(n) for n in factorized_feature_names if n in features}
-
-    if factorized_enabled:
-        logger.info(
-            "Factorized anomaly training | margin={} λV={} λM={} λD={} λcls={} λclean={}",
-            factorized_margin,
-            lambda_voltage,
-            lambda_mismatch,
-            lambda_dynamic,
-            lambda_family_classification,
-            lambda_clean,
-        )
 
     # ── Window config ──────────────────────────────────────────────────────────
     win_size = int(maat_cfg["win_size"])
@@ -1237,6 +1196,17 @@ def run_maat(config: dict | None = None) -> None:
     else:
         run_type = args.run_type
 
+    loader_runtime = _resolve_loader_runtime(
+        training_cfg.get("threading", {}), hpo_mode=run_hpo
+    )
+    logger.info(
+        "DataLoader runtime | workers={} pin_memory={} persistent_workers={} prefetch_factor={}",
+        loader_runtime["num_workers"],
+        loader_runtime["pin_memory"],
+        loader_runtime["persistent_workers"],
+        loader_runtime["prefetch_factor"],
+    )
+
     def _make_dataloaders(cfg: dict, stride_train: int, stride_eval: int, bs: int) -> tuple:
         ds_train = TimeSeriesDataset(
             train_df, features, label_col, cfg["win_size"], stride_train, normal_only=True
@@ -1249,12 +1219,18 @@ def run_maat(config: dict | None = None) -> None:
             test_df, features, label_col, cfg["win_size"], stride_eval,
             normal_only=False, return_original_label=True,
         )
-        # num_workers=0: avoids DataLoader multiprocessing teardown races under
-        # Lightning/Optuna/Colab (Python 3.12 AssertionError: can only test a child process).
-        # persistent_workers requires num_workers > 0, so also forced off.
-        train_dl = DataLoader(ds_train, batch_size=bs, shuffle=True, drop_last=False, num_workers=0)
-        val_dl = DataLoader(ds_val, batch_size=bs, shuffle=False, drop_last=False, num_workers=0)
-        test_dl = DataLoader(ds_test, batch_size=bs, shuffle=False, drop_last=False, num_workers=0)
+        dl_common = {
+            "drop_last": False,
+            "num_workers": loader_runtime["num_workers"],
+            "pin_memory": loader_runtime["pin_memory"],
+            "persistent_workers": loader_runtime["persistent_workers"],
+        }
+        if loader_runtime["num_workers"] > 0:
+            dl_common["prefetch_factor"] = loader_runtime["prefetch_factor"]
+
+        train_dl = DataLoader(ds_train, batch_size=bs, shuffle=True, **dl_common)
+        val_dl = DataLoader(ds_val, batch_size=bs, shuffle=False, **dl_common)
+        test_dl = DataLoader(ds_test, batch_size=bs, shuffle=False, **dl_common)
         return train_dl, val_dl, test_dl
 
     train_dl, val_dl, test_dl = _make_dataloaders(maat_cfg, train_stride, eval_stride, batch_size)
@@ -1274,8 +1250,15 @@ def run_maat(config: dict | None = None) -> None:
         trial_budget: dict = hpo_cfg.get("trial_budget", {})
         n_stage1 = int(trial_budget.get("stage1_training", 20))
         n_stage2 = int(trial_budget.get("stage2_architecture", 40))
-        hpo_epochs = max(5, max_epochs // 5)
-        hpo_patience = max(3, patience // 3)
+        hpo_epochs = max(
+            int(hpo_cfg.get("min_hpo_epochs", 10)),
+            int(max_epochs * float(hpo_cfg.get("max_epochs_fraction", 0.25))),
+        )
+        hpo_patience = max(
+            int(hpo_cfg.get("min_hpo_patience", 5)),
+            int(patience * float(hpo_cfg.get("patience_fraction", 0.33))),
+        )
+        pruning_warmup_epochs = int(hpo_cfg.get("pruning_warmup_epochs", 3))
 
         fixed_arch = {
             k: maat_cfg[k]
@@ -1316,10 +1299,12 @@ def run_maat(config: dict | None = None) -> None:
                         power_imbalance_feature_idx,
                         current_imbalance_feature_idx,
                         voltage_imbalance_feature_idx,
-                        factorized_enabled, factorized_feature_idx, factorized_margin,
-                        lambda_voltage, lambda_mismatch, lambda_dynamic,
-                        lambda_family_classification, lambda_clean,
-                        hpo_epochs, hpo_patience, seed, trial=trial,
+                        hpo_epochs,
+                        hpo_patience,
+                        total_steps=max(1, len(t_dl) * hpo_epochs),
+                        seed=seed,
+                        pruning_warmup_epochs=pruning_warmup_epochs,
+                        trial=trial,
                     )
                     pr_auc = lit.best_val_pr_auc
                 except optuna.exceptions.TrialPruned:
@@ -1452,16 +1437,9 @@ def run_maat(config: dict | None = None) -> None:
         power_imbalance_feature_idx=power_imbalance_feature_idx,
         current_imbalance_feature_idx=current_imbalance_feature_idx,
         voltage_imbalance_feature_idx=voltage_imbalance_feature_idx,
-        factorized_enabled=factorized_enabled,
-        factorized_feature_idx=factorized_feature_idx,
-        factorized_margin=factorized_margin,
-        lambda_voltage=lambda_voltage,
-        lambda_mismatch=lambda_mismatch,
-        lambda_dynamic=lambda_dynamic,
-        lambda_family_classification=lambda_family_classification,
-        lambda_clean=lambda_clean,
         max_epochs=max_epochs,
         patience=patience,
+        total_steps=max(1, len(train_dl) * max_epochs),
         seed=seed,
         ckpt_dir=ckpt_dir,
     )
@@ -1520,7 +1498,6 @@ def run_maat(config: dict | None = None) -> None:
         return
 
     threshold = final_lit.val_threshold
-    score_mode = "product"
     val_pr_auc = float(average_precision_score(val_labels, val_scores))
     val_roc_auc = float(roc_auc_score(val_labels, val_scores))
     _, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, val_labels)
@@ -1563,9 +1540,14 @@ def run_maat(config: dict | None = None) -> None:
         "fit_time_s": round(fit_time, 2),
         "nan_count": final_lit._nan_count,
     }
+    run_name = f"anomaly_maat_{ts}"
 
     # ── Save artifacts ──────────────────────────────────────────────────────────
     metrics_path = artifacts_dir / "metrics.json"
+    global_metrics_path = artifacts_dir / "global_metrics.json"
+    per_class_metrics_path = artifacts_dir / "per_class_metrics.json"
+    run_manifest_path = artifacts_dir / "run_manifest.json"
+    deployment_manifest_path = artifacts_dir / "deployment_manifest.json"
     scaler_path = artifacts_dir / "scaler.joblib"
     params_path = artifacts_dir / "best_params.json"
     config_path = artifacts_dir / "resolved_config.json"
@@ -1576,6 +1558,7 @@ def run_maat(config: dict | None = None) -> None:
     decomposition_path = artifacts_dir / "score_decomposition_metrics.json"
 
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    write_json(global_metrics_path, metrics)
     joblib.dump(scaler, scaler_path)
     params_path.write_text(json.dumps(best_params, indent=2, default=str), encoding="utf-8")
     config_path.write_text(
@@ -1583,6 +1566,42 @@ def run_maat(config: dict | None = None) -> None:
         encoding="utf-8",
     )
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    per_class_labels = test_original_labels if test_original_labels is not None else test_labels
+    per_class_metrics = compute_anomaly_per_class_metrics(
+        labels=per_class_labels,
+        scores=test_scores,
+        threshold=threshold,
+    )
+    run_manifest = build_run_manifest(
+        task=args.task,
+        model="maat",
+        model_family="anomaly_dl",
+        dataset=args.dataset,
+        split_path=args.split_path,
+        feature_profile=str(args.profile),
+        feature_run_dir=str(resolved_run_dir),
+        seed=seed,
+        run_type=run_type,
+        extras={"run_name": run_name},
+    )
+    model_artifact_rel = "checkpoints/best.ckpt" if best_ckpt_path else "checkpoints/last.ckpt"
+    deployment_manifest = build_deployment_manifest(
+        task=args.task,
+        model="maat",
+        model_family="anomaly_dl",
+        model_artifact=model_artifact_rel,
+        scaler_artifact=scaler_path.name,
+        feature_names=features,
+        label_column=label_col,
+        threshold=threshold,
+        window_size=int(final_maat_cfg["win_size"]),
+        score_direction="higher_is_more_anomalous",
+        classes=[str(c) for c in sorted(np.unique(per_class_labels).tolist())],
+        extras={"checkpoint_available": bool(best_ckpt_path)},
+    )
+    write_json(per_class_metrics_path, per_class_metrics)
+    write_json(run_manifest_path, run_manifest)
+    write_json(deployment_manifest_path, deployment_manifest)
 
     _save_pr_curve(val_scores, val_labels, test_scores, test_labels, pr_curve_path)
     _save_score_histogram(val_scores, val_labels, threshold, histogram_path)
@@ -1636,10 +1655,10 @@ def run_maat(config: dict | None = None) -> None:
         decomposition_path.write_text(
             json.dumps(decomposition_report, indent=2, default=str), encoding="utf-8"
         )
-        clean_max = decomposition_report["scores"]["clean_max_z_recon_product"]
+        max_recon_product = decomposition_report["scores"]["max_z_recon_product"]
         logger.info(
-            "Score decomposition — clean max test_pr_auc={:.4f} test_macro_fault_pr_auc={:.4f}",
-            clean_max["test"]["pr_auc"], clean_max["test_macro_fault_pr_auc"],
+            "Score decomposition — max_z_recon_product test_pr_auc={:.4f} test_macro_fault_pr_auc={:.4f}",
+            max_recon_product["test"]["pr_auc"], max_recon_product["test_macro_fault_pr_auc"],
         )
 
     if stage_results:
@@ -1650,7 +1669,6 @@ def run_maat(config: dict | None = None) -> None:
     logger.info(f"Artifacts saved → {artifacts_dir}")
 
     # ── MLflow ──────────────────────────────────────────────────────────────────
-    run_name = f"anomaly_maat_{ts}"
     try:
         init_tracking("anomaly")
         with mlflow.start_run(run_name=run_name):
@@ -1670,12 +1688,23 @@ def run_maat(config: dict | None = None) -> None:
                 "hpo_enabled": run_hpo,
                 "run_type": run_type,
                 "score_reduction": final_maat_cfg.get("score_reduction", "center"),
-                "score_mode": score_mode,
             })
             mlflow.log_metrics(metrics)
-            for p in (metrics_path, scaler_path, params_path, config_path,
-                      pr_curve_path, histogram_path, timeline_path, manifest_path,
-                      decomposition_path):
+            for p in (
+                metrics_path,
+                global_metrics_path,
+                per_class_metrics_path,
+                run_manifest_path,
+                deployment_manifest_path,
+                scaler_path,
+                params_path,
+                config_path,
+                pr_curve_path,
+                histogram_path,
+                timeline_path,
+                manifest_path,
+                decomposition_path,
+            ):
                 if p.exists():
                     mlflow.log_artifact(str(p))
             if stage_results:
@@ -1697,7 +1726,6 @@ def run_maat(config: dict | None = None) -> None:
                 "feature_profile": str(args.profile),
                 "feature_run_dir": str(resolved_run_dir),
                 "hpo_enabled": run_hpo,
-                "score_mode": score_mode,
                 "hpo_stage_budgets": hpo_cfg.get("trial_budget", {}),
                 "best_params": best_params,
                 "n_features": n_features,

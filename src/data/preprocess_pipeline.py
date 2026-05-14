@@ -56,6 +56,12 @@ def get_feature_cols(config: dict, dataset: str) -> list[str]:
     return list(DEFAULT_BASE_FEATURE_COLUMNS)
 
 
+def get_label_col(config: dict, dataset: str) -> str:
+    """Resolve dataset-aware label column name."""
+    dataset_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
+    return str(dataset_cfg.get("label_col", "label"))
+
+
 def _restore_costa_power_channels(df: pd.DataFrame, dataset: str) -> pd.DataFrame:
     """Restore Costa power-channel invariants from cleaned primary sensors."""
     if dataset != "costa":
@@ -254,7 +260,7 @@ def preprocess_split(
     dataset: str,
     feature_cols: list[str],
     preprocess_config: dict,
-    label_col: str = "Fault",
+    label_col: str = "label",
     split_path: str = "path_a",
 ) -> dict:
     """
@@ -308,14 +314,18 @@ def preprocess_split(
             logger.warning("  No segment_id column, creating single segment")
             df["segment_id"] = 0
 
-        # Check for label column
-        if label_col not in df.columns:
-            # Try 'label' as fallback
-            if "label" in df.columns:
-                df[label_col] = df["label"]
-            else:
-                logger.error(f"  No label column '{label_col}' found!")
-                continue
+        # Resolve label column for this subset without fabricating schema
+        if label_col in df.columns:
+            active_label_col = label_col
+        elif "label" in df.columns:
+            logger.warning(
+                "  Requested label column '{}' missing, using fallback 'label'",
+                label_col,
+            )
+            active_label_col = "label"
+        else:
+            logger.error(f"  No label column '{label_col}' or fallback 'label' found!")
+            continue
 
         total_input_rows += len(df)
 
@@ -326,7 +336,7 @@ def preprocess_split(
             config=preprocess_config,
             timestamp_col="timestamp",
             segment_col="segment_id",
-            label_col=label_col,
+            label_col=active_label_col,
             outlier_reference_bounds=train_bounds if subset != "train" else None,
         )
 
@@ -340,7 +350,7 @@ def preprocess_split(
             subset=subset,
             split_name=split_name,
             feature_cols=available_features,
-            label_col=label_col,
+            label_col=active_label_col,
         )
 
         # Save
@@ -425,7 +435,7 @@ def main() -> None:
 
     preprocess_config = resolve_effective_preprocess_config(config, args.dataset, args.split_path)
     feature_cols = get_feature_cols(config, args.dataset)
-    label_col = "Fault"
+    label_col = get_label_col(config, args.dataset)
 
     logger.info(f"Feature columns: {feature_cols}")
     logger.info(f"Label column: {label_col}")

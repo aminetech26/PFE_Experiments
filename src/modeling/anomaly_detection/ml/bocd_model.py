@@ -35,6 +35,12 @@ from src.modeling.anomaly_detection.ml.one_class_svm_model import (
     _save_score_histogram,
     _save_score_timeline,
 )
+from src.modeling.common.artifact_contract import (
+    build_deployment_manifest,
+    build_run_manifest,
+    compute_anomaly_per_class_metrics,
+    write_json,
+)
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import run_optuna, suggest_params_from_space
 from src.utils.paths import get_experiments_root
@@ -392,6 +398,11 @@ def run_bocd(config: dict | None = None) -> None:
     metrics_path = artifacts_dir / "metrics.json"
     detector_path = artifacts_dir / "detector.joblib"
     scaler_path = artifacts_dir / "scaler.joblib"
+    global_metrics_path = artifacts_dir / "global_metrics.json"
+    per_class_metrics_path = artifacts_dir / "per_class_metrics.json"
+    run_manifest_path = artifacts_dir / "run_manifest.json"
+    deployment_manifest_path = artifacts_dir / "deployment_manifest.json"
+    features_manifest_path = artifacts_dir / "features_manifest.json"
     best_params_path = artifacts_dir / "best_params.json"
     pr_curve_path = artifacts_dir / "pr_curve.png"
     histogram_path = artifacts_dir / "score_histogram.png"
@@ -401,6 +412,42 @@ def run_bocd(config: dict | None = None) -> None:
     best_params_path.write_text(json.dumps(best_params, indent=2), encoding="utf-8")
     joblib.dump(final_detector, detector_path)
     joblib.dump(scaler, scaler_path)
+    per_class_metrics = compute_anomaly_per_class_metrics(
+        labels=y_test,
+        scores=test_scores,
+        threshold=threshold,
+    )
+    run_name = f"anomaly_bocd_{ts}"
+    run_manifest = build_run_manifest(
+        task=args.task,
+        model="bocd",
+        model_family="anomaly_ml",
+        dataset=args.dataset,
+        split_path=args.split_path,
+        feature_profile=str(args.profile),
+        feature_run_dir=str(resolved_run_dir),
+        seed=seed,
+        run_type=args.run_type,
+        extras={"run_name": run_name, "group_col": group_col},
+    )
+    deployment_manifest = build_deployment_manifest(
+        task=args.task,
+        model="bocd",
+        model_family="anomaly_ml",
+        model_artifact=detector_path.name,
+        scaler_artifact=scaler_path.name,
+        feature_names=features,
+        label_column=label_col,
+        threshold=threshold,
+        score_direction="higher_is_more_anomalous",
+        classes=[str(c) for c in sorted(np.unique(y_test).tolist())],
+        extras={"group_column": str(group_col)},
+    )
+    write_json(global_metrics_path, metrics)
+    write_json(per_class_metrics_path, per_class_metrics)
+    write_json(run_manifest_path, run_manifest)
+    write_json(deployment_manifest_path, deployment_manifest)
+    write_json(features_manifest_path, manifest)
     _save_pr_curve(val_scores, y_val_bin, test_scores, y_test_bin, pr_curve_path, model_name="BOCD")
     _save_score_histogram(train_scores, val_scores, y_val_bin, threshold, histogram_path, model_name="BOCD")
     _save_score_timeline(test_scores, y_test_bin, threshold, timeline_path, model_name="BOCD")
@@ -413,7 +460,6 @@ def run_bocd(config: dict | None = None) -> None:
 
     try:
         init_tracking("anomaly")
-        run_name = f"anomaly_bocd_{ts}"
         with mlflow.start_run(run_name=run_name):
             mlflow.set_tags(
                 {
@@ -441,8 +487,20 @@ def run_bocd(config: dict | None = None) -> None:
             )
             mlflow.log_metrics(metrics)
             mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
-            for p in (metrics_path, detector_path, scaler_path, best_params_path,
-                      pr_curve_path, histogram_path, timeline_path):
+            for p in (
+                metrics_path,
+                global_metrics_path,
+                per_class_metrics_path,
+                run_manifest_path,
+                deployment_manifest_path,
+                features_manifest_path,
+                detector_path,
+                scaler_path,
+                best_params_path,
+                pr_curve_path,
+                histogram_path,
+                timeline_path,
+            ):
                 if p.exists():
                     mlflow.log_artifact(str(p))
             mlflow.log_dict(manifest, "features_manifest.json")

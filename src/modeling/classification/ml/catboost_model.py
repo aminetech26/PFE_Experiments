@@ -29,6 +29,7 @@ from src.modeling.classification.ml.common import (
     resolve_runtime_seed,
     resolve_threading,
     save_classification_plots,
+    write_classification_contract_artifacts,
     write_json_artifact,
 )
 from src.modeling.common.feature_loader import load_features_for_task
@@ -371,6 +372,22 @@ def run_catboost(config: dict | None = None) -> None:
 
         write_json_artifact(metrics_path, metrics_payload)
         write_json_artifact(leakage_report_path, leakage_payload)
+        write_classification_contract_artifacts(
+            paths=artifact_paths,
+            args=args,
+            model_name="catboost",
+            feature_profile=effective_profile,
+            resolved_run_dir=resolved_run_dir,
+            seed=hpo_seed,
+            run_name=run_name,
+            features=features,
+            label_column=label_column,
+            classes=encoder.classes_,
+            summary_metrics=summary_metrics,
+            pr_auc_by_class=pr_auc_by_class,
+            classification_report_payload=report,
+            features_manifest_payload=manifest,
+        )
 
         model_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(

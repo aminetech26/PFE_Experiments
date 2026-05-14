@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 import yaml
@@ -287,6 +288,130 @@ def plot_vdc1_outlier_localization(report: dict, output_dir: Path, manifest: lis
     )
 
 
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    return numerator / denominator.replace(0, np.nan)
+
+
+def _robust_positive_z(series: pd.Series, baseline: pd.Series) -> pd.Series:
+    median = float(baseline.median())
+    mad = float((baseline - median).abs().median())
+    scale = 1.4826 * mad if mad > 0 else float(baseline.std(ddof=0))
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    return ((series - median) / scale).clip(lower=0)
+
+
+def _build_costa_targeted_frame(df: pd.DataFrame) -> pd.DataFrame | None:
+    required = {"label", "vdc1", "vdc2", "idc1", "idc2", "pdc1", "pdc2"}
+    if not required.issubset(df.columns):
+        missing = sorted(required - set(df.columns))
+        logger.warning("Skipping Costa targeted evidence plots: missing columns {}", missing)
+        return None
+
+    out = df[list(required)].copy()
+    total_voltage = out["vdc1"].abs() + out["vdc2"].abs()
+    total_current = out["idc1"].abs() + out["idc2"].abs()
+    total_power = out["pdc1"].abs() + out["pdc2"].abs()
+    out["voltage_imbalance"] = _safe_ratio((out["vdc1"] - out["vdc2"]).abs(), total_voltage)
+    out["current_imbalance"] = _safe_ratio((out["idc1"] - out["idc2"]).abs(), total_current)
+    out["power_imbalance"] = _safe_ratio((out["pdc1"] - out["pdc2"]).abs(), total_power)
+
+    normal = out[out["label"] == 0.0]
+    if normal.empty:
+        logger.warning("Skipping Costa targeted evidence plots: no normal rows found")
+        return None
+
+    normal_vdc2 = normal["vdc2"].dropna()
+    if normal_vdc2.empty:
+        logger.warning("Skipping Costa targeted evidence plots: normal vdc2 is empty")
+        return None
+
+    normal_vdc2_median = float(normal_vdc2.median())
+    normal_vdc2_mad = float((normal_vdc2 - normal_vdc2_median).abs().median())
+    vdc2_scale = 1.4826 * normal_vdc2_mad if normal_vdc2_mad > 0 else float(normal_vdc2.std(ddof=0))
+    if not np.isfinite(vdc2_scale) or vdc2_scale <= 0:
+        vdc2_scale = 1.0
+    out["voltage_drop_vdc2_z"] = ((normal_vdc2_median - out["vdc2"]) / vdc2_scale).clip(lower=0)
+
+    imbalance_cols = ["power_imbalance", "current_imbalance", "voltage_imbalance"]
+    for col in imbalance_cols:
+        out[f"{col}_z"] = _robust_positive_z(out[col], normal[col].dropna())
+    out["mismatch_imbalance_z"] = out[[f"{col}_z" for col in imbalance_cols]].max(axis=1)
+    return out
+
+
+def plot_costa_targeted_evidence(
+    df: pd.DataFrame, output_dir: Path, manifest: list[dict]
+) -> None:
+    evidence = _build_costa_targeted_frame(df)
+    if evidence is None:
+        return
+
+    sample = evidence.iloc[:: max(1, len(evidence) // 60000)].copy()
+    sample["label"] = sample["label"].map(lambda x: f"{x:g}")
+    melted = sample.melt(
+        id_vars="label",
+        value_vars=["voltage_drop_vdc2_z", "mismatch_imbalance_z"],
+        var_name="signal",
+        value_name="normal_robust_z",
+    )
+    melted["signal"] = melted["signal"].map(
+        {
+            "voltage_drop_vdc2_z": "Voltage drop (VDC2)",
+            "mismatch_imbalance_z": "String mismatch",
+        }
+    )
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    sns.boxplot(
+        data=melted,
+        x="label",
+        y="normal_robust_z",
+        hue="signal",
+        ax=ax,
+        showfliers=False,
+    )
+    ax.set_title("Costa Targeted Physics Signals by Fault Class")
+    ax.set_xlabel("Label (0=normal, 1=short-circuit, 2=degradation, 3=open-circuit, 4=shadowing)")
+    ax.set_ylabel("Positive robust z-score vs normal baseline")
+    save_figure(
+        fig,
+        output_dir / "costa_targeted_physics_signals.png",
+        manifest,
+        "Costa targeted physics signals",
+    )
+
+    summary_cols = [
+        "voltage_drop_vdc2_z",
+        "power_imbalance_z",
+        "current_imbalance_z",
+        "voltage_imbalance_z",
+        "mismatch_imbalance_z",
+    ]
+    heatmap_df = evidence.groupby("label", observed=True)[summary_cols].median().rename(
+        columns={
+            "voltage_drop_vdc2_z": "VDC2 drop",
+            "power_imbalance_z": "Power mismatch",
+            "current_imbalance_z": "Current mismatch",
+            "voltage_imbalance_z": "Voltage mismatch",
+            "mismatch_imbalance_z": "Max mismatch",
+        }
+    )
+    heatmap_df.index = [f"{idx:g}" for idx in heatmap_df.index]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.heatmap(heatmap_df, cmap="mako", annot=True, fmt=".2f", ax=ax)
+    ax.set_title("Costa Median Targeted Signal Strength by Class")
+    ax.set_xlabel("Signal")
+    ax.set_ylabel("Label")
+    save_figure(
+        fig,
+        output_dir / "costa_targeted_signal_heatmap.png",
+        manifest,
+        "Costa targeted signal heatmap",
+    )
+
+
 def write_manifest(
     output_dir: Path, dataset: str, figures: list[dict], source_artifacts: dict
 ) -> None:
@@ -336,6 +461,8 @@ def generate_visualizations(config: dict, dataset: str) -> int:
     plot_class_imbalance(report, figures_dir, figures)
     plot_regime_binned_correlation(findings, figures_dir, figures)
     plot_vdc1_outlier_localization(report, figures_dir, figures)
+    if dataset == "costa":
+        plot_costa_targeted_evidence(df_raw, figures_dir, figures)
 
     write_manifest(
         figures_dir,

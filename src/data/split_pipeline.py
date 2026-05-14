@@ -84,7 +84,7 @@ def load_and_segment_data(config: dict, dataset: str = "reunion") -> pd.DataFram
     Returns DataFrame with standardised columns: timestamp | label | segment_id | <sensors>
     """
     paths = config["paths"]
-    split_cfg = config["splits"]
+    split_cfg = effective_split_cfg(config, dataset)
 
     # Resolve dataset config from registry
     dataset_cfg = paths.get("datasets", {}).get(dataset)
@@ -175,6 +175,24 @@ def dataset_split_cfg(config: dict, dataset: str) -> dict:
     return config.get("paths", {}).get("datasets", {}).get(dataset, {}).get("splits", {})
 
 
+def _merge_dict(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def effective_split_cfg(config: dict, dataset: str) -> dict:
+    """Resolve split settings with dataset overrides on top of global defaults."""
+    global_cfg = dict(config.get("splits", {}))
+    ds_cfg = dict(dataset_split_cfg(config, dataset))
+    ds_cfg.pop("comparison_paths", None)
+    return _merge_dict(global_cfg, ds_cfg)
+
+
 def available_group_columns(df: pd.DataFrame) -> list[str]:
     return [
         c
@@ -226,7 +244,7 @@ def run_anomaly_semisup_split(
     logger.info("[1/3] Anomaly Detection — Semi-Supervised (Temporal Hybrid)")
     logger.info("Train: Normal-only (temporal) | Val/Test: Normal + faults (temporal)")
 
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
 
     artifacts = hybrid_semisup_split(
         df=df,
@@ -270,7 +288,7 @@ def run_anomaly_supervised_split(
     logger.info("[2/3] Anomaly Detection — Supervised (Temporal-Stratified)")
     logger.info("All sets: Temporal order preserved within each class")
 
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
 
     artifacts = segment_stratified_split(
         df=df,
@@ -308,7 +326,7 @@ def run_classification_split(
     logger.info("=" * 50)
     logger.info("[3/3] Fault Classification (Temporal-Stratified, Evaluable Classes)")
 
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
     dataset_split_cfg = (
         config.get("paths", {}).get("datasets", {}).get(dataset, {}).get("splits", {})
     )
@@ -392,7 +410,7 @@ def run_classification_split(
 
 def run_path_b_splits(df: pd.DataFrame, config: dict, output_base: Path, dataset: str) -> None:
     """Generate Costa Path B day-based chronological splits with day-level purge."""
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
     ds_split_cfg = dataset_split_cfg(config, dataset)
     path_b_cfg = ds_split_cfg.get("comparison_paths", {}).get("path_b", {})
     if dataset != "costa" or not path_b_cfg.get("enabled", False):
