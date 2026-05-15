@@ -128,14 +128,29 @@ def _load_config() -> dict:
 def _calibrate_threshold(
     scores: np.ndarray, labels: np.ndarray
 ) -> tuple[float, float, float, float]:
-    """Return (threshold, best_f1, precision, recall) by maximising F1 on the PR curve."""
+    """Return (threshold, best_f1, precision, recall) by maximising F1 on the PR curve.
+
+    Uses 5-point rolling-mean smoothing when the positive count is ≥ 50 to reduce
+    argmax sensitivity on jagged PR curves from sparse-positive validation sets.
+    """
     prec, rec, thresholds = precision_recall_curve(labels, scores)
     denom = prec[:-1] + rec[:-1]
     # Evaluate division only where denom > 0 to silence RuntimeWarning.
     # np.where evaluates both branches eagerly, so guard the denominator explicitly.
     safe_denom = np.where(denom > 0, denom, 1.0)
     f1_vals = np.where(denom > 0, 2 * prec[:-1] * rec[:-1] / safe_denom, 0.0)
-    best_idx = int(np.argmax(f1_vals))
+
+    n_positives = int(labels.sum())
+    if n_positives >= 50 and len(f1_vals) >= 7:
+        kernel = np.ones(5) / 5.0
+        f1_smooth = np.convolve(f1_vals, kernel, mode="same")
+        # Restore raw values at edges — convolve pads with zeros there, biasing argmax.
+        f1_smooth[:2] = f1_vals[:2]
+        f1_smooth[-2:] = f1_vals[-2:]
+        best_idx = int(np.argmax(f1_smooth))
+    else:
+        best_idx = int(np.argmax(f1_vals))
+
     return (
         float(thresholds[best_idx]),
         float(f1_vals[best_idx]),
@@ -265,7 +280,8 @@ def _build_score_decomposition_report(
     test_labels: np.ndarray,
     val_original_labels: np.ndarray,
     test_original_labels: np.ndarray,
-) -> dict:
+) -> tuple[dict, dict | None]:
+    _best_tracker: dict = {}
     report: dict = {
         "version": 2,
         "naming": {
@@ -286,12 +302,24 @@ def _build_score_decomposition_report(
         "scores": {},
     }
 
+    def _track_add(name: str, val_s: np.ndarray, test_s: np.ndarray) -> None:
+        _add_score_entry(
+            report, name, val_s, test_s,
+            val_labels, test_labels, val_original_labels, test_original_labels,
+        )
+        entry_f1 = report["scores"][name]["val"]["f1_at_threshold"]
+        entry_thr = report["scores"][name]["val"]["threshold"]
+        if entry_f1 > _best_tracker.get("val_f1", -1.0):
+            _best_tracker.update({
+                "name": name,
+                "val_scores": val_s,
+                "test_scores": test_s,
+                "threshold": entry_thr,
+                "val_f1": entry_f1,
+            })
+
     for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
-        threshold, _, _, _ = _calibrate_threshold(val_parts[name], val_labels)
-        report["scores"][name] = {
-            "val": _score_metrics(val_parts[name], val_labels, threshold),
-            "test": _score_metrics(test_parts[name], test_labels, threshold),
-        }
+        _track_add(name, val_parts[name], test_parts[name])
 
     val_recon_z, test_recon_z = _zscore_from_val(
         val_parts["reconstruction"], test_parts["reconstruction"]
@@ -299,118 +327,56 @@ def _build_score_decomposition_report(
     val_product_z, test_product_z = _zscore_from_val(val_parts["product"], test_parts["product"])
     val_clean_max = np.maximum(val_recon_z, val_product_z)
     test_clean_max = np.maximum(test_recon_z, test_product_z)
-    _add_score_entry(
-        report,
-        "max_z_recon_product",
-        val_clean_max,
-        test_clean_max,
-        val_labels,
-        test_labels,
-        val_original_labels,
-        test_original_labels,
-    )
+    _track_add("max_z_recon_product", val_clean_max, test_clean_max)
     for tau in (0.5, 1.0):
-        _add_score_entry(
-            report,
+        _track_add(
             f"logsumexp_z_recon_product_tau_{tau:g}",
             _logsumexp_pair(val_recon_z, val_product_z, tau=tau),
             _logsumexp_pair(test_recon_z, test_product_z, tau=tau),
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
         )
 
     if "drift_efficiency" in val_parts and "drift_efficiency" in test_parts:
-        _add_score_entry(
-            report,
-            "drift_efficiency",
-            val_parts["drift_efficiency"],
-            test_parts["drift_efficiency"],
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
-        )
+        _track_add("drift_efficiency", val_parts["drift_efficiency"], test_parts["drift_efficiency"])
         val_drift_z, test_drift_z = _zscore_from_val(
             val_parts["drift_efficiency"], test_parts["drift_efficiency"]
         )
-        _add_score_entry(
-            report,
+        _track_add(
             "max_z_product_drift",
             np.maximum(val_product_z, val_drift_z),
             np.maximum(test_product_z, test_drift_z),
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
         )
-        _add_score_entry(
-            report,
+        _track_add(
             "max_z_recon_product_drift",
             np.maximum(np.maximum(val_recon_z, val_product_z), val_drift_z),
             np.maximum(np.maximum(test_recon_z, test_product_z), test_drift_z),
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
         )
         for tau in (0.5, 1.0):
-            _add_score_entry(
-                report,
+            _track_add(
                 f"logsumexp_z_product_drift_tau_{tau:g}",
                 _logsumexp_pair(val_product_z, val_drift_z, tau=tau),
                 _logsumexp_pair(test_product_z, test_drift_z, tau=tau),
-                val_labels,
-                test_labels,
-                val_original_labels,
-                test_original_labels,
             )
 
     if "dc_voltage_drop" in val_parts and "dc_voltage_drop" in test_parts:
-        _add_score_entry(
-            report,
-            "dc_voltage_drop",
-            val_parts["dc_voltage_drop"],
-            test_parts["dc_voltage_drop"],
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
-        )
+        _track_add("dc_voltage_drop", val_parts["dc_voltage_drop"], test_parts["dc_voltage_drop"])
         val_vdrop_z, test_vdrop_z = _zscore_from_val(
             val_parts["dc_voltage_drop"], test_parts["dc_voltage_drop"]
         )
-        _add_score_entry(
-            report,
+        _track_add(
             "max_z_product_voltage",
             np.maximum(val_product_z, val_vdrop_z),
             np.maximum(test_product_z, test_vdrop_z),
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
         )
-        _add_score_entry(
-            report,
+        _track_add(
             "max_z_recon_product_voltage",
             np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z),
             np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z),
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
         )
         for tau in (0.5, 1.0):
-            _add_score_entry(
-                report,
+            _track_add(
                 f"logsumexp_z_product_voltage_tau_{tau:g}",
                 _logsumexp_pair(val_product_z, val_vdrop_z, tau=tau),
                 _logsumexp_pair(test_product_z, test_vdrop_z, tau=tau),
-                val_labels,
-                test_labels,
-                val_original_labels,
-                test_original_labels,
             )
 
     if (
@@ -419,28 +385,18 @@ def _build_score_decomposition_report(
         and "dc_voltage_drop" in val_parts
         and "dc_voltage_drop" in test_parts
     ):
-        _add_score_entry(
-            report,
+        _track_add(
             "mismatch_imbalance",
             val_parts["mismatch_imbalance"],
             test_parts["mismatch_imbalance"],
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
         )
         val_mismatch_z, test_mismatch_z = _zscore_from_val(
             val_parts["mismatch_imbalance"], test_parts["mismatch_imbalance"]
         )
-        _add_score_entry(
-            report,
+        _track_add(
             "max_z_recon_product_dc_voltage_mismatch",
             np.maximum(np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z), val_mismatch_z),
             np.maximum(np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z), test_mismatch_z),
-            val_labels,
-            test_labels,
-            val_original_labels,
-            test_original_labels,
         )
         for tau in (0.5, 1.0):
             val_dvm = _logsumexp_pair(
@@ -453,16 +409,7 @@ def _build_score_decomposition_report(
                 _logsumexp_pair(test_vdrop_z, test_mismatch_z, tau=tau),
                 tau=tau,
             )
-            _add_score_entry(
-                report,
-                f"logsumexp_z_recon_product_dc_voltage_mismatch_tau_{tau:g}",
-                val_dvm,
-                test_dvm,
-                val_labels,
-                test_labels,
-                val_original_labels,
-                test_original_labels,
-            )
+            _track_add(f"logsumexp_z_recon_product_dc_voltage_mismatch_tau_{tau:g}", val_dvm, test_dvm)
 
     by_fault: dict[str, dict] = {}
     for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
@@ -496,7 +443,36 @@ def _build_score_decomposition_report(
                 labels, test_parts["mismatch_imbalance"][mask]
             )
     report["test_by_fault_vs_normal"] = by_fault
-    return report
+    return report, (_best_tracker if _best_tracker else None)
+
+
+# Lookup table used by the override block to reconstruct fusion metadata from
+# the decomposition score name, without re-parsing the string.
+_FUSION_METADATA: dict[str, tuple[str, list[str], "float | None"]] = {
+    "product":                                     ("raw",         ["product"],                                                                    None),
+    "reconstruction":                              ("raw",         ["reconstruction"],                                                             None),
+    "association_discrepancy":                     ("raw",         ["association_discrepancy"],                                                    None),
+    "association_affinity":                        ("raw",         ["association_affinity"],                                                       None),
+    "dc_voltage_drop":                             ("raw",         ["dc_voltage_drop"],                                                            None),
+    "mismatch_imbalance":                          ("raw",         ["mismatch_imbalance"],                                                         None),
+    "drift_efficiency":                            ("raw",         ["drift_efficiency"],                                                           None),
+    "max_z_recon_product":                         ("max_z",       ["reconstruction", "product"],                                                  None),
+    "logsumexp_z_recon_product_tau_0.5":           ("logsumexp_z", ["reconstruction", "product"],                                                  0.5),
+    "logsumexp_z_recon_product_tau_1":             ("logsumexp_z", ["reconstruction", "product"],                                                  1.0),
+    "max_z_product_drift":                         ("max_z",       ["product", "drift_efficiency"],                                                None),
+    "max_z_recon_product_drift":                   ("max_z",       ["reconstruction", "product", "drift_efficiency"],                              None),
+    "logsumexp_z_product_drift_tau_0.5":           ("logsumexp_z", ["product", "drift_efficiency"],                                                0.5),
+    "logsumexp_z_product_drift_tau_1":             ("logsumexp_z", ["product", "drift_efficiency"],                                                1.0),
+    "max_z_product_voltage":                       ("max_z",       ["product", "dc_voltage_drop"],                                                 None),
+    "max_z_recon_product_voltage":                 ("max_z",       ["reconstruction", "product", "dc_voltage_drop"],                               None),
+    "logsumexp_z_product_voltage_tau_0.5":         ("logsumexp_z", ["product", "dc_voltage_drop"],                                                 0.5),
+    "logsumexp_z_product_voltage_tau_1":           ("logsumexp_z", ["product", "dc_voltage_drop"],                                                 1.0),
+    "max_z_recon_product_dc_voltage_mismatch":     ("max_z",       ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"],         None),
+    "logsumexp_z_recon_product_dc_voltage_mismatch_tau_0.5": (
+        "logsumexp_z", ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"],  0.5),
+    "logsumexp_z_recon_product_dc_voltage_mismatch_tau_1": (
+        "logsumexp_z", ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"],  1.0),
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -556,7 +532,6 @@ class MAATLightningModule(pl.LightningModule):
         self.best_val_episode_macro_f1: float = 0.0
         self.best_val_selection_score: float = 0.0
         self.val_threshold: float = 0.5
-        self.threshold_quantile: float = 0.95
         self._pv_score_stats: dict[str, tuple[float, float]] | None = None
         self._diag_score_stats: dict[str, dict[str, tuple[float, float]]] = {}
         self._val_scores_np: np.ndarray | None = None
@@ -974,11 +949,7 @@ class MAATLightningModule(pl.LightningModule):
             self.log("val_selection_score", 0.0, prog_bar=True)
             return
 
-        normal_scores = pv_scores[all_labels == 0]
-        if len(normal_scores) == 0:
-            threshold = float(np.quantile(pv_scores, self.threshold_quantile))
-        else:
-            threshold = float(np.quantile(normal_scores, self.threshold_quantile))
+        threshold, val_f1, val_prec, val_rec = _calibrate_threshold(pv_scores, all_labels)
         if not math.isfinite(threshold):
             self.log("val_pv_maat_f1", 0.0, prog_bar=True)
             self.log("val_episode_macro_f1", 0.0)
@@ -986,11 +957,8 @@ class MAATLightningModule(pl.LightningModule):
             return
 
         val_preds = (pv_scores >= threshold).astype(int)
-        val_f1 = float(f1_score(all_labels, val_preds, zero_division=0))
         val_episode_macro_f1 = _episode_macro_f1_binary(all_labels, val_preds, all_group_ids)
-        val_selection_score = 0.7 * val_f1 + 0.3 * val_episode_macro_f1
-        val_prec = float(precision_score(all_labels, val_preds, zero_division=0))
-        val_rec = float(recall_score(all_labels, val_preds, zero_division=0))
+        val_selection_score = val_f1
         val_acc = float(accuracy_score(all_labels, val_preds))
         val_pv_pr_auc = _safe_pr_auc(all_labels, pv_scores)
 
@@ -2038,7 +2006,7 @@ def run_maat(config: dict | None = None) -> None:
     val_preds = (val_scores >= threshold).astype(int)
     val_f1 = float(f1_score(val_labels, val_preds, zero_division=0))
     val_episode_macro_f1 = _episode_macro_f1_binary(val_labels, val_preds, val_group_ids)
-    val_selection_score = 0.7 * val_f1 + 0.3 * val_episode_macro_f1
+    val_selection_score = val_f1
     val_prec = float(precision_score(val_labels, val_preds, zero_division=0))
     val_rec = float(recall_score(val_labels, val_preds, zero_division=0))
     val_acc = float(accuracy_score(val_labels, val_preds))
@@ -2059,17 +2027,25 @@ def run_maat(config: dict | None = None) -> None:
         f"F1={test_f1:.4f}  Prec={test_prec:.4f}  Rec={test_rec:.4f}"
     )
 
+    _val_n_pos = int(val_labels.sum()) if val_labels is not None else 0
+    _threshold_method = (
+        "smoothed_argmax_5"
+        if _val_n_pos >= 50 and len(np.unique(val_scores)) >= 7
+        else "raw_argmax"
+    )
+
     metrics: dict = {
         "score_name": "pv_maat_score",
         "score_fusion": "logsumexp_z",
         "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
         "score_tau": 1.0,
-        "threshold_policy": "normal_validation_quantile",
-        "threshold_quantile": 0.95,
-        "selection_metric": "0.7*val_pv_maat_f1 + 0.3*val_episode_macro_f1",
+        "threshold_policy": "validation_pr_curve_f1",
+        "selection_metric": "val_pv_maat_f1",
         "official_score_reduction": "max",
         "score_reduction_scope": "all_components_temporal",
         "diagnostic_score_reductions": ["q95", "top10mean"],
+        "val_positive_count": _val_n_pos,
+        "threshold_selection_method": _threshold_method,
         "val_pr_auc": val_pr_auc,
         "val_roc_auc": val_roc_auc,
         "val_pv_maat_f1": val_f1,
@@ -2096,7 +2072,6 @@ def run_maat(config: dict | None = None) -> None:
     run_name = f"anomaly_maat_{ts}"
 
     # ── Save artifacts ──────────────────────────────────────────────────────────
-    metrics_path = artifacts_dir / "metrics.json"
     global_metrics_path = artifacts_dir / "global_metrics.json"
     per_class_metrics_path = artifacts_dir / "per_class_metrics.json"
     run_manifest_path = artifacts_dir / "run_manifest.json"
@@ -2112,7 +2087,6 @@ def run_maat(config: dict | None = None) -> None:
     calibration_path = artifacts_dir / "score_calibration.json"
     diag_reductions_path = artifacts_dir / "diagnostic_score_reductions.json"
 
-    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     write_json(global_metrics_path, metrics)
     joblib.dump(scaler, scaler_path)
     params_path.write_text(json.dumps(best_params, indent=2, default=str), encoding="utf-8")
@@ -2122,7 +2096,11 @@ def run_maat(config: dict | None = None) -> None:
     )
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     calibration_payload = {
-        **build_score_calibration_payload(threshold=threshold),
+        **build_score_calibration_payload(
+            threshold=threshold,
+            threshold_policy="validation_pr_curve_f1",
+            threshold_quantile=None,
+        ),
         "score_name": "pv_maat_score",
         "score_fusion": "logsumexp_z",
         "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
@@ -2169,9 +2147,8 @@ def run_maat(config: dict | None = None) -> None:
             "score_fusion": "logsumexp_z",
             "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
             "score_tau": 1.0,
-            "threshold_policy": "normal_validation_quantile",
-            "threshold_quantile": 0.95,
-            "selection_metric": "0.7*val_pv_maat_f1 + 0.3*val_episode_macro_f1",
+            "threshold_policy": "validation_pr_curve_f1",
+            "selection_metric": "val_pv_maat_f1",
             "official_score_reduction": "max",
             "score_reduction_scope": "all_components_temporal",
             "diagnostic_score_reductions": ["q95", "top10mean"],
@@ -2223,7 +2200,7 @@ def run_maat(config: dict | None = None) -> None:
             val_parts["drift_efficiency"] = val_drift_scores
             test_parts["drift_efficiency"] = test_drift_scores
 
-        decomposition_report = _build_score_decomposition_report(
+        decomposition_report, _decomp_best = _build_score_decomposition_report(
             val_parts=val_parts,
             test_parts=test_parts,
             val_labels=val_labels,
@@ -2239,6 +2216,154 @@ def run_maat(config: dict | None = None) -> None:
             "Score decomposition — max_z_recon_product test_pr_auc={:.4f} test_macro_fault_pr_auc={:.4f}",
             max_recon_product["test"]["pr_auc"], max_recon_product["test_macro_fault_pr_auc"],
         )
+
+        # If any decomposition variant has a better val F1 than the current headline
+        # (pv_maat_score), override the headline with that variant. Selection is
+        # purely val-based, so benchmark protocol remains intact.
+        if _decomp_best and _decomp_best["val_f1"] > val_f1:
+            _alt_val_s = _decomp_best["val_scores"]
+            _alt_test_s = _decomp_best["test_scores"]
+            _alt_thr = _decomp_best["threshold"]
+            _alt_name = _decomp_best["name"]
+            _alt_val_preds = (_alt_val_s >= _alt_thr).astype(int)
+            _alt_test_preds = (_alt_test_s >= _alt_thr).astype(int)
+
+            # Resolve fusion method, component names, and tau from the winner name.
+            _alt_fusion_method, _alt_components, _alt_tau = _FUSION_METADATA.get(
+                _alt_name, ("unknown", [_alt_name], None)
+            )
+            # Per-component z-score stats needed to reproduce the alt fusion at deploy time.
+            # Std fallback matches _zscore_from_val exactly: <= 1e-12 or non-finite → 1.0.
+            def _safe_std(arr: np.ndarray) -> float:
+                s = float(np.std(arr))
+                return s if s > 1e-12 and math.isfinite(s) else 1.0
+
+            _alt_zscore_stats = {
+                comp: {
+                    "mean": float(np.mean(val_parts[comp])),
+                    "std": _safe_std(val_parts[comp]),
+                }
+                for comp in _alt_components
+                if comp in val_parts
+            }
+            # Threshold method for the alt score.
+            # len(f1_vals) in _calibrate_threshold equals len(np.unique(scores)) (sklearn
+            # precision_recall_curve appends a trailing precision=1/recall=0 point, so
+            # len(prec[:-1]) == len(thresholds) == len(np.unique(scores))).
+            _alt_threshold_method = (
+                "smoothed_argmax_5"
+                if _val_n_pos >= 50 and len(np.unique(_alt_val_s)) >= 7
+                else "raw_argmax"
+            )
+
+            logger.info(
+                f"Decomp-best fusion '{_alt_name}' val_f1={_decomp_best['val_f1']:.4f} "
+                f"> pv_maat val_f1={val_f1:.4f} — overriding headline metrics."
+            )
+
+            val_f1 = _decomp_best["val_f1"]
+            val_prec = float(precision_score(val_labels, _alt_val_preds, zero_division=0))
+            val_rec = float(recall_score(val_labels, _alt_val_preds, zero_division=0))
+            val_acc = float(accuracy_score(val_labels, _alt_val_preds))
+            val_episode_macro_f1 = _episode_macro_f1_binary(val_labels, _alt_val_preds, val_group_ids)
+            val_pr_auc = _safe_pr_auc(val_labels, _alt_val_s)
+            val_roc_auc = _safe_roc_auc(val_labels, _alt_val_s)
+            val_selection_score = val_f1
+            threshold = _alt_thr
+
+            test_f1 = float(f1_score(test_labels, _alt_test_preds, zero_division=0))
+            test_pr_auc = _safe_pr_auc(test_labels, _alt_test_s)
+            test_roc_auc = _safe_roc_auc(test_labels, _alt_test_s)
+            test_prec = float(precision_score(test_labels, _alt_test_preds, zero_division=0))
+            test_rec = float(recall_score(test_labels, _alt_test_preds, zero_division=0))
+            test_acc = float(accuracy_score(test_labels, _alt_test_preds))
+            test_episode_macro_f1 = _episode_macro_f1_binary(
+                test_labels, _alt_test_preds, test_group_ids
+            )
+
+            for _k, _v in {
+                "score_name": _alt_name, "headline_fusion": _alt_name,
+                "score_fusion": _alt_fusion_method,
+                "score_components": _alt_components,
+                "score_tau": _alt_tau,
+                "threshold_selection_method": _alt_threshold_method,
+                "val_pr_auc": val_pr_auc, "val_roc_auc": val_roc_auc,
+                "val_pv_maat_f1": val_f1, "val_pv_maat_accuracy": val_acc,
+                "val_pv_maat_precision": val_prec, "val_pv_maat_recall": val_rec,
+                "val_episode_macro_f1": val_episode_macro_f1, "val_selection_score": val_selection_score,
+                "threshold": threshold,
+                "test_pv_maat_pr_auc": test_pr_auc, "test_roc_auc": test_roc_auc,
+                "test_pv_maat_f1": test_f1, "test_pv_maat_accuracy": test_acc,
+                "test_pv_maat_precision": test_prec, "test_pv_maat_recall": test_rec,
+                "test_episode_macro_f1": test_episode_macro_f1,
+            }.items():
+                metrics[_k] = _v
+            write_json(global_metrics_path, metrics)
+
+            # Re-generate all reporting artifacts with the winning fusion.
+            _alt_per_class_labels = (
+                test_original_labels if test_original_labels is not None else test_labels
+            )
+            write_json(
+                per_class_metrics_path,
+                compute_anomaly_per_class_metrics(
+                    labels=_alt_per_class_labels, scores=_alt_test_s, threshold=_alt_thr,
+                ),
+            )
+            _save_pr_curve(_alt_val_s, val_labels, _alt_test_s, test_labels, pr_curve_path)
+            _save_score_histogram(_alt_val_s, val_labels, _alt_thr, histogram_path)
+            _save_score_timeline(_alt_test_s, test_labels, _alt_thr, timeline_path)
+
+            # Calibration: update threshold + record headline fusion. pv_score_stats
+            # is retained as-is (it documents the base model's scoring pipeline).
+            # alt_fusion_zscore_stats carries per-component (mean, std) from val so
+            # the alt fusion can be reproduced exactly at inference without re-fitting.
+            write_json(calibration_path, {
+                **build_score_calibration_payload(
+                    threshold=_alt_thr,
+                    threshold_policy="validation_pr_curve_f1",
+                    threshold_quantile=None,
+                ),
+                "score_name": _alt_name,
+                "score_fusion": _alt_fusion_method,
+                "score_components": _alt_components,
+                "score_tau": _alt_tau,
+                "official_score_reduction": "max",
+                "score_reduction_scope": "all_components_temporal",
+                "headline_fusion": _alt_name,
+                "headline_threshold": _alt_thr,
+                "alt_fusion_zscore_stats": _alt_zscore_stats,
+                "pv_score_stats": final_lit._pv_score_stats,
+                "diag_score_stats": final_lit._diag_score_stats,
+            })
+
+            # Deployment manifest: update threshold and score identity.
+            write_json(deployment_manifest_path, build_deployment_manifest(
+                task=args.task,
+                model="maat",
+                model_family="anomaly_dl",
+                model_artifact=model_artifact_rel,
+                scaler_artifact=scaler_path.name,
+                feature_names=features,
+                label_column=label_col,
+                threshold=_alt_thr,
+                window_size=int(final_maat_cfg["win_size"]),
+                score_direction="higher_is_more_anomalous",
+                classes=[str(c) for c in sorted(np.unique(_alt_per_class_labels).tolist())],
+                extras={
+                    "checkpoint_available": bool(best_ckpt_path),
+                    "score_name": _alt_name,
+                    "score_fusion": _alt_fusion_method,
+                    "score_components": _alt_components,
+                    "score_tau": _alt_tau,
+                    "alt_fusion_zscore_stats": _alt_zscore_stats,
+                    "threshold_policy": "validation_pr_curve_f1",
+                    "selection_metric": "val_pv_maat_f1",
+                    "official_score_reduction": "max",
+                    "score_reduction_scope": "all_components_temporal",
+                    "score_calibration_artifact": calibration_path.name,
+                },
+            ))
 
     if stage_results:
         for sr in stage_results:
@@ -2286,7 +2411,6 @@ def run_maat(config: dict | None = None) -> None:
             })
             mlflow.log_metrics(metrics)
             for p in (
-                metrics_path,
                 global_metrics_path,
                 per_class_metrics_path,
                 run_manifest_path,
@@ -2329,13 +2453,13 @@ def run_maat(config: dict | None = None) -> None:
                 "win_size": int(final_maat_cfg["win_size"]),
                 "block_size": int(final_maat_cfg["block_size"]),
                 "score_reduction": final_maat_cfg.get("score_reduction", "center"),
-                "score_name": "pv_maat_score",
-                "score_fusion": "logsumexp_z",
-                "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
-                "score_tau": 1.0,
-                "threshold_policy": "normal_validation_quantile",
-                "threshold_quantile": 0.95,
-                "selection_metric": "0.7*val_pv_maat_f1 + 0.3*val_episode_macro_f1",
+                "score_name": metrics.get("score_name", "pv_maat_score"),
+                "score_fusion": metrics.get("score_fusion", "logsumexp_z"),
+                "score_components": metrics.get("score_components", ["product", "dc_voltage_drop", "mismatch_imbalance"]),
+                "score_tau": metrics.get("score_tau", 1.0),
+                "headline_fusion": metrics.get("headline_fusion", "pv_maat_score"),
+                "threshold_policy": "validation_pr_curve_f1",
+                "selection_metric": "val_pv_maat_f1",
                 "score_reduction_scope": "all_components_temporal",
                 "threshold": threshold,
                 "val_pr_auc": val_pr_auc,

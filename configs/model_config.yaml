@@ -92,11 +92,11 @@ anomaly_detection:
         stage1_training: 40
         stage2_architecture: 30
         stage3_joint: 12
-      max_epochs_fraction: 0.30
+      max_epochs_fraction: 0.45
       min_hpo_epochs: 15
       patience_fraction: 0.40
-      min_hpo_patience: 6
-      pruning_warmup_epochs: 5
+      min_hpo_patience: 8
+      pruning_warmup_epochs: 7
     models:
       maat:
         win_size: 30
@@ -117,11 +117,11 @@ anomaly_detection:
           weight_decay:      {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
           dropout:           {type: float, low: 0.0, high: 0.25}
           k:                 {type: float, low: 2.0, high: 6.0}
-          temperature:       {type: categorical, choices: [10, 25, 50]}
+          temperature:       {type: categorical, choices: [10, 25, 50, 100]}
           batch_size:        {type: categorical, choices: [128, 256]}
           gradient_clip_val: {type: categorical, choices: [0.5, 1.0, 2.0]}
         hpo_stage2:
-          win_size:     {type: categorical, choices: [30, 60, 90]}
+          win_size:     {type: categorical, choices: [30, 60, 90, 120]}
           block_size:   {type: categorical, choices: [5, 10, 15, 30]}
           d_model:      {type: categorical, choices: [32, 64, 128]}
           n_heads:      {type: categorical, choices: [2, 4, 8]}
@@ -207,7 +207,7 @@ anomaly_detection:
             score_reduction:      {type: categorical, choices: [center, mean, max]}
 
   primary_metric: f1
-  threshold_calibration: normal_validation_quantile
+  threshold_calibration: validation_pr_curve_f1
 
 # ============================================================================
 # TASK B — Fault Classification

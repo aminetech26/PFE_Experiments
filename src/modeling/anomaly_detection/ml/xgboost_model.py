@@ -263,7 +263,6 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
         else get_experiments_root() / "anomaly" / "xgboost" / f"xgb_{ts}"
     )
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = Path(args.metrics_path) if args.metrics_path else artifacts_dir / "metrics.json"
     model_path = Path(args.model_path) if args.model_path else artifacts_dir / "model.joblib"
     global_metrics_path = artifacts_dir / "global_metrics.json"
     per_class_metrics_path = artifacts_dir / "per_class_metrics.json"
@@ -274,7 +273,6 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
 
-    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     joblib.dump(final_model, model_path)
     per_class_metrics = compute_anomaly_per_class_metrics(
         labels=y_test_raw,
@@ -401,7 +399,6 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
                 leakage_payload.get("sanity_check", {}).get("is_suspicious", False)
             ))
             for p in (
-                metrics_path,
                 global_metrics_path,
                 per_class_metrics_path,
                 run_manifest_path,

@@ -409,7 +409,6 @@ def run_bocd(config: dict | None = None) -> None:
         artifacts_dir = get_experiments_root() / "anomaly" / "bocd" / f"bocd_{ts}"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics_path = artifacts_dir / "metrics.json"
     detector_path = artifacts_dir / "detector.joblib"
     scaler_path = artifacts_dir / "scaler.joblib"
     global_metrics_path = artifacts_dir / "global_metrics.json"
@@ -422,7 +421,6 @@ def run_bocd(config: dict | None = None) -> None:
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
 
-    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     best_params_path.write_text(json.dumps(best_params, indent=2), encoding="utf-8")
     joblib.dump(final_detector, detector_path)
     joblib.dump(scaler, scaler_path)
@@ -521,7 +519,6 @@ def run_bocd(config: dict | None = None) -> None:
             )
             mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
             for p in (
-                metrics_path,
                 global_metrics_path,
                 per_class_metrics_path,
                 run_manifest_path,

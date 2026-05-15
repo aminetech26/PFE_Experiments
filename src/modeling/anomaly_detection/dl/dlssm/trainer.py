@@ -1149,7 +1149,6 @@ def run_dlssm(config: dict | None = None) -> None:
         "c_norm": float(lit.c.norm()) if bool(lit.c_initialized) else 0.0,
     }
 
-    metrics_path = artifacts_dir / "metrics.json"
     global_metrics_path = artifacts_dir / "global_metrics.json"
     per_class_metrics_path = artifacts_dir / "per_class_metrics.json"
     run_manifest_path = artifacts_dir / "run_manifest.json"
@@ -1163,7 +1162,6 @@ def run_dlssm(config: dict | None = None) -> None:
     timeline_path = artifacts_dir / "score_timeline.png"
     pred_residual_path = artifacts_dir / "prediction_residual_decomposition.png"
 
-    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     write_json(global_metrics_path, metrics)
     params_path.write_text(json.dumps(run_params, indent=2, default=str), encoding="utf-8")
     if hpo_params:
@@ -1243,7 +1241,6 @@ def run_dlssm(config: dict | None = None) -> None:
             })
             mlflow.log_metrics(metrics)
             for p in (
-                metrics_path,
                 global_metrics_path,
                 per_class_metrics_path,
                 run_manifest_path,

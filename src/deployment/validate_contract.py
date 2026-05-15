@@ -5,9 +5,7 @@ import json
 import math
 from pathlib import Path
 
-_TASK_A_ML_THRESHOLD_POLICY = "validation_pr_curve_f1"
-_TASK_A_DL_THRESHOLD_POLICY = "normal_validation_quantile"
-_TASK_A_DL_THRESHOLD_QUANTILE = 0.95
+_TASK_A_THRESHOLD_POLICY = "validation_pr_curve_f1"
 _TASK_A_SCORE_DIRECTION = "higher_is_more_anomalous"
 
 
@@ -36,12 +34,11 @@ def _validate_numeric_json(payload: object, *, key: str = "") -> bool:
 
 
 def _validate_task_a_operating_point(artifact_dir: Path, dm: dict) -> list[str]:
-    """Enforce the shared q95 operating-point contract for finalized Task A methods.
+    """Enforce the shared validation-F1 operating-point contract for finalized Task A methods.
 
     Checks:
     - score_calibration.json exists and is referenced in the deployment manifest
-    - threshold_policy == "normal_validation_quantile"
-    - threshold_quantile == 0.95
+    - threshold_policy == "validation_pr_curve_f1"
     - score_direction == "higher_is_more_anomalous"
     - test_not_used_for_calibration is true
     - deployment_manifest.threshold matches score_calibration.threshold (within 1e-9)
@@ -67,30 +64,13 @@ def _validate_task_a_operating_point(artifact_dir: Path, dm: dict) -> list[str]:
         errors.append(f"score_calibration.json unreadable: {exc}")
         return errors
 
-    model_family = str(dm.get("model_family", "")).lower()
-    is_anomaly_ml = model_family == "anomaly_ml"
-    expected_policy = _TASK_A_ML_THRESHOLD_POLICY if is_anomaly_ml else _TASK_A_DL_THRESHOLD_POLICY
+    expected_policy = _TASK_A_THRESHOLD_POLICY
 
     if cal.get("threshold_policy") != expected_policy:
         errors.append(
             f"score_calibration.threshold_policy must be '{expected_policy}', "
             f"got '{cal.get('threshold_policy')}'"
         )
-    if not is_anomaly_ml:
-        try:
-            cal_quantile = float(cal.get("threshold_quantile", 0))
-        except (TypeError, ValueError):
-            errors.append(
-                f"score_calibration.threshold_quantile is not numeric: {cal.get('threshold_quantile')!r}"
-            )
-            cal_quantile = None
-        if cal_quantile is not None and not math.isclose(
-            cal_quantile, _TASK_A_DL_THRESHOLD_QUANTILE, rel_tol=1e-9
-        ):
-            errors.append(
-                f"score_calibration.threshold_quantile must be {_TASK_A_DL_THRESHOLD_QUANTILE}, "
-                f"got {cal.get('threshold_quantile')}"
-            )
     if cal.get("score_direction") != _TASK_A_SCORE_DIRECTION:
         errors.append(
             f"score_calibration.score_direction must be '{_TASK_A_SCORE_DIRECTION}', "
@@ -129,22 +109,6 @@ def _validate_task_a_operating_point(artifact_dir: Path, dm: dict) -> list[str]:
             f"deployment_manifest.threshold_policy must be '{expected_policy}', "
             f"got '{dm.get('threshold_policy')}'"
         )
-    if not is_anomaly_ml:
-        try:
-            dm_quantile = float(dm.get("threshold_quantile", 0))
-        except (TypeError, ValueError):
-            errors.append(
-                f"deployment_manifest.threshold_quantile is not numeric: {dm.get('threshold_quantile')!r}"
-            )
-            dm_quantile = None
-        if dm_quantile is not None and not math.isclose(
-            dm_quantile, _TASK_A_DL_THRESHOLD_QUANTILE, rel_tol=1e-9
-        ):
-            errors.append(
-                f"deployment_manifest.threshold_quantile must be {_TASK_A_DL_THRESHOLD_QUANTILE}, "
-                f"got '{dm.get('threshold_quantile')}'"
-            )
-
     return errors
 
 
