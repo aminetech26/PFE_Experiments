@@ -42,6 +42,7 @@ from src.modeling.anomaly_detection.dl.maat.model import MambaAnomalyTransformer
 from src.modeling.common.artifact_contract import (
     build_deployment_manifest,
     build_run_manifest,
+    build_score_calibration_payload,
     compute_anomaly_per_class_metrics,
     write_json,
 )
@@ -50,6 +51,7 @@ from src.modeling.common.dl_training_utils import (
     _resolve_loader_runtime,
     _trainer_runtime_kwargs,
 )
+from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
     HPOStageConfig,
@@ -176,19 +178,10 @@ def _episode_macro_f1_binary(
     preds: np.ndarray,
     group_ids: np.ndarray | None,
 ) -> float:
+    result = episode_macro_f1_binary(labels, preds, group_ids)
     if group_ids is None or len(group_ids) != len(labels):
         logger.warning("episode_macro_f1 unavailable: missing or misaligned group_ids")
-        return 0.0
-    by_group: dict[str, dict[str, int]] = {}
-    for y, p, g in zip(labels.astype(int), preds.astype(int), group_ids.astype(str), strict=False):
-        row = by_group.setdefault(g, {"pos_true": 0, "pos_pred": 0})
-        row["pos_true"] += int(y == 1)
-        row["pos_pred"] += int(p == 1)
-    ep_true = np.array([1 if v["pos_true"] > 0 else 0 for v in by_group.values()], dtype=int)
-    ep_pred = np.array([1 if v["pos_pred"] > 0 else 0 for v in by_group.values()], dtype=int)
-    if len(ep_true) == 0:
-        return 0.0
-    return float(f1_score(ep_true, ep_pred, average="macro", zero_division=0))
+    return result
 
 
 def _zscore_from_val(val_scores: np.ndarray, test_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -2129,12 +2122,10 @@ def run_maat(config: dict | None = None) -> None:
     )
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     calibration_payload = {
+        **build_score_calibration_payload(threshold=threshold),
         "score_name": "pv_maat_score",
         "score_fusion": "logsumexp_z",
         "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
-        "threshold": threshold,
-        "threshold_policy": "normal_validation_quantile",
-        "threshold_quantile": 0.95,
         "official_score_reduction": "max",
         "score_reduction_scope": "all_components_temporal",
         "pv_score_stats": final_lit._pv_score_stats,

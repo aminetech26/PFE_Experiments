@@ -12,6 +12,46 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
+def q95_normal_val_threshold(
+    *,
+    val_scores: np.ndarray,
+    val_labels: np.ndarray,
+    normal_label: float | int = 0,
+    quantile: float = 0.95,
+) -> float:
+    """Return the `quantile`-th percentile of val scores on normal-labeled rows.
+
+    Standard operating-point rule for all finalized Task A models.
+    Raises ValueError if no normal rows exist in val (misconfigured split).
+    """
+    mask = np.asarray(val_labels) == normal_label
+    if not mask.any():
+        raise ValueError("No normal-labeled rows in validation — cannot compute q95 threshold")
+    normal_scores = np.asarray(val_scores, dtype=float)[mask]
+    finite_scores = normal_scores[np.isfinite(normal_scores)]
+    if len(finite_scores) == 0:
+        raise ValueError("All normal validation scores are non-finite — cannot compute q95 threshold")
+    return float(np.quantile(finite_scores, float(quantile)))
+
+
+def build_score_calibration_payload(
+    *,
+    threshold: float,
+    threshold_quantile: float = 0.95,
+    score_direction: str = "higher_is_more_anomalous",
+    score_stats: dict | None = None,
+) -> dict:
+    """Standard score_calibration.json contents for finalized Task A methods."""
+    return {
+        "score_direction": score_direction,
+        "threshold_policy": "normal_validation_quantile",
+        "threshold_quantile": float(threshold_quantile),
+        "threshold": float(threshold),
+        "test_not_used_for_calibration": True,
+        "score_stats": score_stats or {},
+    }
+
+
 def compute_anomaly_per_class_metrics(
     *,
     labels: np.ndarray,

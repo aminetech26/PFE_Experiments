@@ -10,7 +10,6 @@ import joblib
 import mlflow
 import numpy as np
 import optuna
-import pandas as pd
 import yaml
 from loguru import logger
 from sklearn.ensemble import IsolationForest
@@ -27,8 +26,8 @@ from sklearn.preprocessing import StandardScaler
 from src.evaluation.leakage_checks import performance_sanity_check
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.ml.one_class_svm_model import (
-    _calibrate_threshold,
     _default_comparison_records_path,
+    _pick_sampling_group_column,
     _prepare_xy,
     _save_pr_curve,
     _save_score_histogram,
@@ -38,9 +37,12 @@ from src.modeling.anomaly_detection.ml.one_class_svm_model import (
 from src.modeling.common.artifact_contract import (
     build_deployment_manifest,
     build_run_manifest,
+    build_score_calibration_payload,
     compute_anomaly_per_class_metrics,
+    q95_normal_val_threshold,
     write_json,
 )
+from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
     midpoint_params_from_space,
@@ -128,6 +130,10 @@ def run_isolation_forest(config: dict | None = None) -> None:
     y_val_bin = (y_val != 0).astype(int)
     y_test_bin = (y_test != 0).astype(int)
 
+    _ep_group_col = _pick_sampling_group_column(val_df, args.split_path)
+    val_group_ids = val_df[_ep_group_col].to_numpy() if _ep_group_col and _ep_group_col in val_df.columns else None
+    test_group_ids = test_df[_ep_group_col].to_numpy() if _ep_group_col and _ep_group_col in test_df.columns else None
+
     non_normal_in_train = int((y_train != 0).sum())
     if non_normal_in_train:
         logger.warning(
@@ -178,7 +184,11 @@ def run_isolation_forest(config: dict | None = None) -> None:
         model = IsolationForest(**fixed_params, **trial_params)
         model.fit(x_fit)
         scores = _anomaly_score(model, x_val_scaled)
-        return float(average_precision_score(y_val_bin, scores))
+        thr = q95_normal_val_threshold(val_scores=scores, val_labels=y_val_bin)
+        preds = (scores >= thr).astype(int)
+        f1 = float(f1_score(y_val_bin, preds, zero_division=0))
+        ep_f1 = episode_macro_f1_binary(y_val_bin, preds, val_group_ids)
+        return 0.7 * f1 + 0.3 * ep_f1
 
     if args.no_optuna or not search_space:
         best_params = midpoint_params_from_space(search_space) if search_space else {}
@@ -196,7 +206,7 @@ def run_isolation_forest(config: dict | None = None) -> None:
             pruner_name=str(hpo_cfg.get("pruner", "none")),
             study_name=f"{hpo_cfg.get('study_name_prefix', 'anomaly_ml')}_iforest",
         )
-        logger.info("Best params: {} | Best val PR-AUC: {:.4f}", best_params, study.best_value)
+        logger.info("Best params: {} | Best val objective (0.7*F1@q95+0.3*epF1): {:.4f}", best_params, study.best_value)
 
     logger.info("Fitting final model...")
     t0 = time.perf_counter()
@@ -208,7 +218,11 @@ def run_isolation_forest(config: dict | None = None) -> None:
     val_scores = _anomaly_score(final_model, x_val_scaled)
     test_scores = _anomaly_score(final_model, x_test_scaled)
 
-    threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, y_val_bin)
+    threshold = q95_normal_val_threshold(val_scores=val_scores, val_labels=y_val_bin)
+    val_preds_for_cal = (val_scores >= threshold).astype(int)
+    val_f1 = float(f1_score(y_val_bin, val_preds_for_cal, zero_division=0))
+    val_prec = float(precision_score(y_val_bin, val_preds_for_cal, zero_division=0))
+    val_rec = float(recall_score(y_val_bin, val_preds_for_cal, zero_division=0))
     logger.info(
         "Val — threshold={:.4f} F1={:.4f} Prec={:.4f} Rec={:.4f}",
         threshold,
@@ -230,6 +244,10 @@ def run_isolation_forest(config: dict | None = None) -> None:
     test_prec_val = float(precision_score(y_test_bin, test_preds, zero_division=0))
     test_rec_val = float(recall_score(y_test_bin, test_preds, zero_division=0))
 
+    val_episode_macro_f1 = episode_macro_f1_binary(y_val_bin, val_preds, val_group_ids)
+    test_episode_macro_f1 = episode_macro_f1_binary(y_test_bin, test_preds, test_group_ids)
+    val_selection_score = 0.7 * val_f1 + 0.3 * val_episode_macro_f1
+
     metrics: dict = {
         "val_pr_auc": val_pr_auc,
         "val_roc_auc": val_roc_auc,
@@ -237,13 +255,18 @@ def run_isolation_forest(config: dict | None = None) -> None:
         "val_accuracy_at_threshold": val_acc,
         "val_precision_at_threshold": val_prec,
         "val_recall_at_threshold": val_rec,
+        "val_episode_macro_f1": val_episode_macro_f1,
+        "val_selection_score": val_selection_score,
         "threshold": threshold,
+        "threshold_policy": "normal_validation_quantile",
+        "threshold_quantile": 0.95,
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "test_f1_at_threshold": test_f1,
         "test_accuracy_at_threshold": test_acc,
         "test_precision_at_threshold": test_prec_val,
         "test_recall_at_threshold": test_rec_val,
+        "test_episode_macro_f1": test_episode_macro_f1,
         "n_train_total": int(len(x_train)),
         "n_train_used_for_fit": int(len(x_fit)),
         "sampling_groups": int(sampling_meta.get("n_groups", 0)),
@@ -290,6 +313,7 @@ def run_isolation_forest(config: dict | None = None) -> None:
         run_type=args.run_type,
         extras={"run_name": run_name},
     )
+    score_calibration_path = artifacts_dir / "score_calibration.json"
     deployment_manifest = build_deployment_manifest(
         task=args.task,
         model="isolation_forest",
@@ -301,7 +325,13 @@ def run_isolation_forest(config: dict | None = None) -> None:
         threshold=threshold,
         score_direction="higher_is_more_anomalous",
         classes=[str(c) for c in sorted(np.unique(y_test).tolist())],
+        extras={
+            "threshold_policy": "normal_validation_quantile",
+            "threshold_quantile": 0.95,
+            "score_calibration_artifact": score_calibration_path.name,
+        },
     )
+    write_json(score_calibration_path, build_score_calibration_payload(threshold=threshold))
     write_json(global_metrics_path, metrics)
     write_json(per_class_metrics_path, per_class_metrics)
     write_json(run_manifest_path, run_manifest)

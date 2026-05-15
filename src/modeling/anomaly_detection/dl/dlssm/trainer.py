@@ -105,7 +105,11 @@ def _load_config() -> dict:
 def _calibrate_threshold(
     scores: np.ndarray, labels: np.ndarray
 ) -> tuple[float, float, float, float]:
-    """Return (threshold, best_f1, precision, recall) by maximising F1 on PR curve."""
+    """Return (threshold, best_f1, precision, recall) by maximising F1 on PR curve.
+
+    NOTE: DLSSM intentionally uses PR-curve F1 threshold pending methodology alignment.
+    Once aligned, switch to q95_normal_val_threshold from artifact_contract (Phase 9 contract).
+    """
     prec, rec, thresholds = precision_recall_curve(labels, scores)
     denom = prec[:-1] + rec[:-1]
     safe_denom = np.where(denom > 0, denom, 1.0)
