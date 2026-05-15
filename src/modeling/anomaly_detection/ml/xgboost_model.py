@@ -25,6 +25,7 @@ from xgboost import XGBClassifier
 from src.evaluation.leakage_checks import run_leakage_report
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.ml.one_class_svm_model import (
+    _calibrate_threshold,
     _default_comparison_records_path,
     _pick_sampling_group_column,
     _prepare_xy,
@@ -37,7 +38,6 @@ from src.modeling.common.artifact_contract import (
     build_run_manifest,
     build_score_calibration_payload,
     compute_anomaly_per_class_metrics,
-    q95_normal_val_threshold,
     write_json,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
@@ -178,7 +178,7 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
         )
         model.fit(x_fit, y_fit, eval_set=[(x_val, y_val)], verbose=False)
         scores = model.predict_proba(x_val)[:, 1]
-        thr = q95_normal_val_threshold(val_scores=scores, val_labels=y_val)
+        thr, f1, _, _ = _calibrate_threshold(scores, y_val)
         preds = (scores >= thr).astype(int)
         f1 = float(f1_score(y_val, preds, zero_division=0))
         ep_f1 = episode_macro_f1_binary(y_val, preds, val_group_ids)
@@ -213,11 +213,7 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
     val_scores = final_model.predict_proba(x_val)[:, 1]
     test_scores = final_model.predict_proba(x_test)[:, 1]
 
-    threshold = q95_normal_val_threshold(val_scores=val_scores, val_labels=y_val)
-    val_preds_for_cal = (val_scores >= threshold).astype(int)
-    val_f1 = float(f1_score(y_val, val_preds_for_cal, zero_division=0))
-    val_prec = float(precision_score(y_val, val_preds_for_cal, zero_division=0))
-    val_rec = float(recall_score(y_val, val_preds_for_cal, zero_division=0))
+    threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, y_val)
     val_pr_auc = float(average_precision_score(y_val, val_scores))
     val_roc_auc = float(roc_auc_score(y_val, val_scores))
     test_pr_auc = float(average_precision_score(y_test, test_scores))
@@ -244,8 +240,7 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
         "val_episode_macro_f1": val_episode_macro_f1,
         "val_selection_score": val_selection_score,
         "threshold": threshold,
-        "threshold_policy": "normal_validation_quantile",
-        "threshold_quantile": 0.95,
+        "threshold_policy": "validation_pr_curve_f1",
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "test_f1_at_threshold": test_f1,
@@ -313,12 +308,18 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
         score_direction="higher_is_more_anomalous",
         classes=[str(c) for c in sorted(np.unique(y_test_raw).tolist())],
         extras={
-            "threshold_policy": "normal_validation_quantile",
-            "threshold_quantile": 0.95,
+            "threshold_policy": "validation_pr_curve_f1",
             "score_calibration_artifact": score_calibration_path.name,
         },
     )
-    write_json(score_calibration_path, build_score_calibration_payload(threshold=threshold))
+    write_json(
+        score_calibration_path,
+        build_score_calibration_payload(
+            threshold=threshold,
+            threshold_policy="validation_pr_curve_f1",
+            threshold_quantile=None,
+        ),
+    )
     write_json(global_metrics_path, metrics)
     write_json(per_class_metrics_path, per_class_metrics)
     write_json(run_manifest_path, run_manifest)
@@ -388,7 +389,13 @@ def run_xgboost_anomaly(config: dict | None = None) -> None:
                     "scale_pos_weight_multiplier": best_spw_mul,
                 }
             )
-            mlflow.log_metrics(metrics)
+            mlflow.log_metrics(
+                {
+                    k: float(v)
+                    for k, v in metrics.items()
+                    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                }
+            )
             mlflow.log_metric(
                 "leakage_flag_count", float(len(leakage_payload.get("leakage_flags", [])))
             )

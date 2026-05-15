@@ -28,6 +28,7 @@ from sklearn.preprocessing import StandardScaler
 from src.evaluation.leakage_checks import performance_sanity_check
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.ml.one_class_svm_model import (
+    _calibrate_threshold,
     _default_comparison_records_path,
     _prepare_xy,
     _save_pr_curve,
@@ -39,7 +40,6 @@ from src.modeling.common.artifact_contract import (
     build_run_manifest,
     build_score_calibration_payload,
     compute_anomaly_per_class_metrics,
-    q95_normal_val_threshold,
     write_json,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
@@ -308,7 +308,7 @@ def run_bocd(config: dict | None = None) -> None:
         val_df_scaled = val_df.copy()
         val_df_scaled[features] = scaler.transform(x_val)
         scores = det.score(val_df_scaled, features, label_col, group_col)
-        thr = q95_normal_val_threshold(val_scores=scores, val_labels=y_val_bin)
+        thr, f1, _, _ = _calibrate_threshold(scores, y_val_bin)
         preds = (scores >= thr).astype(int)
         f1 = float(f1_score(y_val_bin, preds, zero_division=0))
         ep_f1 = episode_macro_f1_binary(y_val_bin, preds, val_group_ids)
@@ -358,11 +358,7 @@ def run_bocd(config: dict | None = None) -> None:
     test_scores = final_detector.score(test_df_scaled, features, label_col, group_col)
     score_time = time.perf_counter() - t1
 
-    threshold = q95_normal_val_threshold(val_scores=val_scores, val_labels=y_val_bin)
-    val_preds_for_cal = (val_scores >= threshold).astype(int)
-    val_f1 = float(f1_score(y_val_bin, val_preds_for_cal, zero_division=0))
-    val_prec = float(precision_score(y_val_bin, val_preds_for_cal, zero_division=0))
-    val_rec = float(recall_score(y_val_bin, val_preds_for_cal, zero_division=0))
+    threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, y_val_bin)
     logger.info(
         "Val — threshold={:.4f} F1={:.4f} Prec={:.4f} Rec={:.4f}",
         threshold, val_f1, val_prec, val_rec,
@@ -395,8 +391,7 @@ def run_bocd(config: dict | None = None) -> None:
         "val_episode_macro_f1": val_episode_macro_f1,
         "val_selection_score": val_selection_score,
         "threshold": threshold,
-        "threshold_policy": "normal_validation_quantile",
-        "threshold_quantile": 0.95,
+        "threshold_policy": "validation_pr_curve_f1",
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "test_f1_at_threshold": test_f1,
@@ -465,12 +460,18 @@ def run_bocd(config: dict | None = None) -> None:
         classes=[str(c) for c in sorted(np.unique(y_test).tolist())],
         extras={
             "group_column": str(group_col),
-            "threshold_policy": "normal_validation_quantile",
-            "threshold_quantile": 0.95,
+            "threshold_policy": "validation_pr_curve_f1",
             "score_calibration_artifact": score_calibration_path.name,
         },
     )
-    write_json(score_calibration_path, build_score_calibration_payload(threshold=threshold))
+    write_json(
+        score_calibration_path,
+        build_score_calibration_payload(
+            threshold=threshold,
+            threshold_policy="validation_pr_curve_f1",
+            threshold_quantile=None,
+        ),
+    )
     write_json(global_metrics_path, metrics)
     write_json(per_class_metrics_path, per_class_metrics)
     write_json(run_manifest_path, run_manifest)
@@ -513,7 +514,13 @@ def run_bocd(config: dict | None = None) -> None:
                     "score_time_s": round(score_time, 2),
                 }
             )
-            mlflow.log_metrics(metrics)
+            mlflow.log_metrics(
+                {
+                    k: float(v)
+                    for k, v in metrics.items()
+                    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                }
+            )
             mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
             for p in (
                 metrics_path,

@@ -26,6 +26,7 @@ from sklearn.preprocessing import StandardScaler
 from src.evaluation.leakage_checks import performance_sanity_check
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.ml.one_class_svm_model import (
+    _calibrate_threshold,
     _default_comparison_records_path,
     _pick_sampling_group_column,
     _prepare_xy,
@@ -39,7 +40,6 @@ from src.modeling.common.artifact_contract import (
     build_run_manifest,
     build_score_calibration_payload,
     compute_anomaly_per_class_metrics,
-    q95_normal_val_threshold,
     write_json,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
@@ -184,7 +184,7 @@ def run_isolation_forest(config: dict | None = None) -> None:
         model = IsolationForest(**fixed_params, **trial_params)
         model.fit(x_fit)
         scores = _anomaly_score(model, x_val_scaled)
-        thr = q95_normal_val_threshold(val_scores=scores, val_labels=y_val_bin)
+        thr, f1, _, _ = _calibrate_threshold(scores, y_val_bin)
         preds = (scores >= thr).astype(int)
         f1 = float(f1_score(y_val_bin, preds, zero_division=0))
         ep_f1 = episode_macro_f1_binary(y_val_bin, preds, val_group_ids)
@@ -218,11 +218,7 @@ def run_isolation_forest(config: dict | None = None) -> None:
     val_scores = _anomaly_score(final_model, x_val_scaled)
     test_scores = _anomaly_score(final_model, x_test_scaled)
 
-    threshold = q95_normal_val_threshold(val_scores=val_scores, val_labels=y_val_bin)
-    val_preds_for_cal = (val_scores >= threshold).astype(int)
-    val_f1 = float(f1_score(y_val_bin, val_preds_for_cal, zero_division=0))
-    val_prec = float(precision_score(y_val_bin, val_preds_for_cal, zero_division=0))
-    val_rec = float(recall_score(y_val_bin, val_preds_for_cal, zero_division=0))
+    threshold, val_f1, val_prec, val_rec = _calibrate_threshold(val_scores, y_val_bin)
     logger.info(
         "Val — threshold={:.4f} F1={:.4f} Prec={:.4f} Rec={:.4f}",
         threshold,
@@ -258,8 +254,7 @@ def run_isolation_forest(config: dict | None = None) -> None:
         "val_episode_macro_f1": val_episode_macro_f1,
         "val_selection_score": val_selection_score,
         "threshold": threshold,
-        "threshold_policy": "normal_validation_quantile",
-        "threshold_quantile": 0.95,
+        "threshold_policy": "validation_pr_curve_f1",
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "test_f1_at_threshold": test_f1,
@@ -326,12 +321,18 @@ def run_isolation_forest(config: dict | None = None) -> None:
         score_direction="higher_is_more_anomalous",
         classes=[str(c) for c in sorted(np.unique(y_test).tolist())],
         extras={
-            "threshold_policy": "normal_validation_quantile",
-            "threshold_quantile": 0.95,
+            "threshold_policy": "validation_pr_curve_f1",
             "score_calibration_artifact": score_calibration_path.name,
         },
     )
-    write_json(score_calibration_path, build_score_calibration_payload(threshold=threshold))
+    write_json(
+        score_calibration_path,
+        build_score_calibration_payload(
+            threshold=threshold,
+            threshold_policy="validation_pr_curve_f1",
+            threshold_quantile=None,
+        ),
+    )
     write_json(global_metrics_path, metrics)
     write_json(per_class_metrics_path, per_class_metrics)
     write_json(run_manifest_path, run_manifest)
@@ -394,7 +395,13 @@ def run_isolation_forest(config: dict | None = None) -> None:
                     "seed": seed,
                 }
             )
-            mlflow.log_metrics(metrics)
+            mlflow.log_metrics(
+                {
+                    k: float(v)
+                    for k, v in metrics.items()
+                    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                }
+            )
             mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
             for p in (
                 metrics_path,

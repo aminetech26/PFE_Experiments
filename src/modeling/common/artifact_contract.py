@@ -37,19 +37,22 @@ def q95_normal_val_threshold(
 def build_score_calibration_payload(
     *,
     threshold: float,
-    threshold_quantile: float = 0.95,
+    threshold_policy: str = "normal_validation_quantile",
+    threshold_quantile: float | None = 0.95,
     score_direction: str = "higher_is_more_anomalous",
     score_stats: dict | None = None,
 ) -> dict:
     """Standard score_calibration.json contents for finalized Task A methods."""
-    return {
+    payload = {
         "score_direction": score_direction,
-        "threshold_policy": "normal_validation_quantile",
-        "threshold_quantile": float(threshold_quantile),
+        "threshold_policy": threshold_policy,
         "threshold": float(threshold),
         "test_not_used_for_calibration": True,
         "score_stats": score_stats or {},
     }
+    if threshold_quantile is not None:
+        payload["threshold_quantile"] = float(threshold_quantile)
+    return payload
 
 
 def compute_anomaly_per_class_metrics(
