@@ -213,6 +213,10 @@ anomaly_detection:
 # TASK B — Fault Classification
 # ============================================================================
 classification:
+  calibration:
+    enabled: true
+    method: sigmoid        # sigmoid (safe default) or isotonic
+
   # Runtime decomposition: ml only
   ml:
     active_model: lightgbm

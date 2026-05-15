@@ -20,11 +20,16 @@ from src.data.splitting import PerClassSegmentTimeSeriesCV
 from src.evaluation.leakage_checks import exact_duplicate_overlap_check, run_leakage_report
 from src.mlflow_setup import init_tracking
 from src.modeling.classification.ml.common import (
+    build_probability_calibration_payload,
     build_study_name_prefix,
     compute_classification_metrics,
     default_comparison_records_path,
+    fit_probability_calibrator,
     resolve_artifact_paths,
+    resolve_calibration_config,
     save_classification_plots,
+    save_confidence_histogram,
+    save_reliability_diagram,
     write_classification_contract_artifacts,
     write_json_artifact,
 )
@@ -255,6 +260,7 @@ def run_lightgbm(config: dict | None = None) -> None:
 
     runtime_config = config or _load_model_config()
     runtime_cfg, _, hpo_cfg = _resolve_classification_ml_config(runtime_config)
+    calibration_cfg = resolve_calibration_config(runtime_config)
     active_model = str(runtime_cfg.get("active_model", "lightgbm"))
     if active_model != "lightgbm":
         raise NotImplementedError(
@@ -520,19 +526,32 @@ def run_lightgbm(config: dict | None = None) -> None:
             study.trials_dataframe().to_csv(trials_artifact, index=False)
             mlflow.log_artifact(str(trials_artifact))
 
-        x_train_final = pd.concat([x_train, x_val], axis=0, ignore_index=True)
-        y_train_final = np.concatenate([y_train, y_val])
+        if calibration_cfg["enabled"]:
+            logger.info("Training final model on train only (calibration enabled) | params={}", best_params)
+            final_model, evals_result = _train_lightgbm(
+                x_train,
+                y_train,
+                params=best_params,
+                eval_sets=[(x_train, y_train)],
+            )
+            deployed_model = fit_probability_calibrator(
+                final_model, x_val, y_val, calibration_cfg["method"]
+            )
+            logger.info("Probability calibration fitted | method={}", calibration_cfg["method"])
+        else:
+            x_train_final = pd.concat([x_train, x_val], axis=0, ignore_index=True)
+            y_train_final = np.concatenate([y_train, y_val])
+            logger.info("Training final model on train+val | params={}", best_params)
+            final_model, evals_result = _train_lightgbm(
+                x_train_final,
+                y_train_final,
+                params=best_params,
+                eval_sets=[(x_train_final, y_train_final)],
+            )
+            deployed_model = final_model
 
-        logger.info("Training final model | params={}", best_params)
-        final_model, evals_result = _train_lightgbm(
-            x_train_final,
-            y_train_final,
-            params=best_params,
-            eval_sets=[(x_train_final, y_train_final)],
-        )
-
-        test_pred = final_model.predict(x_test)
-        test_pred_proba = final_model.predict_proba(x_test)
+        test_pred_proba = deployed_model.predict_proba(x_test)
+        test_pred = np.argmax(test_pred_proba, axis=1)
 
         summary_metrics, pr_auc_by_class, report = compute_classification_metrics(
             y_test,
@@ -575,7 +594,7 @@ def run_lightgbm(config: dict | None = None) -> None:
         if not args.skip_leakage_checks:
             try:
                 leakage_payload = run_leakage_report(
-                    model=final_model,
+                    model=final_model,  # use base model (pre-calibration) for leakage diagnostics
                     X_train=x_train,
                     y_train=y_train,
                     X_val=x_val,
@@ -592,6 +611,16 @@ def run_lightgbm(config: dict | None = None) -> None:
                     "leakage_flags": [],
                     "is_clean": True,
                 }
+
+        calibration_payload = None
+        if calibration_cfg["enabled"]:
+            calibration_payload = build_probability_calibration_payload(
+                y_true=y_test,
+                y_proba=test_pred_proba,
+                classes=encoder.classes_,
+                method=calibration_cfg["method"],
+                n_calibration_samples=len(y_val),
+            )
 
         artifact_paths = resolve_artifact_paths(
             model_name="lightgbm",
@@ -622,16 +651,19 @@ def run_lightgbm(config: dict | None = None) -> None:
             pr_auc_by_class=pr_auc_by_class,
             classification_report_payload=report,
             features_manifest_payload=manifest,
+            calibration_payload=calibration_payload,
         )
 
         model_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(
             {
-                "model": final_model,
+                "model": deployed_model,
+                "base_model": final_model,
                 "label_encoder": encoder,
                 "features": features,
                 "label_column": label_column,
                 "manifest": manifest,
+                "calibration": calibration_payload,
             },
             model_path,
         )
@@ -645,6 +677,18 @@ def run_lightgbm(config: dict | None = None) -> None:
             feature_names=features,
             model=final_model,
         )
+        if calibration_cfg["enabled"] and calibration_payload is not None:
+            save_reliability_diagram(
+                y_true=y_test,
+                y_proba=test_pred_proba,
+                classes=encoder.classes_,
+                path=artifact_paths["reliability_diagram_path"],
+            )
+            save_confidence_histogram(
+                y_proba=test_pred_proba,
+                path=artifact_paths["confidence_histogram_path"],
+                model_name="LightGBM",
+            )
 
         mlflow.log_metrics(
             {
@@ -662,6 +706,11 @@ def run_lightgbm(config: dict | None = None) -> None:
             mlflow.log_metric("test_pr_auc_weighted", pr_auc_weighted)
         for class_name, class_pr_auc in pr_auc_by_class.items():
             mlflow.log_metric(f"test_pr_auc_class_{class_name}", class_pr_auc)
+        if calibration_payload is not None:
+            cal_metrics = calibration_payload.get("metrics", {})
+            mlflow.log_metrics(
+                {f"cal_{k}": v for k, v in cal_metrics.items() if isinstance(v, float)}
+            )
 
         if evals_result:
             split_names = list(evals_result.keys())

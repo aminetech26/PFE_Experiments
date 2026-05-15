@@ -185,6 +185,53 @@ def validate_artifact_contract(artifact_dir: Path, *, task: str | None = None) -
     if is_task_a and not is_dlssm and dm_path.exists():
         errors.extend(_validate_task_a_operating_point(artifact_dir, dm))
 
+    # Task B probability calibration contract
+    if dm_path.exists() and dm.get("confidence_is_calibrated") is True:
+        errors.extend(_validate_task_b_calibration(artifact_dir, dm))
+
+    return errors
+
+
+def _validate_task_b_calibration(artifact_dir: Path, dm: dict) -> list[str]:
+    """Enforce calibration contract when confidence_is_calibrated == true."""
+    errors: list[str] = []
+
+    cal_name = dm.get("probability_calibration_artifact")
+    if not cal_name:
+        errors.append(
+            "deployment_manifest.json missing probability_calibration_artifact "
+            "(required when confidence_is_calibrated is true)"
+        )
+        return errors
+
+    cal_path = artifact_dir / str(cal_name)
+    if not cal_path.exists():
+        errors.append(f"probability_calibration_artifact does not exist: {cal_name}")
+        return errors
+
+    try:
+        cal = json.loads(cal_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        errors.append(f"probability_calibration.json unreadable: {exc}")
+        return errors
+
+    method = cal.get("calibration_method")
+    if method not in ("sigmoid", "isotonic"):
+        errors.append(
+            f"probability_calibration.calibration_method must be 'sigmoid' or 'isotonic', "
+            f"got {method!r}"
+        )
+
+    if cal.get("test_not_used_for_calibration") is not True:
+        errors.append("probability_calibration.test_not_used_for_calibration must be true")
+
+    dm_method = dm.get("calibration_method")
+    if dm_method and dm_method != method:
+        errors.append(
+            f"deployment_manifest.calibration_method ({dm_method!r}) does not match "
+            f"probability_calibration.calibration_method ({method!r})"
+        )
+
     return errors
 
 

@@ -9,13 +9,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yaml
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     balanced_accuracy_score,
+    brier_score_loss,
     classification_report,
     confusion_matrix,
     f1_score,
+    log_loss,
     precision_recall_curve,
     precision_score,
     recall_score,
@@ -189,6 +192,9 @@ def resolve_artifact_paths(
         "deployment_manifest_path": root / "deployment_manifest.json",
         "classification_report_path": root / "classification_report.json",
         "features_manifest_path": root / "features_manifest.json",
+        "probability_calibration_path": root / "probability_calibration.json",
+        "reliability_diagram_path": root / "reliability_diagram.png",
+        "confidence_histogram_path": root / "confidence_histogram.png",
     }
     return paths
 
@@ -209,8 +215,9 @@ def write_classification_contract_artifacts(
     pr_auc_by_class: dict[str, float],
     classification_report_payload: dict[str, Any],
     features_manifest_payload: dict[str, Any],
+    calibration_payload: dict[str, Any] | None = None,
 ) -> None:
-    global_metrics = {
+    global_metrics: dict[str, Any] = {
         "accuracy": summary_metrics.get("accuracy"),
         "balanced_accuracy": summary_metrics.get("balanced_accuracy"),
         "f1_weighted": summary_metrics.get("f1_weighted"),
@@ -221,6 +228,18 @@ def write_classification_contract_artifacts(
         "recall_macro": summary_metrics.get("recall_macro"),
         "pr_auc_weighted": summary_metrics.get("pr_auc_weighted"),
     }
+    if calibration_payload is not None:
+        cal_metrics = calibration_payload.get("metrics", {})
+        global_metrics.update(
+            {
+                "log_loss": cal_metrics.get("log_loss"),
+                "brier_score_multiclass": cal_metrics.get("brier_score_multiclass"),
+                "expected_calibration_error": cal_metrics.get("expected_calibration_error"),
+                "maximum_calibration_error": cal_metrics.get("maximum_calibration_error"),
+                "mean_confidence": cal_metrics.get("mean_confidence"),
+                "accuracy_confidence_gap": cal_metrics.get("accuracy_confidence_gap"),
+            }
+        )
 
     per_class: dict[str, dict[str, Any]] = {}
     for cls in classes:
@@ -246,6 +265,16 @@ def write_classification_contract_artifacts(
         run_type=str(args.run_type),
         extras={"run_name": run_name},
     )
+    deployment_extras: dict[str, Any] = {"label_encoder_embedded": True}
+    if calibration_payload is not None:
+        deployment_extras["confidence_is_calibrated"] = True
+        deployment_extras["probability_calibration_artifact"] = paths[
+            "probability_calibration_path"
+        ].name
+        deployment_extras["calibration_method"] = calibration_payload.get("calibration_method")
+    else:
+        deployment_extras["confidence_is_calibrated"] = False
+
     deployment_manifest = build_deployment_manifest(
         task=str(args.task),
         model=model_name,
@@ -255,7 +284,7 @@ def write_classification_contract_artifacts(
         feature_names=features,
         label_column=label_column,
         classes=[str(c) for c in classes],
-        extras={"label_encoder_embedded": True},
+        extras=deployment_extras,
     )
 
     write_json_artifact(paths["global_metrics_path"], global_metrics)
@@ -264,6 +293,8 @@ def write_classification_contract_artifacts(
     write_json_artifact(paths["deployment_manifest_path"], deployment_manifest)
     write_json_artifact(paths["classification_report_path"], classification_report_payload)
     write_json_artifact(paths["features_manifest_path"], features_manifest_payload)
+    if calibration_payload is not None:
+        write_json_artifact(paths["probability_calibration_path"], calibration_payload)
 
 
 def _save_confusion_matrix_plot(
@@ -391,6 +422,132 @@ def save_classification_plots(
 def write_json_artifact(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def resolve_calibration_config(config: dict) -> dict:
+    classification_cfg = config.get("classification", {})
+    cal_cfg = classification_cfg.get("calibration", {})
+    return {
+        "enabled": bool(cal_cfg.get("enabled", False)),
+        "method": str(cal_cfg.get("method", "sigmoid")),
+    }
+
+
+def fit_probability_calibrator(base_model, x_val: pd.DataFrame, y_val: np.ndarray, method: str):
+    calibrated = CalibratedClassifierCV(estimator=base_model, method=method, cv="prefit")
+    calibrated.fit(x_val, y_val)
+    return calibrated
+
+
+def compute_calibration_metrics(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    classes: np.ndarray,
+    n_bins: int = 10,
+) -> dict[str, float]:
+    ll = float(log_loss(y_true, y_proba, labels=np.arange(len(classes))))
+
+    # Multiclass Brier: mean over OvR Brier scores
+    y_true_bin = label_binarize(y_true, classes=np.arange(len(classes)))
+    brier = float(np.mean([brier_score_loss(y_true_bin[:, i], y_proba[:, i]) for i in range(len(classes))]))
+
+    # ECE / MCE over max-class confidence (classwise calibration proxy)
+    confidence = np.max(y_proba, axis=1)
+    correctness = (np.argmax(y_proba, axis=1) == y_true).astype(float)
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    mce = 0.0
+    n = len(y_true)
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        # Last bin is closed on the right to capture confidence == 1.0 (common with ExtraTrees)
+        if hi == 1.0:
+            mask = (confidence >= lo) & (confidence <= hi)
+        else:
+            mask = (confidence >= lo) & (confidence < hi)
+        if mask.sum() == 0:
+            continue
+        bin_acc = correctness[mask].mean()
+        bin_conf = confidence[mask].mean()
+        gap = abs(bin_acc - bin_conf)
+        ece += (mask.sum() / n) * gap
+        mce = max(mce, gap)
+
+    mean_conf = float(confidence.mean())
+    acc = float(correctness.mean())
+
+    return {
+        "log_loss": ll,
+        "brier_score_multiclass": brier,
+        "expected_calibration_error": float(ece),
+        "maximum_calibration_error": float(mce),
+        "mean_confidence": mean_conf,
+        "accuracy_confidence_gap": float(abs(acc - mean_conf)),
+    }
+
+
+def build_probability_calibration_payload(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    classes: np.ndarray,
+    method: str,
+    n_calibration_samples: int,
+) -> dict[str, Any]:
+    cal_metrics = compute_calibration_metrics(y_true, y_proba, classes)
+    return {
+        "confidence_is_calibrated": True,
+        "calibration_method": method,
+        "fit_split": "validation",
+        "test_not_used_for_calibration": True,
+        "probability_output": "calibrated_predict_proba",
+        "n_calibration_samples": n_calibration_samples,
+        "n_classes": int(len(classes)),
+        "classes": [str(c) for c in classes],
+        "metrics_split": "test",
+        "metrics": cal_metrics,
+    }
+
+
+def save_reliability_diagram(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    classes: np.ndarray,
+    path: Path,
+) -> None:
+    y_true_bin = label_binarize(y_true, classes=np.arange(len(classes)))
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot([0, 1], [0, 1], "k--", label="Perfectly calibrated")
+    for idx, cls in enumerate(classes):
+        prob_true, prob_pred = calibration_curve(
+            y_true_bin[:, idx], y_proba[:, idx], n_bins=10, strategy="uniform"
+        )
+        ax.plot(prob_pred, prob_true, marker="o", label=f"Class {cls}")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Fraction of positives")
+    ax.set_title("Reliability Diagram (per-class OvR)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def save_confidence_histogram(
+    y_proba: np.ndarray,
+    path: Path,
+    *,
+    model_name: str = "",
+) -> None:
+    confidence = np.max(y_proba, axis=1)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(confidence, bins=20, edgecolor="black")
+    ax.set_xlabel("Max-class confidence")
+    ax.set_ylabel("Count")
+    title = f"Confidence Histogram{' - ' + model_name if model_name else ''}"
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
 
 
 def resolve_threading(config: dict, args: argparse.Namespace) -> dict:
