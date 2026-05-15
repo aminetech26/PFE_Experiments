@@ -392,9 +392,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
         scores = _anomaly_score(model, x_val_scaled)
         thr, f1, _, _ = _calibrate_threshold(scores, y_val_bin)
         preds = (scores >= thr).astype(int)
-        f1 = float(f1_score(y_val_bin, preds, zero_division=0))
-        ep_f1 = episode_macro_f1_binary(y_val_bin, preds, val_group_ids)
-        return 0.7 * f1 + 0.3 * ep_f1
+        return float(f1_score(y_val_bin, preds, zero_division=0))
 
     if args.no_optuna:
         best_params = midpoint_params_from_space(search_space)
@@ -412,7 +410,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
             pruner_name=str(hpo_cfg.get("pruner", "none")),
             study_name=(f"{hpo_cfg.get('study_name_prefix', 'anomaly_ml')}_ocsvm_{kernel}"),
         )
-        logger.info(f"Best params: {best_params} | Best val objective (0.7*F1@q95+0.3*epF1): {study.best_value:.4f}")
+        logger.info(f"Best params: {best_params} | Best val objective (F1@val_best_thr): {study.best_value:.4f}")
 
     # ── Final model ───────────────────────────────────────────────────────────
     logger.info("Fitting final model…")
@@ -450,7 +448,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
 
     val_episode_macro_f1 = episode_macro_f1_binary(y_val_bin, val_preds, val_group_ids)
     test_episode_macro_f1 = episode_macro_f1_binary(y_test_bin, test_preds, test_group_ids)
-    val_selection_score = 0.7 * val_f1 + 0.3 * val_episode_macro_f1
+    val_selection_score = val_f1
 
     metrics: dict = {
         "val_pr_auc": val_pr_auc,

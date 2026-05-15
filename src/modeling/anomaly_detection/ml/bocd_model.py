@@ -310,9 +310,7 @@ def run_bocd(config: dict | None = None) -> None:
         scores = det.score(val_df_scaled, features, label_col, group_col)
         thr, f1, _, _ = _calibrate_threshold(scores, y_val_bin)
         preds = (scores >= thr).astype(int)
-        f1 = float(f1_score(y_val_bin, preds, zero_division=0))
-        ep_f1 = episode_macro_f1_binary(y_val_bin, preds, val_group_ids)
-        return 0.7 * f1 + 0.3 * ep_f1
+        return float(f1_score(y_val_bin, preds, zero_division=0))
 
     if args.hpo and search_space:
         logger.info("Running Optuna HPO: {} trials", n_trials)
@@ -328,7 +326,7 @@ def run_bocd(config: dict | None = None) -> None:
             storage_url=hpo_cfg.get("storage_url") or None,
             load_if_exists=True,
         )
-        logger.info("Best params: {} | Best val objective (0.7*F1@q95+0.3*epF1): {:.4f}", best_params, study.best_value)
+        logger.info("Best params: {} | Best val objective (F1@val_best_thr): {:.4f}", best_params, study.best_value)
     else:
         # Default hazard_lambda: geometric midpoint of log-scale search range
         if search_space and "hazard_lambda" in search_space:
@@ -379,7 +377,7 @@ def run_bocd(config: dict | None = None) -> None:
 
     val_episode_macro_f1 = episode_macro_f1_binary(y_val_bin, val_preds, val_group_ids)
     test_episode_macro_f1 = episode_macro_f1_binary(y_test_bin, test_preds, test_group_ids)
-    val_selection_score = 0.7 * val_f1 + 0.3 * val_episode_macro_f1
+    val_selection_score = val_f1
 
     metrics: dict = {
         "val_pr_auc": val_pr_auc,
