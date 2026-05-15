@@ -62,7 +62,8 @@ from src.utils.paths import get_experiments_root
 PROJECT_ROOT = Path(__file__).resolve().parents[5]
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-torch.set_float32_matmul_precision("highest")  # prioritize score stability for final runs
+torch.set_float32_matmul_precision("high")  # TF32 matmul on Ampere; fp32 accumulators preserved
+torch.backends.cudnn.benchmark = True       # fixed input shapes → cuDNN autotunes once and caches
 
 
 def _hpo_config_fingerprint(maat_cfg: dict, hpo_cfg: dict, seed: int) -> str:
@@ -1579,6 +1580,7 @@ def _train_and_eval(
         enable_checkpointing=(ckpt_dir is not None),
         logger=False,
         deterministic=False,
+        benchmark=True,
         **_trainer_runtime_kwargs(training_cfg),
     )
     trainer.fit(lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
@@ -1982,6 +1984,7 @@ def run_maat(config: dict | None = None) -> None:
             enable_progress_bar=False,
             enable_model_summary=False,
             logger=False,
+            precision="32-true",  # scoring/PR-AUC stays fp32 regardless of training precision
         )
         trainer_val.validate(final_lit, dataloaders=val_dl, ckpt_path=best_ckpt_path)
     else:
@@ -1999,6 +2002,7 @@ def run_maat(config: dict | None = None) -> None:
         enable_progress_bar=False,
         enable_model_summary=False,
         logger=False,
+        precision="32-true",  # scoring/PR-AUC stays fp32 regardless of training precision
     )
     trainer_test.test(
         final_lit,

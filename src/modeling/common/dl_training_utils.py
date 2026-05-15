@@ -7,19 +7,11 @@ import torch
 
 
 def _resolve_loader_runtime(threading_cfg: dict, *, hpo_mode: bool) -> dict:
-    if hpo_mode:
-        return {
-            "num_workers": 0,
-            "pin_memory": False,
-            "persistent_workers": False,
-            "prefetch_factor": None,
-        }
-
     cpu_count = max(1, int(os.cpu_count() or 1))
     configured_workers = threading_cfg.get("dl_num_workers", "auto")
     if isinstance(configured_workers, str) and configured_workers.lower() == "auto":
-        cap = 4 if hpo_mode else 8
-        num_workers = max(1, min(cap, cpu_count - 1))
+        cap = 2 if hpo_mode else 8
+        num_workers = max(0, min(cap, cpu_count - 1))
     else:
         num_workers = max(0, int(configured_workers))
 
@@ -30,7 +22,8 @@ def _resolve_loader_runtime(threading_cfg: dict, *, hpo_mode: bool) -> dict:
         pin_memory = bool(pin_memory_cfg)
 
     persistent_default = bool(threading_cfg.get("dl_persistent_workers", True))
-    persistent_workers = bool(num_workers > 0 and persistent_default)
+    # In HPO each trial rebuilds dataloaders; persistent workers leak across trials → off.
+    persistent_workers = bool(num_workers > 0 and persistent_default and not hpo_mode)
     prefetch_factor = int(threading_cfg.get("dl_prefetch_factor", 2))
     return {
         "num_workers": num_workers,

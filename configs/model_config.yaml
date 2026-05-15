@@ -271,7 +271,7 @@ training:
   gradient_clip_val: 1.0
   accelerator: auto
   devices: auto
-  precision: 32-true        # full precision for stable anomaly scores/thresholds
+  precision: bf16-mixed     # bf16 training (A100 tensor cores); val/test trainers force 32-true for scoring
   threading:
     prefer_physical_cores: true
     reserve_cores: 1
