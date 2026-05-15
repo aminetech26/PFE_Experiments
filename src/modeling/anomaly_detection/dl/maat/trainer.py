@@ -448,7 +448,7 @@ def _build_score_decomposition_report(
 
 # Lookup table used by the override block to reconstruct fusion metadata from
 # the decomposition score name, without re-parsing the string.
-_FUSION_METADATA: dict[str, tuple[str, list[str], "float | None"]] = {
+_FUSION_METADATA: dict[str, tuple[str, list[str], float | None]] = {
     "product":                                     ("raw",         ["product"],                                                                    None),
     "reconstruction":                              ("raw",         ["reconstruction"],                                                             None),
     "association_discrepancy":                     ("raw",         ["association_discrepancy"],                                                    None),

@@ -19,10 +19,11 @@ def q95_normal_val_threshold(
     normal_label: float | int = 0,
     quantile: float = 0.95,
 ) -> float:
-    """Return the `quantile`-th percentile of val scores on normal-labeled rows.
+    """Return the `quantile`-th percentile of validation scores on normal rows.
 
-    Standard operating-point rule for all finalized Task A models.
-    Raises ValueError if no normal rows exist in val (misconfigured split).
+    Legacy helper retained for methods that still use normal-quantile thresholding.
+    The current Task A benchmark policy uses validation PR-curve F1 calibration.
+    Raises ValueError if no normal rows exist in validation.
     """
     mask = np.asarray(val_labels) == normal_label
     if not mask.any():
@@ -42,7 +43,12 @@ def build_score_calibration_payload(
     score_direction: str = "higher_is_more_anomalous",
     score_stats: dict | None = None,
 ) -> dict:
-    """Standard score_calibration.json contents for finalized Task A methods."""
+    """Build score_calibration.json payload.
+
+    Policy fields are explicit and caller-controlled via `threshold_policy` and
+    `threshold_quantile` to support both legacy quantile and current PR-F1
+    threshold calibration contracts.
+    """
     payload = {
         "score_direction": score_direction,
         "threshold_policy": threshold_policy,
@@ -62,30 +68,52 @@ def compute_anomaly_per_class_metrics(
     threshold: float,
     normal_label: float | int = 0,
 ) -> dict[str, dict[str, float | int | None]]:
-    """Compute one-vs-normal metrics for each non-normal class."""
+    """Compute class-vs-normal metrics for each non-normal class.
+
+    For each fault class ``cls``, metrics are evaluated on the filtered subset
+    ``{normal_label, cls}`` only. This matches Task A semantics (fault vs normal)
+    and avoids penalizing a binary anomaly detector for not separating fault
+    classes from each other.
+    """
     labels_arr = np.asarray(labels)
     scores_arr = np.asarray(scores, dtype=float)
-    preds = (scores_arr >= float(threshold)).astype(int)
+    threshold_val = float(threshold)
 
     out: dict[str, dict[str, float | int | None]] = {}
     unique_labels = sorted(np.unique(labels_arr).tolist())
     for cls in unique_labels:
         if float(cls) == float(normal_label):
             continue
-        y_true = (labels_arr == cls).astype(int)
+
+        class_mask = (labels_arr == cls) | (labels_arr == normal_label)
+        if not np.any(class_mask):
+            continue
+
+        y_true = (labels_arr[class_mask] == cls).astype(int)
+        cls_scores = scores_arr[class_mask]
+        cls_preds = (cls_scores >= threshold_val).astype(int)
+
         support = int(y_true.sum())
         if support == 0:
             continue
+        support_normal = int((labels_arr[class_mask] == normal_label).sum())
+
         try:
-            pr_auc = float(average_precision_score(y_true, scores_arr))
+            pr_auc = float(average_precision_score(y_true, cls_scores))
         except Exception:
             pr_auc = None
+
+        precision = float(precision_score(y_true, cls_preds, zero_division=0))
+        recall = float(recall_score(y_true, cls_preds, zero_division=0))
+        f1 = float(f1_score(y_true, cls_preds, zero_division=0))
+
         out[str(int(cls) if float(cls).is_integer() else cls)] = {
-            "support": support,
-            "pr_auc_one_vs_rest": pr_auc,
-            "precision_at_threshold": float(precision_score(y_true, preds, zero_division=0)),
-            "recall_at_threshold": float(recall_score(y_true, preds, zero_division=0)),
-            "f1_at_threshold": float(f1_score(y_true, preds, zero_division=0)),
+            "support_fault": support,
+            "support_normal": support_normal,
+            "pr_auc_vs_normal": pr_auc,
+            "precision_at_threshold_vs_normal": precision,
+            "recall_at_threshold_vs_normal": recall,
+            "f1_at_threshold_vs_normal": f1,
         }
     return out
 
