@@ -54,11 +54,9 @@ from src.modeling.common.dl_training_utils import (
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
-from src.modeling.common.hyperparameter_optimizer import (
-    HPOStageConfig,
-    run_staged_optuna,
-    suggest_params_from_space,
-)
+from src.modeling.common.hyperparameter_optimizer import HPOStageResult
+from src.modeling.common.conditional_search_space import suggest_conditional_params
+from src.modeling.anomaly_detection.dl.maat.warm_start import load_warm_start_params
 from src.utils.paths import get_experiments_root
 
 # trainer.py lives under dl/maat/, so PROJECT_ROOT is 5 levels up
@@ -116,6 +114,12 @@ def _parse_args() -> argparse.Namespace:
             "Skips HPO entirely and merges these params directly into the final run. "
             'Example: \'{"learning_rate": 3.2e-4, "k": 4.77, "temperature": 10}\''
         ),
+    )
+    p.add_argument(
+        "--warm-start-from",
+        default=None,
+        help="Path to a run dir or best_params.json to warm-start HPO. "
+             "Null = auto-detect latest maat run.",
     )
     return p.parse_args()
 
@@ -248,61 +252,121 @@ def _fit_logistic_meta_fusion(
     val_parts: dict[str, np.ndarray],
     test_parts: dict[str, np.ndarray],
     val_labels: np.ndarray,
+    val_original_labels: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict] | None:
-    component_order = [
-        name
-        for name in (
-            "mismatch_imbalance",
-            "dc_voltage_drop",
-            "product",
-            "reconstruction",
-            "drift_efficiency",
-        )
+    """Fit logistic meta-fusion with a fast Optuna HPO over C, class_weight, and component subset.
+
+    Objective: 0.85 * val_f1 + 0.15 * val_macro_fault_pr_auc (same as MAAT HPO).
+    All search is on val arrays only — test arrays are only scored with the winner.
+    """
+    all_components = [
+        name for name in ("mismatch_imbalance", "dc_voltage_drop", "product", "reconstruction", "drift_efficiency")
         if name in val_parts and name in test_parts
     ]
-    if len(component_order) < 2:
+    if len(all_components) < 2:
         return None
 
     labels = np.asarray(val_labels, dtype=int)
     if len(np.unique(labels)) < 2:
         return None
 
-    x_val = np.column_stack([np.asarray(val_parts[name], dtype=float) for name in component_order])
-    x_test = np.column_stack([np.asarray(test_parts[name], dtype=float) for name in component_order])
+    def _score_subset(trial: optuna.Trial) -> float:
+        # Component subset: always keep product; optionally include others
+        subset = ["product"] + [
+            c for c in all_components if c != "product"
+            and trial.suggest_categorical(f"use_{c}", [True, False])
+        ]
+        if len(subset) < 2:
+            raise optuna.TrialPruned()
+
+        C = trial.suggest_float("C", 1e-3, 10.0, log=True)
+        cw_choice = trial.suggest_categorical("class_weight", ["balanced", "none", "recall_boost"])
+
+        x_val = np.column_stack([np.asarray(val_parts[n], dtype=float) for n in subset])
+        if not np.all(np.isfinite(x_val)):
+            raise optuna.TrialPruned()
+
+        means = x_val.mean(axis=0)
+        safe_stds = np.where((s := x_val.std(axis=0)) > 1e-12, s, 1.0)
+        x_val_s = (x_val - means) / safe_stds
+
+        if cw_choice == "recall_boost":
+            # Up-weight positives 3× to push recall on hard faults (targets class-2)
+            cw = {0: 1.0, 1: 3.0}
+        elif cw_choice == "balanced":
+            cw = "balanced"
+        else:
+            cw = None
+
+        clf = LogisticRegression(class_weight=cw, C=C, max_iter=1000, random_state=0, solver="lbfgs")
+        clf.fit(x_val_s, labels)
+        val_scores = clf.decision_function(x_val_s)
+
+        _, val_f1, _, _ = _calibrate_threshold(val_scores, labels)
+        macro_pr = (
+            _macro_fault_pr_auc(val_original_labels, val_scores)
+            if val_original_labels is not None and val_original_labels.size > 0
+            else 0.0
+        )
+        return 0.85 * val_f1 + 0.15 * macro_pr
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=0, n_startup_trials=10),
+        pruner=optuna.pruners.NopPruner(),
+    )
+    # Anchor: enqueue the prior fixed-config (C=0.25, balanced, full 5-component)
+    # as trial 0 so fusion HPO can never regress below the existing baseline.
+    study.enqueue_trial({
+        "C": 0.25,
+        "class_weight": "balanced",
+        "use_mismatch_imbalance": True,
+        "use_dc_voltage_drop":    True,
+        "use_reconstruction":     True,
+        "use_drift_efficiency":   True,
+    })
+    study.optimize(_score_subset, n_trials=60, show_progress_bar=False)
+
+    # Refit winner on full val set, score test
+    bp = study.best_params
+    best_subset = ["product"] + [
+        c for c in all_components if c != "product" and bp.get(f"use_{c}", False)
+    ]
+    best_C = float(bp["C"])
+    cw_choice = bp["class_weight"]
+    cw = {0: 1.0, 1: 3.0} if cw_choice == "recall_boost" else (None if cw_choice == "none" else "balanced")
+
+    x_val = np.column_stack([np.asarray(val_parts[n], dtype=float) for n in best_subset])
+    x_test = np.column_stack([np.asarray(test_parts[n], dtype=float) for n in best_subset])
     if not np.all(np.isfinite(x_val)) or not np.all(np.isfinite(x_test)):
         return None
 
     means = x_val.mean(axis=0)
-    stds = x_val.std(axis=0)
-    safe_stds = np.where((stds > 1e-12) & np.isfinite(stds), stds, 1.0)
+    safe_stds = np.where((s := x_val.std(axis=0)) > 1e-12, s, 1.0)
+    x_val_s = (x_val - means) / safe_stds
+    x_test_s = (x_test - means) / safe_stds
 
-    x_val_scaled = (x_val - means) / safe_stds
-    x_test_scaled = (x_test - means) / safe_stds
-
-    clf = LogisticRegression(
-        class_weight="balanced",
-        C=0.25,
-        max_iter=1000,
-        random_state=0,
-        solver="lbfgs",
-    )
-    clf.fit(x_val_scaled, labels)
+    clf = LogisticRegression(class_weight=cw, C=best_C, max_iter=1000, random_state=0, solver="lbfgs")
+    clf.fit(x_val_s, labels)
 
     metadata = {
         "score_fusion": "logreg_meta",
-        "score_components": component_order,
+        "score_components": best_subset,
         "score_tau": None,
         "meta_model": {
             "type": "logistic_regression",
             "coefficients": [float(x) for x in clf.coef_[0].tolist()],
             "intercept": float(clf.intercept_[0]),
+            "hpo_C": best_C,
+            "hpo_class_weight": cw_choice,
+            "hpo_best_val_selection": float(study.best_value),
             "input_stats": {
-                name: {"mean": float(mean), "std": float(std)}
-                for name, mean, std in zip(component_order, means.tolist(), safe_stds.tolist(), strict=True)
+                name: {"mean": float(m), "std": float(sd)}
+                for name, m, sd in zip(best_subset, means.tolist(), safe_stds.tolist(), strict=True)
             },
         },
     }
-    return clf.decision_function(x_val_scaled), clf.decision_function(x_test_scaled), metadata
+    return clf.decision_function(x_val_s), clf.decision_function(x_test_s), metadata
 
 
 def _logsumexp_pair(a: np.ndarray, b: np.ndarray, tau: float) -> np.ndarray:
@@ -535,7 +599,7 @@ def _build_score_decomposition_report(
                 },
             )
 
-    smart_fusion = _fit_logistic_meta_fusion(val_parts, test_parts, val_labels)
+    smart_fusion = _fit_logistic_meta_fusion(val_parts, test_parts, val_labels, val_original_labels)
     if smart_fusion is not None:
         val_smart, test_smart, smart_meta = smart_fusion
         _track_add("smart_logreg_core_physics", val_smart, test_smart, smart_meta)
@@ -663,6 +727,7 @@ class MAATLightningModule(pl.LightningModule):
         self.best_val_pr_auc: float = 0.0
         self.best_val_pv_maat_f1: float = 0.0
         self.best_val_episode_macro_f1: float = 0.0
+        self.best_val_macro_fault_pr_auc: float = 0.0
         self.best_val_selection_score: float = 0.0
         self.val_threshold: float = 0.5
         self._pv_score_stats: dict[str, tuple[float, float]] | None = None
@@ -1095,8 +1160,16 @@ class MAATLightningModule(pl.LightningModule):
         val_acc = float(accuracy_score(all_labels, val_preds))
         val_pv_pr_auc = _safe_pr_auc(all_labels, pv_scores)
 
+        val_macro_fault_pr_auc = (
+            _macro_fault_pr_auc(all_original_labels, pv_scores)
+            if all_original_labels is not None and all_original_labels.size > 0
+            else 0.0
+        )
+        val_selection_score = 0.85 * val_f1 + 0.15 * val_macro_fault_pr_auc
+
         self.best_val_pv_maat_f1 = max(self.best_val_pv_maat_f1, val_f1)
         self.best_val_episode_macro_f1 = max(self.best_val_episode_macro_f1, val_episode_macro_f1)
+        self.best_val_macro_fault_pr_auc = max(self.best_val_macro_fault_pr_auc, val_macro_fault_pr_auc)
         self.best_val_selection_score = max(self.best_val_selection_score, val_selection_score)
         self.val_threshold = threshold
         self._val_scores_np = pv_scores
@@ -1130,6 +1203,7 @@ class MAATLightningModule(pl.LightningModule):
         self.log("val_pr_auc", val_pr_auc)
         self.log("val_pv_maat_pr_auc", val_pv_pr_auc)
         self.log("val_pv_maat_f1", val_f1, prog_bar=True)
+        self.log("val_macro_fault_pr_auc", val_macro_fault_pr_auc)
         self.log("val_episode_macro_f1", val_episode_macro_f1)
         self.log("val_selection_score", val_selection_score, prog_bar=True)
         self.log("val_roc_auc", val_roc_auc)
@@ -1859,8 +1933,7 @@ def run_maat(config: dict | None = None) -> None:
 
     if run_hpo:
         trial_budget: dict = hpo_cfg.get("trial_budget", {})
-        n_stage1 = int(trial_budget.get("stage1_training", 20))
-        n_stage2 = int(trial_budget.get("stage2_architecture", 40))
+        n_trials = int(trial_budget.get("stage1_training", 20)) + int(trial_budget.get("stage2_architecture", 40))
         hpo_epochs = max(
             int(hpo_cfg.get("min_hpo_epochs", 10)),
             int(max_epochs * float(hpo_cfg.get("max_epochs_fraction", 0.25))),
@@ -1871,142 +1944,121 @@ def run_maat(config: dict | None = None) -> None:
         )
         pruning_warmup_epochs = int(hpo_cfg.get("pruning_warmup_epochs", 3))
 
-        fixed_arch = {
-            k: maat_cfg[k]
-            for k in ("win_size", "block_size", "d_model", "n_heads", "e_layers", "d_ff")
-        }
+        hpo_mode = str(hpo_cfg.get("mode", "conditional")).strip().lower()
 
-        def objective_builder(stage: HPOStageConfig, frozen_params: dict):
-            def objective(trial: optuna.Trial) -> float:
-                trial_p = suggest_params_from_space(trial, stage.search_space)
-                merged = {**fixed_arch, **frozen_params, **trial_p}
-                merged["score_reduction"] = "max"
+        def _conditional_objective(trial: optuna.Trial) -> float:
+            trial_p = suggest_conditional_params(trial)
+            trial_p["score_reduction"] = "max"
 
-                ws = int(merged.get("win_size", maat_cfg["win_size"]))
-                bs_ = int(merged.get("block_size", maat_cfg["block_size"]))
-                dm = int(merged.get("d_model", maat_cfg["d_model"]))
-                nh = int(merged.get("n_heads", maat_cfg["n_heads"]))
-                if ws % bs_ != 0 or dm % nh != 0:
-                    raise optuna.TrialPruned()
+            trial_maat_cfg = {**maat_cfg, **trial_p}
+            trial_training_cfg = {**training_cfg, **{
+                k: trial_p[k] for k in ("weight_decay", "batch_size", "gradient_clip_val")
+                if k in trial_p
+            }}
+            if "learning_rate" in trial_p:
+                trial_training_cfg["lr"] = float(trial_p["learning_rate"])
 
-                trial_maat_cfg = {**maat_cfg, **merged}
-                trial_training_cfg = {**training_cfg, **{
-                    k: merged[k] for k in ("weight_decay", "batch_size", "gradient_clip_val")
-                    if k in merged
-                }}
-                if "learning_rate" in merged:
-                    trial_training_cfg["lr"] = float(merged["learning_rate"])
+            trial_bs = int(trial_training_cfg.get("batch_size", min(batch_size, 128)))
+            trial_stride = int(trial_p.get("train_stride", train_stride))
 
-                trial_bs = int(trial_training_cfg.get("batch_size", min(batch_size, 128)))
-                trial_stride = int(merged.get("train_stride", train_stride))
+            try:
+                t_dl, v_dl, _ = _make_dataloaders(
+                    trial_maat_cfg, trial_stride, eval_stride, trial_bs
+                )
+                lit, _ = _train_and_eval(
+                    trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
+                    n_features,
+                    drift_feature_idx,
+                    voltage_drop_feature_indices,
+                    power_imbalance_feature_idx,
+                    current_imbalance_feature_idx,
+                    voltage_imbalance_feature_idx,
+                    hpo_epochs,
+                    hpo_patience,
+                    total_steps=max(1, len(t_dl) * hpo_epochs),
+                    seed=seed,
+                    pruning_warmup_epochs=pruning_warmup_epochs,
+                    trial=trial,
+                )
+                selection_score = float(lit.best_val_selection_score)
+            except optuna.exceptions.TrialPruned:
+                raise
+            except Exception as exc:
+                logger.warning(f"HPO trial exception (will prune): {type(exc).__name__}: {exc}")
+                raise optuna.TrialPruned()
 
-                try:
-                    t_dl, v_dl, _ = _make_dataloaders(
-                        trial_maat_cfg, trial_stride, eval_stride, trial_bs
-                    )
-                    lit, _ = _train_and_eval(
-                        trial_maat_cfg, trial_training_cfg, t_dl, v_dl,
-                        n_features,
-                        drift_feature_idx,
-                        voltage_drop_feature_indices,
-                        power_imbalance_feature_idx,
-                        current_imbalance_feature_idx,
-                        voltage_imbalance_feature_idx,
-                        hpo_epochs,
-                        hpo_patience,
-                        total_steps=max(1, len(t_dl) * hpo_epochs),
-                        seed=seed,
-                        pruning_warmup_epochs=pruning_warmup_epochs,
-                        trial=trial,
-                    )
-                    selection_score = float(lit.best_val_selection_score)
-                except optuna.exceptions.TrialPruned:
-                    raise
-                except Exception as exc:
-                    logger.warning(f"HPO trial real exception (will prune): {type(exc).__name__}: {exc}")
-                    raise optuna.TrialPruned()
-
-                if not math.isfinite(selection_score) or selection_score <= 0.0:
-                    raise optuna.TrialPruned()
-                return selection_score
-
-            return objective
-
-        stage1_space = dict(maat_cfg.get("hpo_stage1", {}))
-        stage2_space = dict(maat_cfg.get("hpo_stage2", {}))
-
-        stages = [
-            HPOStageConfig(
-                name="stage1_training",
-                search_space=stage1_space,
-                n_trials=n_stage1,
-                direction="maximize",
-                sampler=str(hpo_cfg.get("sampler", "tpe")),
-                pruner=str(hpo_cfg.get("pruner", "hyperband")),
-            ),
-            HPOStageConfig(
-                name="stage2_architecture",
-                search_space=stage2_space,
-                n_trials=n_stage2,
-                direction="maximize",
-                sampler=str(hpo_cfg.get("sampler", "tpe")),
-                pruner=str(hpo_cfg.get("pruner", "hyperband")),
-            ),
-        ]
+            if not math.isfinite(selection_score) or selection_score <= 0.0:
+                raise optuna.TrialPruned()
+            return selection_score
 
         profile_str = str(args.profile or "default").replace("/", "_").replace("\\", "_")
         cfg_hash = _hpo_config_fingerprint(maat_cfg, hpo_cfg, seed)
-        fingerprinted_prefix = (
+        study_name = (
             f"{hpo_cfg.get('study_name_prefix', 'anomaly_dl_maat')}"
             f"_{args.dataset}_{args.task}_{args.split_path}_{profile_str}_{cfg_hash}"
+            f"__conditional"
         )
 
-        logger.info(f"Running two-stage HPO | stage1={n_stage1} trials  stage2={n_stage2} trials")
-        best_params, stage_results = run_staged_optuna(
-            stages=stages,
-            objective_builder=objective_builder,
-            seed=seed,
-            storage_url=hpo_cfg.get("storage_url"),
-            study_name_prefix=fingerprinted_prefix,
+        sampler = optuna.samplers.TPESampler(seed=seed)
+        pruner = optuna.pruners.HyperbandPruner()
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=sampler,
+            pruner=pruner,
+            storage=hpo_cfg.get("storage_url"),
+            study_name=study_name,
+            load_if_exists=True,
         )
-        logger.info(f"HPO selection-score winner: {best_params}")
 
-        # Validation-only selection: among each stage's top-decile selection-score trials,
-        # pick the simplest / most-regularized one. Fights val-overfit without ever
-        # touching the test set.
+        # Warm-start: enqueue known-good params as trial 0
+        warm_start_source = (
+            getattr(args, "warm_start_from", None)
+            or maat_cfg.get("hpo_conditional", {}).get("warm_start_from")
+        )
+        warm_params = load_warm_start_params(warm_start_source)
+        if warm_params:
+            study.enqueue_trial(warm_params)
+            logger.info(f"HPO warm-start enqueued: {warm_params}")
+
+        logger.info(f"Running conditional HPO | n_trials={n_trials} | study={study_name}")
+        study.optimize(_conditional_objective, n_trials=n_trials)
+
+        stage_results = [HPOStageResult(
+            name="conditional",
+            best_params=study.best_params,
+            best_value=float(study.best_value),
+            study=study,
+        )]
+
+        # Validation-only selection: top-decile by blended score, tiebreak by simplicity
         def _simplicity_score(t: optuna.trial.FrozenTrial) -> tuple:
             p = t.params
-            sr_rank = {"center": 2, "mean": 1, "max": 0}.get(p.get("score_reduction", "max"), 0)
             return (
-                -int(p.get("d_model", 64)),                 # smaller architecture
+                -int(p.get("d_model", 64)),
                 -int(p.get("e_layers", 2)),
                 -int(p.get("d_ff", 256)),
-                -float(p.get("learning_rate", 1.0e-4)),     # lower lr (less aggressive)
-                 int(p.get("batch_size", 256)),             # larger batch (more stable)
-                -sr_rank,                                   # simpler score reduction
+                -float(p.get("learning_rate", 1.0e-4)),
+                 int(p.get("batch_size", 256)),
             )
 
-        validation_selected: dict = {}
-        for sr in stage_results:
-            completed = [
-                t for t in sr.study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-                and math.isfinite(t.value)
-            ]
-            if not completed:
-                continue
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+            and math.isfinite(t.value)
+        ]
+        if completed:
             top_n = max(1, len(completed) // 10)
             top_decile = sorted(completed, key=lambda t: t.value, reverse=True)[:top_n]
             picked = max(top_decile, key=_simplicity_score)
+            best_params = dict(picked.params)
             logger.info(
-                f"[{sr.name}] val-only select | top-decile={top_n}/{len(completed)} | "
-                f"picked selection_score={picked.value:.4f} (stage max was {sr.best_value:.4f}) | "
-                f"params={picked.params}"
+                f"[conditional] val-only select | top-decile={top_n}/{len(completed)} | "
+                f"picked selection_score={picked.value:.4f} (study max={study.best_value:.4f}) | "
+                f"params={best_params}"
             )
-            validation_selected.update(picked.params)
+        else:
+            best_params = dict(study.best_params)
 
-        if validation_selected:
-            best_params = validation_selected
         logger.info(f"HPO validation-only selected params: {best_params}")
     else:
         if not injected_params:
@@ -2139,7 +2191,12 @@ def run_maat(config: dict | None = None) -> None:
     val_preds = (val_scores >= threshold).astype(int)
     val_f1 = float(f1_score(val_labels, val_preds, zero_division=0))
     val_episode_macro_f1 = _episode_macro_f1_binary(val_labels, val_preds, val_group_ids)
-    val_selection_score = val_f1
+    _val_macro_fault_pr_auc_base = (
+        _macro_fault_pr_auc(val_original_labels, val_scores)
+        if val_original_labels is not None and val_original_labels.size > 0
+        else 0.0
+    )
+    val_selection_score = 0.85 * val_f1 + 0.15 * _val_macro_fault_pr_auc_base
     val_prec = float(precision_score(val_labels, val_preds, zero_division=0))
     val_rec = float(recall_score(val_labels, val_preds, zero_division=0))
     val_acc = float(accuracy_score(val_labels, val_preds))
@@ -2173,7 +2230,7 @@ def run_maat(config: dict | None = None) -> None:
         "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
         "score_tau": 1.0,
         "threshold_policy": "validation_pr_curve_f1",
-        "selection_metric": "val_pv_maat_f1",
+        "selection_metric": "0.85*val_pv_maat_f1 + 0.15*val_macro_fault_pr_auc",
         "official_score_reduction": "max",
         "score_reduction_scope": "all_components_temporal",
         "diagnostic_score_reductions": ["q95", "top10mean"],
@@ -2189,6 +2246,7 @@ def run_maat(config: dict | None = None) -> None:
         "val_selection_score": val_selection_score,
         "threshold": threshold,
         "product_val_pr_auc": product_val_pr_auc,
+        "val_macro_fault_pr_auc": _val_macro_fault_pr_auc_base,
         "test_pv_maat_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "product_test_pr_auc": product_test_pr_auc,

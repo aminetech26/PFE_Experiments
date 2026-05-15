@@ -81,17 +81,15 @@ anomaly_detection:
   dl:
     active_model: maat
     hpo:
-      mode: auto_two_stage
+      mode: conditional
       sampler: tpe
-      pruner: median
+      pruner: hyperband
       early_stopping: true
       study_name_prefix: anomaly_dl_maat
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_dl.db"
-      run_stage3: false
       trial_budget:
-        stage1_training: 40
-        stage2_architecture: 30
-        stage3_joint: 12
+        stage1_training: 35
+        stage2_architecture: 25
       max_epochs_fraction: 0.45
       min_hpo_epochs: 15
       patience_fraction: 0.40
@@ -127,6 +125,11 @@ anomaly_detection:
           n_heads:      {type: categorical, choices: [2, 4, 8]}
           e_layers:     {type: int, low: 1, high: 4}
           d_ff:         {type: categorical, choices: [128, 256, 512]}
+        # Single conditional study — replaces greedy two-stage when hpo.mode=conditional
+        # n_trials = stage1_training + stage2_architecture (back-compat sum)
+        # warm_start_from: path to run dir or best_params.json; null = auto-detect latest
+        hpo_conditional:
+          warm_start_from: null
 
       dlssm:
         win_size: 60
