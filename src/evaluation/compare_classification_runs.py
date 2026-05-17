@@ -45,7 +45,7 @@ def _filter_group(df: pd.DataFrame, field: str, value: str, max_rows: int | None
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare classification runs with statistical tests")
     parser.add_argument("--records-path", default=str(DEFAULT_RECORDS_PATH), help="Path to comparison records jsonl")
-    parser.add_argument("--metric", default="test_f1_weighted", help="Metric column to compare")
+    parser.add_argument("--metric", default="test_f1_macro", help="Metric column to compare")
     parser.add_argument("--group-field", default="feature_profile", help="Field used to create A/B groups")
     parser.add_argument("--group-a", required=True, help="Group A value")
     parser.add_argument("--group-b", required=True, help="Group B value")

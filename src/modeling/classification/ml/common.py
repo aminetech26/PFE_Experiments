@@ -112,7 +112,14 @@ def compute_pr_auc_multiclass(
 ) -> float:
     if len(classes) <= 1:
         return float("nan")
-    y_true_bin = label_binarize(y_true_encoded, classes=np.arange(len(classes)))
+    if len(classes) == 2:
+        # sklearn.label_binarize returns shape (n, 1) for binary classes;
+        # expand to OvR two-column target to align with predict_proba shape (n, 2).
+        y_true_bin = np.zeros((len(y_true_encoded), 2), dtype=int)
+        y_true_bin[:, 1] = (y_true_encoded == 1).astype(int)
+        y_true_bin[:, 0] = 1 - y_true_bin[:, 1]
+    else:
+        y_true_bin = label_binarize(y_true_encoded, classes=np.arange(len(classes)))
     return float(average_precision_score(y_true_bin, y_proba, average="weighted"))
 
 
@@ -121,7 +128,12 @@ def compute_pr_auc_by_class(
     y_proba: np.ndarray,
     classes: np.ndarray,
 ) -> dict[str, float]:
-    y_true_bin = label_binarize(y_true_encoded, classes=np.arange(len(classes)))
+    if len(classes) == 2:
+        y_true_bin = np.zeros((len(y_true_encoded), 2), dtype=int)
+        y_true_bin[:, 1] = (y_true_encoded == 1).astype(int)
+        y_true_bin[:, 0] = 1 - y_true_bin[:, 1]
+    else:
+        y_true_bin = label_binarize(y_true_encoded, classes=np.arange(len(classes)))
     pr_auc_by_class: dict[str, float] = {}
     for idx, cls in enumerate(classes):
         pr_auc_by_class[str(cls)] = float(
@@ -136,15 +148,28 @@ def compute_classification_metrics(
     y_proba: np.ndarray,
     classes: np.ndarray,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, Any]]:
+    labels = np.arange(len(classes))
     summary_metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted")),
-        "f1_macro": float(f1_score(y_true, y_pred, average="macro")),
-        "precision_weighted": float(precision_score(y_true, y_pred, average="weighted")),
-        "precision_macro": float(precision_score(y_true, y_pred, average="macro")),
-        "recall_weighted": float(recall_score(y_true, y_pred, average="weighted")),
-        "recall_macro": float(recall_score(y_true, y_pred, average="macro")),
+        "f1_weighted": float(
+            f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+        ),
+        "f1_macro": float(
+            f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        ),
+        "precision_weighted": float(
+            precision_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+        ),
+        "precision_macro": float(
+            precision_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        ),
+        "recall_weighted": float(
+            recall_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)
+        ),
+        "recall_macro": float(
+            recall_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)
+        ),
         "pr_auc_weighted": compute_pr_auc_multiclass(y_true, y_proba, classes),
     }
     pr_auc_by_class = compute_pr_auc_by_class(y_true, y_proba, classes)
@@ -153,8 +178,10 @@ def compute_classification_metrics(
         classification_report(
             y_true,
             y_pred,
+            labels=labels,
             target_names=[str(x) for x in classes],
             output_dict=True,
+            zero_division=0,
         ),
     )
     return summary_metrics, pr_auc_by_class, report
@@ -217,6 +244,7 @@ def write_classification_contract_artifacts(
     classification_report_payload: dict[str, Any],
     features_manifest_payload: dict[str, Any],
     calibration_payload: dict[str, Any] | None = None,
+    calibration_impact: dict[str, Any] | None = None,
 ) -> None:
     global_metrics: dict[str, Any] = {
         "accuracy": summary_metrics.get("accuracy"),
@@ -241,6 +269,8 @@ def write_classification_contract_artifacts(
                 "accuracy_confidence_gap": cal_metrics.get("accuracy_confidence_gap"),
             }
         )
+    if calibration_impact is not None:
+        global_metrics["calibration_impact"] = calibration_impact
 
     per_class: dict[str, dict[str, Any]] = {}
     for cls in classes:
@@ -523,8 +553,9 @@ def build_probability_calibration_payload(
     classes: np.ndarray,
     method: str,
     n_calibration_samples: int,
+    metrics: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    cal_metrics = compute_calibration_metrics(y_true, y_proba, classes)
+    cal_metrics = metrics if metrics is not None else compute_calibration_metrics(y_true, y_proba, classes)
     return {
         "confidence_is_calibrated": True,
         "calibration_method": method,
@@ -536,6 +567,64 @@ def build_probability_calibration_payload(
         "classes": [str(c) for c in classes],
         "metrics_split": "test",
         "metrics": cal_metrics,
+    }
+
+
+def build_calibration_impact_payload(
+    *,
+    y_true: np.ndarray,
+    classes: np.ndarray,
+    uncalibrated_pred_proba: np.ndarray,
+    calibrated_pred_proba: np.ndarray,
+) -> dict[str, Any]:
+    uncalibrated_pred = np.argmax(uncalibrated_pred_proba, axis=1)
+    calibrated_pred = np.argmax(calibrated_pred_proba, axis=1)
+
+    uncalibrated_summary_metrics, _, _ = compute_classification_metrics(
+        y_true,
+        uncalibrated_pred,
+        uncalibrated_pred_proba,
+        classes,
+    )
+    calibrated_summary_metrics, _, _ = compute_classification_metrics(
+        y_true,
+        calibrated_pred,
+        calibrated_pred_proba,
+        classes,
+    )
+
+    uncalibrated_cal_metrics = compute_calibration_metrics(y_true, uncalibrated_pred_proba, classes)
+    calibrated_cal_metrics = compute_calibration_metrics(y_true, calibrated_pred_proba, classes)
+
+    return {
+        "uncalibrated": {
+            "f1_macro": uncalibrated_summary_metrics["f1_macro"],
+            "f1_weighted": uncalibrated_summary_metrics["f1_weighted"],
+            "log_loss": uncalibrated_cal_metrics["log_loss"],
+            "expected_calibration_error": uncalibrated_cal_metrics["expected_calibration_error"],
+        },
+        "calibrated": {
+            "f1_macro": calibrated_summary_metrics["f1_macro"],
+            "f1_weighted": calibrated_summary_metrics["f1_weighted"],
+            "log_loss": calibrated_cal_metrics["log_loss"],
+            "expected_calibration_error": calibrated_cal_metrics["expected_calibration_error"],
+        },
+        "delta": {
+            "f1_macro": calibrated_summary_metrics["f1_macro"]
+            - uncalibrated_summary_metrics["f1_macro"],
+            "f1_weighted": calibrated_summary_metrics["f1_weighted"]
+            - uncalibrated_summary_metrics["f1_weighted"],
+            "log_loss": calibrated_cal_metrics["log_loss"] - uncalibrated_cal_metrics["log_loss"],
+            "expected_calibration_error": calibrated_cal_metrics["expected_calibration_error"]
+            - uncalibrated_cal_metrics["expected_calibration_error"],
+        },
+        "delta_interpretation": {
+            "f1_macro": "higher_is_better",
+            "f1_weighted": "higher_is_better",
+            "log_loss": "lower_is_better",
+            "expected_calibration_error": "lower_is_better",
+        },
+        "calibrated_calibration_metrics": calibrated_cal_metrics,
     }
 
 

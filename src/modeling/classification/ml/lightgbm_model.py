@@ -20,6 +20,7 @@ from src.data.splitting import PerClassSegmentTimeSeriesCV
 from src.evaluation.leakage_checks import exact_duplicate_overlap_check, run_leakage_report
 from src.mlflow_setup import init_tracking
 from src.modeling.classification.ml.common import (
+    build_calibration_impact_payload,
     build_probability_calibration_payload,
     build_study_name_prefix,
     compute_classification_metrics,
@@ -564,6 +565,16 @@ def run_lightgbm(config: dict | None = None) -> None:
         f1_macro = summary_metrics["f1_macro"]
         pr_auc_weighted = summary_metrics["pr_auc_weighted"]
 
+        calibration_impact = None
+        if calibration_cfg["enabled"]:
+            uncalibrated_pred_proba = final_model.predict_proba(x_test)
+            calibration_impact = build_calibration_impact_payload(
+                y_true=y_test,
+                classes=encoder.classes_,
+                uncalibrated_pred_proba=uncalibrated_pred_proba,
+                calibrated_pred_proba=test_pred_proba,
+            )
+
         metrics_payload = {
             "task": args.task,
             "dataset": args.dataset,
@@ -585,6 +596,8 @@ def run_lightgbm(config: dict | None = None) -> None:
             "best_params": best_params,
             "classification_report": report,
         }
+        if calibration_impact is not None:
+            metrics_payload["calibration_impact"] = calibration_impact
 
         leakage_payload = {
             "skipped": bool(args.skip_leakage_checks),
@@ -602,6 +615,7 @@ def run_lightgbm(config: dict | None = None) -> None:
                     feature_names=features,
                     X_eval=x_test,
                     y_eval=y_test,
+                    metric="f1_macro",
                 )
             except Exception as _exc:
                 logger.warning("Leakage report failed (non-fatal): {}", _exc)
@@ -614,12 +628,16 @@ def run_lightgbm(config: dict | None = None) -> None:
 
         calibration_payload = None
         if calibration_cfg["enabled"]:
+            cal_metrics_for_payload = None
+            if calibration_impact is not None:
+                cal_metrics_for_payload = calibration_impact.get("calibrated_calibration_metrics")
             calibration_payload = build_probability_calibration_payload(
                 y_true=y_test,
                 y_proba=test_pred_proba,
                 classes=encoder.classes_,
                 method=calibration_cfg["method"],
                 n_calibration_samples=len(y_val),
+                metrics=cal_metrics_for_payload,
             )
 
         artifact_paths = resolve_artifact_paths(
@@ -652,6 +670,7 @@ def run_lightgbm(config: dict | None = None) -> None:
             classification_report_payload=report,
             features_manifest_payload=manifest,
             calibration_payload=calibration_payload,
+            calibration_impact=calibration_impact,
         )
 
         model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -710,6 +729,21 @@ def run_lightgbm(config: dict | None = None) -> None:
             cal_metrics = calibration_payload.get("metrics", {})
             mlflow.log_metrics(
                 {f"cal_{k}": v for k, v in cal_metrics.items() if isinstance(v, float)}
+            )
+        if calibration_impact is not None:
+            uncal = calibration_impact["uncalibrated"]
+            delta = calibration_impact["delta"]
+            mlflow.log_metrics(
+                {
+                    "uncal_test_f1_macro": uncal["f1_macro"],
+                    "uncal_test_f1_weighted": uncal["f1_weighted"],
+                    "uncal_log_loss": uncal["log_loss"],
+                    "uncal_expected_calibration_error": uncal["expected_calibration_error"],
+                    "cal_delta_test_f1_macro": delta["f1_macro"],
+                    "cal_delta_test_f1_weighted": delta["f1_weighted"],
+                    "cal_delta_log_loss": delta["log_loss"],
+                    "cal_delta_expected_calibration_error": delta["expected_calibration_error"],
+                }
             )
 
         if evals_result:
@@ -783,12 +817,30 @@ def run_lightgbm(config: dict | None = None) -> None:
             "test_recall_weighted": summary_metrics["recall_weighted"],
             "test_recall_macro": summary_metrics["recall_macro"],
             "test_pr_auc_weighted": pr_auc_weighted,
+            "primary_metric_name": "f1_macro",
+            "primary_metric_value": f1_macro,
             "leakage_flag_count": len(leakage_payload.get("leakage_flags", [])),
             "leakage_is_clean": bool(leakage_payload.get("is_clean", False)),
             "duplicate_precheck_overlaps": int(duplicate_precheck.get("overlapping_samples", 0)),
             "duplicate_precheck_is_clean": bool(duplicate_precheck.get("is_clean", True)),
             "mlflow_run_id": mlflow.active_run().info.run_id if mlflow.active_run() else None,
         }
+        if calibration_impact is not None:
+            comparison_record["calibration_impact"] = calibration_impact
+            uncal = calibration_impact["uncalibrated"]
+            delta = calibration_impact["delta"]
+            comparison_record.update(
+                {
+                    "uncal_test_f1_macro": uncal["f1_macro"],
+                    "uncal_test_f1_weighted": uncal["f1_weighted"],
+                    "uncal_log_loss": uncal["log_loss"],
+                    "uncal_expected_calibration_error": uncal["expected_calibration_error"],
+                    "cal_delta_test_f1_macro": delta["f1_macro"],
+                    "cal_delta_test_f1_weighted": delta["f1_weighted"],
+                    "cal_delta_log_loss": delta["log_loss"],
+                    "cal_delta_expected_calibration_error": delta["expected_calibration_error"],
+                }
+            )
         records_path = Path(args.comparison_records_path)
         records_path.parent.mkdir(parents=True, exist_ok=True)
         with records_path.open("a", encoding="utf-8") as fh:
@@ -796,8 +848,9 @@ def run_lightgbm(config: dict | None = None) -> None:
         mlflow.log_artifact(str(records_path))
 
         logger.success(
-            "Training complete | accuracy={:.4f} f1_weighted={:.4f} pr_auc_weighted={:.4f} leakage_flags={} metrics={} model={}",
+            "Training complete | accuracy={:.4f} f1_macro={:.4f} f1_weighted={:.4f} pr_auc_weighted={:.4f} leakage_flags={} metrics={} model={}",
             accuracy,
+            f1_macro,
             f1_weighted,
             pr_auc_weighted,
             len(leakage_payload.get("leakage_flags", [])),

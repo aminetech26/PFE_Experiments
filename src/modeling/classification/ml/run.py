@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import yaml
@@ -37,7 +38,11 @@ def _resolve_active_model(config: dict) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--model", default=None)
-    known_args, _ = parser.parse_known_args()
+    known_args, remaining_args = parser.parse_known_args()
+
+    # Remove dispatcher-only --model argument before delegating to model entrypoints,
+    # because model-specific parsers do not accept this flag.
+    sys.argv = [sys.argv[0], *remaining_args]
 
     config = _load_model_config()
     active_model = str(known_args.model or _resolve_active_model(config))

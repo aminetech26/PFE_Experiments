@@ -67,23 +67,33 @@ def label_shuffle_test(
         shuffle_scores.append(float(score_fn(y_val, y_pred_shuffle)))
 
     mean_shuffle = float(np.mean(shuffle_scores))
-    is_leaking = mean_shuffle > 0.5 * real_score
+    ratio = float(mean_shuffle / real_score) if real_score > 0 else float("inf")
+    gap = float(real_score - mean_shuffle)
+    is_leaking = (ratio >= 0.8) or (gap <= 0.03)
 
     result = {
         "metric": metric,
         "real_score": real_score,
         "mean_shuffle_score": mean_shuffle,
+        "shuffle_to_real_ratio": ratio,
+        "real_minus_shuffle_gap": gap,
         "is_leaking": is_leaking,
     }
     if is_leaking:
         logger.warning(
-            "LEAKAGE ALERT (Label Shuffle): real={:.3f}, shuffle={:.3f} (unexpectedly high!)",
+            "LEAKAGE ALERT (Label Shuffle): real={:.3f}, shuffle={:.3f}, ratio={:.3f}, gap={:.3f}",
             real_score,
             mean_shuffle,
+            ratio,
+            gap,
         )
     else:
         logger.success(
-            "Label Shuffle OK: real={:.3f}, shuffle={:.3f}", real_score, mean_shuffle
+            "Label Shuffle OK: real={:.3f}, shuffle={:.3f}, ratio={:.3f}, gap={:.3f}",
+            real_score,
+            mean_shuffle,
+            ratio,
+            gap,
         )
     return result
 
@@ -316,7 +326,7 @@ def run_leakage_report(
     feature_names: list[str],
     X_eval: np.ndarray | None = None,
     y_eval: np.ndarray | None = None,
-    metric: str = "f1_weighted",
+    metric: str = "f1_macro",
 ) -> dict:
     """
     Run leakage checks and return a combined report suitable for MLflow logging.
@@ -345,8 +355,15 @@ def run_leakage_report(
 
     # 3. Sanity check + bootstrap on the true eval set
     y_pred_eval = model.predict(x_eval_eff)
-    eval_f1 = f1_score(y_eval_eff, y_pred_eval, average="weighted", zero_division=0)
-    report["sanity_check"] = performance_sanity_check("eval_f1_weighted", eval_f1)
+    if metric == "f1_weighted":
+        eval_score = f1_score(y_eval_eff, y_pred_eval, average="weighted", zero_division=0)
+    elif metric == "f1_macro":
+        eval_score = f1_score(y_eval_eff, y_pred_eval, average="macro", zero_division=0)
+    elif metric == "f1_binary":
+        eval_score = f1_score(y_eval_eff, y_pred_eval, average="binary", zero_division=0)
+    else:
+        eval_score = f1_score(y_eval_eff, y_pred_eval, average="macro", zero_division=0)
+    report["sanity_check"] = performance_sanity_check(f"eval_{metric}", eval_score)
     report["bootstrap_ci"] = bootstrap_confidence_interval(y_eval_eff, y_pred_eval, metric=metric)
 
     flags = [k for k, v in report.items() if isinstance(v, dict) and v.get("is_leaking", False)]
