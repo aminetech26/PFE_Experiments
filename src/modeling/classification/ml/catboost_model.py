@@ -94,6 +94,13 @@ def run_catboost(config: dict | None = None) -> None:
     parser.add_argument("--show-thread-plan", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--skip-leakage-checks", action="store_true")
+    parser.add_argument(
+        "--optuna-storage",
+        default="memory",
+        choices=["google_drive", "local", "memory"],
+        help="Optuna study storage: google_drive (Colab path), "
+        "local (sqlite:///experiments/optuna/), memory (in-memory, default)",
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -124,6 +131,16 @@ def run_catboost(config: dict | None = None) -> None:
     hpo_sampler = str(hpo_cfg.get("sampler", "tpe"))
     hpo_pruner = hpo_cfg.get("pruner", "none")
     hpo_storage = hpo_cfg.get("storage_url", None)
+    # Resolve storage URL based on --optuna-storage flag
+    _optuna_storage_url: str | None = None
+    if args.optuna_storage == "google_drive":
+        _optuna_storage_url = str(hpo_storage) if hpo_storage else None
+    elif args.optuna_storage == "local":
+        _local_db_dir = PROJECT_ROOT / "experiments" / "optuna"
+        _local_db_dir.mkdir(parents=True, exist_ok=True)
+        _optuna_storage_url = f"sqlite:///{_local_db_dir / 'optuna_catboost.db'}"
+    elif args.optuna_storage == "memory":
+        _optuna_storage_url = None
     hpo_study_prefix = build_study_name_prefix(
         str(hpo_cfg.get("study_name_prefix", "classification_ml")),
         "catboost",
@@ -212,7 +229,8 @@ def run_catboost(config: dict | None = None) -> None:
                 "optuna_n_trials_executed": 0 if args.no_optuna else int(n_trials),
                 "optuna_sampler": hpo_sampler,
                 "optuna_pruner": str(hpo_pruner),
-                "optuna_storage_enabled": bool(hpo_storage),
+                "optuna_storage_enabled": bool(_optuna_storage_url),
+                "optuna_storage_mode": args.optuna_storage,
                 "cpu_logical_cores": int(threading_plan["cpu_logical_cores"]),
                 "cpu_physical_cores": int(threading_plan["cpu_physical_cores"])
                 if threading_plan["cpu_physical_cores"]
@@ -281,7 +299,7 @@ def run_catboost(config: dict | None = None) -> None:
                 timeout_seconds=int(hpo_timeout) if hpo_timeout is not None else None,
                 sampler_name=hpo_sampler,
                 pruner_name=str(hpo_pruner) if hpo_pruner is not None else None,
-                storage_url=str(hpo_storage) if hpo_storage else None,
+                storage_url=_optuna_storage_url,
                 study_name=f"{hpo_study_prefix}_{args.dataset}_{args.split_path}_{effective_profile}",
                 load_if_exists=True,
             )
