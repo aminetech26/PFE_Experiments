@@ -104,6 +104,32 @@ def prepare_xy(
     return x_data, y_data
 
 
+def compute_per_class_confusion_stats(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    classes: np.ndarray,
+) -> dict[str, dict[str, float]]:
+    """Compute per-class TP, FP, TN, FN from the confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(classes)))
+    total = int(np.sum(cm))
+    per_class: dict[str, dict[str, float]] = {}
+    for idx, cls in enumerate(classes):
+        tp = int(cm[idx, idx])
+        fp = int(np.sum(cm[:, idx])) - tp
+        fn = int(np.sum(cm[idx, :])) - tp
+        tn = total - tp - fp - fn
+        per_class[str(cls)] = {
+            "TP": tp,
+            "FP": fp,
+            "TN": tn,
+            "FN": fn,
+            "precision": round(tp / (tp + fp), 6) if (tp + fp) > 0 else 0.0,
+            "recall": round(tp / (tp + fn), 6) if (tp + fn) > 0 else 0.0,
+            "f1_score": round(2 * tp / (2 * tp + fp + fn), 6) if (2 * tp + fp + fn) > 0 else 0.0,
+        }
+    return per_class
+
+
 def compute_pr_auc_multiclass(
     y_true_encoded: np.ndarray,
     y_proba: np.ndarray,
@@ -216,6 +242,7 @@ def write_classification_contract_artifacts(
     classification_report_payload: dict[str, Any],
     features_manifest_payload: dict[str, Any],
     calibration_payload: dict[str, Any] | None = None,
+    per_class_cm_stats: dict[str, dict[str, float]] | None = None,
 ) -> None:
     global_metrics: dict[str, Any] = {
         "accuracy": summary_metrics.get("accuracy"),
@@ -245,13 +272,21 @@ def write_classification_contract_artifacts(
     for cls in classes:
         key = str(cls)
         report_entry = classification_report_payload.get(key, {})
-        per_class[key] = {
+        entry: dict[str, Any] = {
             "support": report_entry.get("support"),
             "precision": report_entry.get("precision"),
             "recall": report_entry.get("recall"),
             "f1_score": report_entry.get("f1-score"),
             "pr_auc": pr_auc_by_class.get(key),
         }
+        if per_class_cm_stats and key in per_class_cm_stats:
+            entry.update({
+                "TP": per_class_cm_stats[key].get("TP"),
+                "FP": per_class_cm_stats[key].get("FP"),
+                "TN": per_class_cm_stats[key].get("TN"),
+                "FN": per_class_cm_stats[key].get("FN"),
+            })
+        per_class[key] = entry
 
     run_manifest = build_run_manifest(
         task=str(args.task),

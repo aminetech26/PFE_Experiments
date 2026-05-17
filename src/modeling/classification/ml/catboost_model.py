@@ -22,6 +22,7 @@ from src.modeling.classification.ml.common import (
     build_probability_calibration_payload,
     build_study_name_prefix,
     compute_classification_metrics,
+    compute_per_class_confusion_stats,
     default_comparison_records_path,
     fit_probability_calibrator,
     load_model_config,
@@ -323,6 +324,9 @@ def run_catboost(config: dict | None = None) -> None:
             test_pred_proba,
             encoder.classes_,
         )
+        per_class_cm_stats = compute_per_class_confusion_stats(
+            y_test, test_pred, encoder.classes_
+        )
         accuracy = summary_metrics["accuracy"]
         f1_weighted = summary_metrics["f1_weighted"]
         f1_macro = summary_metrics["f1_macro"]
@@ -346,6 +350,7 @@ def run_catboost(config: dict | None = None) -> None:
             "class_weighting_mode": "native_auto_balanced",
             "metrics": summary_metrics,
             "pr_auc_by_class": pr_auc_by_class,
+            "per_class_confusion_stats": per_class_cm_stats,
             "best_params": best_params,
             "classification_report": report,
         }
@@ -415,6 +420,7 @@ def run_catboost(config: dict | None = None) -> None:
             classification_report_payload=report,
             features_manifest_payload=manifest,
             calibration_payload=calibration_payload,
+            per_class_cm_stats=per_class_cm_stats,
         )
 
         model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -469,6 +475,14 @@ def run_catboost(config: dict | None = None) -> None:
             mlflow.log_metric("test_pr_auc_weighted", pr_auc_weighted)
         for class_name, class_pr_auc in pr_auc_by_class.items():
             mlflow.log_metric(f"test_pr_auc_class_{class_name}", class_pr_auc)
+        for class_name, class_stats in per_class_cm_stats.items():
+            mlflow.log_metric(f"test_f1_class_{class_name}", class_stats["f1_score"])
+            mlflow.log_metric(f"test_precision_class_{class_name}", class_stats["precision"])
+            mlflow.log_metric(f"test_recall_class_{class_name}", class_stats["recall"])
+            mlflow.log_metric(f"test_TP_class_{class_name}", float(class_stats["TP"]))
+            mlflow.log_metric(f"test_FP_class_{class_name}", float(class_stats["FP"]))
+            mlflow.log_metric(f"test_TN_class_{class_name}", float(class_stats["TN"]))
+            mlflow.log_metric(f"test_FN_class_{class_name}", float(class_stats["FN"]))
         if calibration_payload is not None:
             cal_metrics = calibration_payload.get("metrics", {})
             mlflow.log_metrics(
@@ -520,6 +534,9 @@ def run_catboost(config: dict | None = None) -> None:
             "test_recall_weighted": summary_metrics["recall_weighted"],
             "test_recall_macro": summary_metrics["recall_macro"],
             "test_pr_auc_weighted": pr_auc_weighted,
+            "per_class_f1": {k: v["f1_score"] for k, v in per_class_cm_stats.items()},
+            "per_class_precision": {k: v["precision"] for k, v in per_class_cm_stats.items()},
+            "per_class_recall": {k: v["recall"] for k, v in per_class_cm_stats.items()},
             "leakage_flag_count": len(leakage_payload.get("leakage_flags", [])),
             "leakage_is_clean": bool(leakage_payload.get("is_clean", False)),
             "duplicate_precheck_overlaps": int(duplicate_precheck.get("overlapping_samples", 0)),
