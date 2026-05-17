@@ -438,17 +438,16 @@ class _PrefitEstimator(ClassifierMixin, BaseEstimator):
     """Wraps a fitted model so CalibratedClassifierCV never refits it.
 
     sklearn >= 1.4 removed cv='prefit'. CalibratedClassifierCV with an iterable cv
-    still clones and calls .fit() on each fold's train split. This wrapper makes
-    .fit() a no-op while forwarding predict_proba to the original fitted model,
-    so the calibrator is fitted on val probabilities without touching the base model.
-
-    Inheriting BaseEstimator provides __sklearn_tags__ (required by sklearn 1.8+)
-    and the standard get_params/set_params via __init__ introspection.
-    ClassifierMixin sets estimator_type='classifier' so is_classifier() returns True.
+    clones the estimator before calling .fit(). __sklearn_clone__ returns self so the
+    original fitted model is preserved through cloning. .fit() is a no-op; predict_proba
+    delegates to the wrapped model, giving the calibrator valid probabilities on val data.
     """
 
     def __init__(self, fitted_model=None):
         self.fitted_model = fitted_model
+
+    def __sklearn_clone__(self):
+        return self
 
     def fit(self, X, y, **kwargs):
         return self
