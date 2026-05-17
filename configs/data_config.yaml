@@ -113,7 +113,8 @@ paths:
       eda_findings_path: "data/interim/eda/costa/eda_feature_findings.json"
 
       splits:
-        evaluable_classes:  [1, 2, 3, 4]   # all four fault types — integer labels
+        evaluable_classes:  [0, 1, 2, 3, 4]   # 0=Normal (reject option gate) + four fault types
+        normal_class_max_samples: 2000          # downsample normal in train only; null = no cap
         train_only_classes: []
         segmentation_gap_seconds: 300
         atomic_group_col: episode_id

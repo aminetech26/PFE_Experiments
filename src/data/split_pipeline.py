@@ -528,6 +528,23 @@ def run_classification_split(
     val_filtered = filter_to_evaluable_classes(artifacts.val, evaluable_classes)
     test_filtered = filter_to_evaluable_classes(artifacts.test, evaluable_classes)
 
+    # Downsample normal class (label 0) in train only — cap to normal_class_max_samples.
+    # Val/test keep all normal rows for unbiased evaluation. Temporal order is preserved
+    # (head rather than random sample) to respect the time-series structure.
+    normal_class_max = dataset_split_cfg.get("normal_class_max_samples", None)
+    normal_label = 0
+    if normal_class_max is not None and normal_label in evaluable_classes:
+        normal_mask = train_filtered["label"] == normal_label
+        n_normal = normal_mask.sum()
+        if n_normal > normal_class_max:
+            normal_rows = train_filtered[normal_mask].head(int(normal_class_max))
+            train_filtered = pd.concat(
+                [train_filtered[~normal_mask], normal_rows], ignore_index=True
+            ).sort_values("timestamp").reset_index(drop=True)
+            logger.info(
+                "Normal class downsampled in train: {} → {} rows", n_normal, len(normal_rows)
+            )
+
     output_dir = output_base / "classification"
     output_dir.mkdir(parents=True, exist_ok=True)
 

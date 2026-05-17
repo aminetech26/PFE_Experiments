@@ -252,7 +252,7 @@ classification:
       validation_mode: holdout      # holdout | segment_temporal_cv
       sampler: tpe                  # ML policy default
       pruner: none                  # ML policy: no pruner
-      study_name_prefix: classification_ml
+      study_name_prefix: classification_ml_macro
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
       n_trials_phase1: 50
       timeout_seconds: null

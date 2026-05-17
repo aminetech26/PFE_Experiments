@@ -433,8 +433,44 @@ def resolve_calibration_config(config: dict) -> dict:
     }
 
 
+class _PrefitEstimator:
+    """Wraps a fitted model so CalibratedClassifierCV never refits it.
+
+    sklearn >= 1.4 removed cv='prefit'. CalibratedClassifierCV with an iterable cv
+    still clones and calls .fit() on each fold's train split. This wrapper makes
+    .fit() a no-op while forwarding predict_proba to the original fitted model,
+    so the calibrator is fitted on val probabilities without touching the base model.
+    """
+
+    def __init__(self, fitted_model=None):
+        self.fitted_model = fitted_model
+
+    def get_params(self, deep: bool = True) -> dict:
+        return {"fitted_model": self.fitted_model}
+
+    def set_params(self, **params):
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+    def fit(self, X, y, **kwargs):
+        return self
+
+    def predict_proba(self, X):
+        return self.fitted_model.predict_proba(X)
+
+    @property
+    def classes_(self):
+        return self.fitted_model.classes_
+
+
 def fit_probability_calibrator(base_model, x_val: pd.DataFrame, y_val: np.ndarray, method: str):
-    calibrated = CalibratedClassifierCV(estimator=base_model, method=method, cv="prefit")
+    # sklearn >= 1.4 removed cv='prefit'. We wrap the fitted model in _PrefitEstimator
+    # so clone()+fit() is a no-op, then pass all val data as a single calibration fold.
+    n = len(x_val)
+    prefit_cv = [(np.array([], dtype=np.intp), np.arange(n, dtype=np.intp))]
+    wrapper = _PrefitEstimator(fitted_model=base_model)
+    calibrated = CalibratedClassifierCV(estimator=wrapper, method=method, cv=prefit_cv)
     calibrated.fit(x_val, y_val)
     return calibrated
 
