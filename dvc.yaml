@@ -174,3 +174,29 @@ stages:
           cache: false
     outs:
       - experiments/checkpoints/hybrid/hybrid_best.pt
+
+  # Stage 11: GTBAD Plus-Physics Preprocessing
+  preprocess_gtbad_plus_physics:
+    cmd: uv run python -m src.data.preprocess_gtbad_plus_physics
+    deps:
+      - src/data/preprocess_gtbad_plus_physics.py
+      - src/data/features.py
+      - data/interim/ingestion/costa/costa_merged.parquet
+    outs:
+      - data/processed/preprocessed/costa_gtbad_pp/gtbad_pp_data.npz
+      - data/processed/preprocessed/costa_gtbad_pp/gtbad_pp_metadata.json
+
+  # Stage 12: GTBAD Plus-Physics Training
+  train_gtbad_plus_physics:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_plus_physics
+    deps:
+      - src/modeling/anomaly_detection/dl/train_gtbad_plus_physics.py
+      - src/modeling/anomaly_detection/dl/gtbad_model.py
+      - src/modeling/anomaly_detection/dl/gvsao.py
+      - data/processed/preprocessed/costa_gtbad_pp/gtbad_pp_data.npz
+      - data/processed/preprocessed/costa_gtbad_pp/gtbad_pp_metadata.json
+    metrics:
+      - experiments/metrics/gtbad_plus_physics_results.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/gtbad_plus_physics/gtbad_pp_best.pt
