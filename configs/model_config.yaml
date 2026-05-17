@@ -106,7 +106,7 @@ anomaly_detection:
         dropout: 0.1
         k: 3.0
         temperature: 50
-        train_stride: 1
+        train_stride: 5
         eval_stride: 1
         score_reduction: max
         scaling: standard
@@ -116,7 +116,7 @@ anomaly_detection:
           dropout:           {type: float, low: 0.0, high: 0.25}
           k:                 {type: float, low: 2.0, high: 6.0}
           temperature:       {type: categorical, choices: [10, 25, 50, 100]}
-          batch_size:        {type: categorical, choices: [128, 256]}
+          batch_size:        {type: categorical, choices: [512, 1024, 2048]}
           gradient_clip_val: {type: categorical, choices: [0.5, 1.0, 2.0]}
         hpo_stage2:
           win_size:     {type: categorical, choices: [30, 60, 90, 120]}
@@ -130,7 +130,7 @@ anomaly_detection:
 
       dlssm:
         win_size: 60
-        train_stride: 1
+        train_stride: 5
         eval_stride: 1
         hidden_dim: 128
         latent_dim: 32
@@ -172,7 +172,7 @@ anomaly_detection:
         lambda_pred_score: 0.1
         score_reduction: max
 
-        batch_size: 256
+        batch_size: 1024
         learning_rate: 1.0e-3
         weight_decay: 1.0e-5
         gradient_clip_val: 1.0
@@ -271,7 +271,7 @@ training:
   min_lr_ratio: 0.01
   max_epochs: 100
   patience: 10             # early stopping
-  batch_size: 256
+  batch_size: 1024
   gradient_clip_val: 1.0
   accelerator: auto
   devices: auto
@@ -281,7 +281,7 @@ training:
     reserve_cores: 1
     max_threads: null
     optuna_parallel_trials: 1
-    dl_num_workers: auto
+    dl_num_workers: 16
     dl_pin_memory: auto
     dl_persistent_workers: true
-    dl_prefetch_factor: 2
+    dl_prefetch_factor: 4
