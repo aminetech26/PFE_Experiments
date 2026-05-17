@@ -56,7 +56,7 @@ class EncoderLayer(nn.Module):
 
     def forward(
         self, x: torch.Tensor, attn_mask=None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Attention branch
         new_x, series, prior, sigma = self.attention(x, x, x)
 
@@ -76,7 +76,7 @@ class EncoderLayer(nn.Module):
         y = self.dropout(self.conv2(y).transpose(-1, 1))
         x = self.norm2(x + y)
 
-        return x, series, prior, sigma
+        return x, series, prior, sigma, gate
 
 
 class Encoder(nn.Module):
@@ -86,14 +86,15 @@ class Encoder(nn.Module):
 
     def forward(
         self, x: torch.Tensor, attn_mask=None
-    ) -> tuple[torch.Tensor, list, list, list]:
-        series_list, prior_list, sigma_list = [], [], []
+    ) -> tuple[torch.Tensor, list, list, list, list]:
+        series_list, prior_list, sigma_list, gate_list = [], [], [], []
         for layer in self.layers:
-            x, series, prior, sigma = layer(x, attn_mask=attn_mask)
+            x, series, prior, sigma, gate = layer(x, attn_mask=attn_mask)
             series_list.append(series)
             prior_list.append(prior)
             sigma_list.append(sigma)
-        return x, series_list, prior_list, sigma_list
+            gate_list.append(gate)
+        return x, series_list, prior_list, sigma_list, gate_list
 
 
 class MambaAnomalyTransformer(nn.Module):
@@ -150,9 +151,9 @@ class MambaAnomalyTransformer(nn.Module):
 
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, list, list, list]:
+    ) -> tuple[torch.Tensor, list, list, list, list]:
         # x: [B, W, F]
         enc_out = self.enc_embedding(x)  # [B, W, d_model]
-        enc_out, series_list, prior_list, sigma_list = self.encoder(enc_out)
+        enc_out, series_list, prior_list, sigma_list, gate_list = self.encoder(enc_out)
         dec_out = self.projection(enc_out)  # [B, W, F]
-        return dec_out, series_list, prior_list, sigma_list
+        return dec_out, series_list, prior_list, sigma_list, gate_list

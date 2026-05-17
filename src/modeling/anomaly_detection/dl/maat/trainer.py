@@ -349,17 +349,19 @@ class MAATLightningModule(pl.LightningModule):
         self._val_labels_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
         self._val_group_ids_np: np.ndarray | None = None
+        self._val_gate_raw: dict[str, list[float]] | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_product_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
         self._test_original_labels_np: np.ndarray | None = None
         self._test_group_ids_np: np.ndarray | None = None
+        self._test_gate_raw: dict[str, list[float]] | None = None
         self._nan_count: int = 0
 
     def _compute_step(
         self, x: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        x_hat, series_list, prior_list, _ = self.model(x)
+        x_hat, series_list, prior_list, _, _ = self.model(x)
         rec_loss = nn.functional.mse_loss(x_hat, x)
         s_loss, p_loss = association_losses(series_list, prior_list)
         loss1 = rec_loss - self.k * s_loss
@@ -450,7 +452,7 @@ class MAATLightningModule(pl.LightningModule):
             original_labels = labels
             group_ids = None
         with torch.no_grad():
-            x_hat, series_list, prior_list, _ = self.model(x)
+            x_hat, series_list, prior_list, _, gate_list = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
@@ -461,6 +463,13 @@ class MAATLightningModule(pl.LightningModule):
         rec_loss = nn.functional.mse_loss(x_hat, x)
         s_loss, p_loss = association_losses(series_list, prior_list)
 
+        # Per-layer gate statistics for diagnostic logging
+        gate_stats = {}
+        for i, g in enumerate(gate_list):
+            gate_stats[f"gate_{i}_mean"] = float(g.mean().item())
+            gate_stats[f"gate_{i}_above_05"] = float((g > 0.5).float().mean().item())
+            gate_stats[f"gate_{i}_std"] = float(g.std().item())
+
         self._val_outputs.append({
             "scores": center_scores,
             "product_scores": product_window_scores.cpu(),
@@ -470,6 +479,7 @@ class MAATLightningModule(pl.LightningModule):
             "rec_loss": rec_loss.item(),
             "s_loss": s_loss.item(),
             "p_loss": p_loss.item(),
+            "gate_stats": gate_stats,
         })
 
     def on_validation_epoch_end(self) -> None:
@@ -489,6 +499,18 @@ class MAATLightningModule(pl.LightningModule):
         mean_rec = float(np.mean([o["rec_loss"] for o in self._val_outputs]))
         mean_s = float(np.mean([o["s_loss"] for o in self._val_outputs]))
         mean_p = float(np.mean([o["p_loss"] for o in self._val_outputs]))
+
+        # Aggregate gate statistics across all validation batches
+        all_gate_keys = {k for o in self._val_outputs for k in (o.get("gate_stats") or {})}
+        aggregated_gate = {}
+        raw_gate: dict[str, list[float]] = {}
+        for key in sorted(all_gate_keys):
+            values = [o["gate_stats"][key] for o in self._val_outputs if key in (o.get("gate_stats") or {})]
+            if values:
+                aggregated_gate[key] = float(np.mean(values))
+                raw_gate[key] = values
+        self._val_gate_raw = raw_gate
+
         self._val_outputs.clear()
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
@@ -571,6 +593,9 @@ class MAATLightningModule(pl.LightningModule):
         self.log("val_series_kl", mean_s)
         self.log("val_prior_kl", mean_p)
 
+        for key, val in aggregated_gate.items():
+            self.log(f"val_{key}", val)
+
     def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         if len(batch) == 4:
             x, labels, original_labels, group_ids = batch
@@ -582,18 +607,26 @@ class MAATLightningModule(pl.LightningModule):
             original_labels = labels
             group_ids = None
         with torch.no_grad():
-            x_hat, series_list, prior_list, _ = self.model(x)
+            x_hat, series_list, prior_list, _, gate_list = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         product_window_scores = self._reduce_scores(product_scores)
         window_scores = product_window_scores
+
+        gate_stats = {}
+        for i, g in enumerate(gate_list):
+            gate_stats[f"gate_{i}_mean"] = float(g.mean().item())
+            gate_stats[f"gate_{i}_above_05"] = float((g > 0.5).float().mean().item())
+            gate_stats[f"gate_{i}_std"] = float(g.std().item())
+
         self._test_outputs.append({
             "scores": window_scores.cpu(),
             "product_scores": product_window_scores.cpu(),
             "labels": labels.cpu(),
             "original_labels": original_labels.cpu(),
             "group_ids": list(group_ids) if group_ids is not None else None,
+            "gate_stats": gate_stats,
         })
 
     def on_test_epoch_end(self) -> None:
@@ -610,6 +643,16 @@ class MAATLightningModule(pl.LightningModule):
                 [gid for o in self._test_outputs for gid in (o.get("group_ids") or [])],
                 dtype=object,
             )
+        all_gate_keys = {k for o in self._test_outputs for k in (o.get("gate_stats") or {})}
+        test_aggregated_gate = {}
+        test_raw_gate: dict[str, list[float]] = {}
+        for key in sorted(all_gate_keys):
+            values = [o["gate_stats"][key] for o in self._test_outputs if key in (o.get("gate_stats") or {})]
+            if values:
+                test_aggregated_gate[key] = float(np.mean(values))
+                test_raw_gate[key] = values
+        self._test_gate_raw = test_raw_gate
+
         self._test_outputs.clear()
 
         all_scores = all_product_scores
@@ -647,10 +690,13 @@ class MAATLightningModule(pl.LightningModule):
         self.log("test_pv_maat_precision", test_prec)
         self.log("test_pv_maat_recall", test_rec)
 
+        for key, val in test_aggregated_gate.items():
+            self.log(f"test_{key}", val)
+
     @torch.no_grad()
     def score_windows(self, x: torch.Tensor) -> torch.Tensor:
         """Score a batch of windows [B, W, F] → anomaly scores [B]."""
-        x_hat, series_list, prior_list, _ = self.model(x)
+        x_hat, series_list, prior_list, _, _ = self.model(x)
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         product = self._reduce_scores(product_scores).detach().cpu().numpy()
@@ -742,6 +788,36 @@ def _save_score_timeline(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=100)
+    plt.close(fig)
+
+
+def _save_gate_histogram(
+    gate_layers: dict[str, list[float]],
+    path: Path,
+) -> None:
+    """Histogram of per-layer gate means across validation batches.
+
+    A gate mean near 0 → Mamba branch ignored at that layer.
+    A gate mean near 1 → Attention branch ignored at that layer.
+    A gate mean near 0.5 with spread → both branches actively used.
+    """
+    layer_keys = sorted(k for k in gate_layers if k.endswith("_mean"))
+    if not layer_keys:
+        return
+    n_layers = len(layer_keys)
+    fig, axes = plt.subplots(1, n_layers, figsize=(5 * n_layers, 4), squeeze=False)
+    for idx, key in enumerate(layer_keys):
+        ax = axes[0, idx]
+        ax.hist(gate_layers[key], bins=30, alpha=0.7, color="steelblue", edgecolor="white")
+        mean_val = float(np.mean(gate_layers[key]))
+        ax.axvline(mean_val, color="red", linestyle="--", linewidth=1.5, label=f"Mean={mean_val:.3f}")
+        ax.set_xlabel("Gate mean")
+        ax.set_ylabel("Batch count")
+        ax.set_title(key)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
     plt.close(fig)
 
 
@@ -1377,6 +1453,8 @@ def run_maat(config: dict | None = None) -> None:
         "n_features": n_features,
         "fit_time_s": round(fit_time, 2),
         "nan_count": final_lit._nan_count,
+        "val_gate_stats": (final_lit._val_gate_raw or {}).copy(),
+        "test_gate_stats": (final_lit._test_gate_raw or {}).copy(),
     }
     run_name = f"anomaly_maat_{ts}"
 
@@ -1391,6 +1469,7 @@ def run_maat(config: dict | None = None) -> None:
     pr_curve_path = artifacts_dir / "pr_curve.png"
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
+    gate_histogram_path = artifacts_dir / "gate_histogram.png"
     manifest_path = artifacts_dir / "features_manifest.json"
     calibration_path = artifacts_dir / "score_calibration.json"
 
@@ -1471,6 +1550,8 @@ def run_maat(config: dict | None = None) -> None:
     _save_pr_curve(val_scores, val_labels, test_scores, test_labels, pr_curve_path)
     _save_score_histogram(val_scores, val_labels, threshold, histogram_path)
     _save_score_timeline(test_scores, test_labels, threshold, timeline_path)
+    if final_lit._val_gate_raw is not None:
+        _save_gate_histogram(final_lit._val_gate_raw, gate_histogram_path)
 
     logger.info(
         "Final MAAT score uses '{}' over components={} (tau={})",
@@ -1523,6 +1604,7 @@ def run_maat(config: dict | None = None) -> None:
                 pr_curve_path,
                 histogram_path,
                 timeline_path,
+                gate_histogram_path,
                 manifest_path,
                 calibration_path,
             ):
