@@ -35,17 +35,22 @@ class EncoderLayer(nn.Module):
         d_ff: int,
         dropout: float = 0.0,
         activation: str = "gelu",
+        gate_mode: str = "learned",
     ) -> None:
         super().__init__()
         self.attention = attention
         self.dropout = nn.Dropout(dropout)
+        self.gate_mode = gate_mode
 
         # Mamba SSM branch — Lightning handles device placement, no .to("cuda")
         self.mamba_block = _build_mamba_block(d_model)
 
         # Gate: fuse Mamba output (x_skip) and attention output (x_attn)
         # gate = sigmoid(Linear(cat([x_skip, x_attn], dim=-1)))
-        self.gate_linear = nn.Linear(2 * d_model, d_model)
+        # Only instantiated when gate_mode == "learned"
+        self.gate_linear: nn.Linear | None = (
+            nn.Linear(2 * d_model, d_model) if gate_mode == "learned" else None
+        )
 
         # FFN: Conv1d 1×1 (equivalent to position-wise linear)
         self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
@@ -64,9 +69,16 @@ class EncoderLayer(nn.Module):
         # Mamba expects [B, L, D] — which is exactly our x shape
         x_skip = self.mamba_block(x)  # [B, W, d_model]
 
-        # Gated fusion: gate ⊙ x_skip + (1-gate) ⊙ new_x
-        gate = torch.sigmoid(self.gate_linear(torch.cat([x_skip, new_x], dim=-1)))
-        fused = gate * x_skip + (1.0 - gate) * new_x
+        # Gated fusion based on gate_mode
+        if self.gate_mode == "attention_only":
+            gate = torch.zeros_like(x_skip)
+            fused = new_x
+        elif self.gate_mode == "mamba_only":
+            gate = torch.ones_like(x_skip)
+            fused = x_skip
+        else:
+            gate = torch.sigmoid(self.gate_linear(torch.cat([x_skip, new_x], dim=-1)))
+            fused = gate * x_skip + (1.0 - gate) * new_x
 
         # Residual + LayerNorm
         x = self.norm1(x + self.dropout(fused))
@@ -110,6 +122,7 @@ class MambaAnomalyTransformer(nn.Module):
         dropout: float = 0.1,
         activation: str = "gelu",
         block_size: int = 10,
+        gate_mode: str = "learned",
     ) -> None:
         super().__init__()
         assert win_size % block_size == 0, (
@@ -142,6 +155,7 @@ class MambaAnomalyTransformer(nn.Module):
                     d_ff=d_ff,
                     dropout=dropout,
                     activation=activation,
+                    gate_mode=gate_mode,
                 )
                 for _ in range(e_layers)
             ]

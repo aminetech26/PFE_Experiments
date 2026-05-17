@@ -869,6 +869,7 @@ def _build_model(maat_cfg: dict, n_features: int) -> MambaAnomalyTransformer:
         d_ff=int(maat_cfg["d_ff"]),
         dropout=float(maat_cfg["dropout"]),
         block_size=int(maat_cfg["block_size"]),
+        gate_mode=str(maat_cfg.get("gate_mode", "learned")),
     )
 
 

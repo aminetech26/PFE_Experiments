@@ -110,6 +110,7 @@ anomaly_detection:
         eval_stride: 1
         score_reduction: max
         scaling: standard
+        gate_mode: learned          # learned | attention_only | mamba_only
         hpo_stage1:
           learning_rate:     {type: float, low: 5.0e-5, high: 8.0e-4, log: true}
           weight_decay:      {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
@@ -281,7 +282,7 @@ training:
     reserve_cores: 1
     max_threads: null
     optuna_parallel_trials: 1
-    dl_num_workers: 16
+    dl_num_workers: 12
     dl_pin_memory: auto
     dl_persistent_workers: true
     dl_prefetch_factor: 4
