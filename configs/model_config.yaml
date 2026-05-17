@@ -257,7 +257,7 @@ classification:
       n_trials_phase1: 50
       timeout_seconds: null
 
-  primary_metric: f1_weighted
+  primary_metric: f1_macro
 
 # ============================================================================
 # TRAINING

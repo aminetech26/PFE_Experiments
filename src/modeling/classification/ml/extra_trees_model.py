@@ -254,7 +254,7 @@ def run_extra_trees(config: dict | None = None) -> None:
                                 f1_score(
                                     y_cv[fold_val_idx],
                                     fold_pred,
-                                    average="weighted",
+                                    average="macro",
                                     zero_division=0,
                                 )
                             )
@@ -264,7 +264,7 @@ def run_extra_trees(config: dict | None = None) -> None:
                 model = ExtraTreesClassifier(**model_params)
                 model.fit(x_train, y_train)
                 val_pred = model.predict(x_val)
-                return float(f1_score(y_val, val_pred, average="weighted", zero_division=0))
+                return float(f1_score(y_val, val_pred, average="macro", zero_division=0))
 
             best_base_params, study = run_optuna(
                 objective,
@@ -285,7 +285,7 @@ def run_extra_trees(config: dict | None = None) -> None:
                 seed=hpo_seed,
                 n_jobs=int(threading_plan["thread_budget"]),
             )
-            mlflow.log_metric("optuna_best_val_f1_weighted", float(study.best_value))
+            mlflow.log_metric("optuna_best_val_f1_macro", float(study.best_value))
             mlflow.log_params(
                 {
                     f"best_{k}": v

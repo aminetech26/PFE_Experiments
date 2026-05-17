@@ -466,7 +466,7 @@ def run_lightgbm(config: dict | None = None) -> None:
                                 f1_score(
                                     y_cv[fold_val_idx],
                                     fold_pred,
-                                    average="weighted",
+                                    average="macro",
                                     zero_division=0,
                                 )
                             )
@@ -476,7 +476,7 @@ def run_lightgbm(config: dict | None = None) -> None:
                 model = lgb.LGBMClassifier(**model_params)
                 model.fit(x_train, y_train)
                 val_pred = model.predict(x_val)
-                return float(f1_score(y_val, val_pred, average="weighted"))
+                return float(f1_score(y_val, val_pred, average="macro", zero_division=0))
 
             def on_trial_complete(study_obj, trial_obj):
                 logger.info(
@@ -509,7 +509,7 @@ def run_lightgbm(config: dict | None = None) -> None:
             )
             best_params["n_jobs"] = int(threading_plan["thread_budget"])
             best_params["num_threads"] = int(threading_plan["thread_budget"])
-            mlflow.log_metric("optuna_best_val_f1_weighted", float(study.best_value))
+            mlflow.log_metric("optuna_best_val_f1_macro", float(study.best_value))
             mlflow.log_params(
                 {
                     f"best_{k}": v

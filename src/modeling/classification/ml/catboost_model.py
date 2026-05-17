@@ -50,7 +50,7 @@ def _build_catboost_params(base: dict, seed: int, thread_count: int) -> dict:
     params.update(
         {
             "loss_function": "MultiClass",
-            "eval_metric": "TotalF1",
+            "eval_metric": "TotalF1:average=Macro",
             "auto_class_weights": "Balanced",
             "random_seed": int(seed),
             "thread_count": int(thread_count),
@@ -258,7 +258,7 @@ def run_catboost(config: dict | None = None) -> None:
                                 f1_score(
                                     y_cv[fold_val_idx],
                                     fold_pred,
-                                    average="weighted",
+                                    average="macro",
                                     zero_division=0,
                                 )
                             )
@@ -268,7 +268,7 @@ def run_catboost(config: dict | None = None) -> None:
                 model = CatBoostClassifier(**model_params)
                 model.fit(x_train, y_train, eval_set=(x_val, y_val), use_best_model=False)
                 val_pred = model.predict(x_val).astype(int).reshape(-1)
-                return float(f1_score(y_val, val_pred, average="weighted", zero_division=0))
+                return float(f1_score(y_val, val_pred, average="macro", zero_division=0))
 
             best_base_params, study = run_optuna(
                 objective,
@@ -289,7 +289,7 @@ def run_catboost(config: dict | None = None) -> None:
                 seed=hpo_seed,
                 thread_count=int(threading_plan["thread_budget"]),
             )
-            mlflow.log_metric("optuna_best_val_f1_weighted", float(study.best_value))
+            mlflow.log_metric("optuna_best_val_f1_macro", float(study.best_value))
             mlflow.log_params(
                 {
                     f"best_{k}": v
