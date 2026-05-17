@@ -5,7 +5,7 @@ import json
 import math
 from pathlib import Path
 
-_TASK_A_THRESHOLD_POLICY = "validation_pr_curve_f1"
+_TASK_A_THRESHOLD_POLICY = "validation_macro_fault_f1"
 _TASK_A_SCORE_DIRECTION = "higher_is_more_anomalous"
 
 
@@ -38,7 +38,7 @@ def _validate_task_a_operating_point(artifact_dir: Path, dm: dict) -> list[str]:
 
     Checks:
     - score_calibration.json exists and is referenced in the deployment manifest
-    - threshold_policy == "validation_pr_curve_f1"
+    - threshold_policy == "validation_macro_fault_f1"
     - score_direction == "higher_is_more_anomalous"
     - test_not_used_for_calibration is true
     - deployment_manifest.threshold matches score_calibration.threshold (within 1e-9)

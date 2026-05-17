@@ -127,9 +127,6 @@ anomaly_detection:
           d_ff:         {type: categorical, choices: [128, 256, 512]}
         # Single conditional study — replaces greedy two-stage when hpo.mode=conditional
         # n_trials = stage1_training + stage2_architecture (back-compat sum)
-        # warm_start_from: path to run dir or best_params.json; null = auto-detect latest
-        hpo_conditional:
-          warm_start_from: null
 
       dlssm:
         win_size: 60

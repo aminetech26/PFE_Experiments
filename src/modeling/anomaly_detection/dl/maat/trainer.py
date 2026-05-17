@@ -19,7 +19,6 @@ import torch.nn as nn
 import yaml
 from loguru import logger
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -36,7 +35,6 @@ from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.maat.losses import (
     association_losses,
-    compute_association_discrepancy,
     compute_maat_scores,
 )
 from src.modeling.anomaly_detection.dl.maat.model import MambaAnomalyTransformer
@@ -47,6 +45,10 @@ from src.modeling.common.artifact_contract import (
     compute_anomaly_per_class_metrics,
     write_json,
 )
+from src.modeling.common.conditional_search_space import (
+    normalize_conditional_params,
+    suggest_conditional_params,
+)
 from src.modeling.common.dl_training_utils import (
     _build_warmup_cosine_scheduler,
     _resolve_loader_runtime,
@@ -55,8 +57,6 @@ from src.modeling.common.dl_training_utils import (
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import HPOStageResult
-from src.modeling.common.conditional_search_space import suggest_conditional_params
-from src.modeling.anomaly_detection.dl.maat.warm_start import load_warm_start_params
 from src.utils.paths import get_experiments_root
 
 # trainer.py lives under dl/maat/, so PROJECT_ROOT is 5 levels up
@@ -65,6 +65,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[5]
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 torch.set_float32_matmul_precision("high")  # TF32 matmul on Ampere; fp32 accumulators preserved
 torch.backends.cudnn.benchmark = True       # fixed input shapes → cuDNN autotunes once and caches
+
+SELECTION_METRIC_NAME = "macro_fault_f1"
+THRESHOLD_POLICY_NAME = "validation_macro_fault_f1"
+OFFICIAL_SCORE_FUSION = "raw"
 
 
 def _hpo_config_fingerprint(maat_cfg: dict, hpo_cfg: dict, seed: int) -> str:
@@ -114,12 +118,6 @@ def _parse_args() -> argparse.Namespace:
             "Skips HPO entirely and merges these params directly into the final run. "
             'Example: \'{"learning_rate": 3.2e-4, "k": 4.77, "temperature": 10}\''
         ),
-    )
-    p.add_argument(
-        "--warm-start-from",
-        default=None,
-        help="Path to a run dir or best_params.json to warm-start HPO. "
-             "Null = auto-detect latest maat run.",
     )
     return p.parse_args()
 
@@ -204,36 +202,6 @@ def _episode_macro_f1_binary(
     return result
 
 
-def _zscore_from_val(val_scores: np.ndarray, test_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    mean = float(np.mean(val_scores))
-    std = float(np.std(val_scores))
-    if std <= 1e-12 or not math.isfinite(std):
-        std = 1.0
-    return (val_scores - mean) / std, (test_scores - mean) / std
-
-
-def _zscore_with_stats(scores: np.ndarray, mean: float, std: float) -> np.ndarray:
-    safe_std = std if std > 1e-12 and math.isfinite(std) else 1.0
-    return (scores - mean) / safe_std
-
-
-def _fit_normal_stats(scores: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
-    normal_scores = scores[labels == 0]
-    if len(normal_scores) == 0:
-        normal_scores = scores
-    mean = float(np.mean(normal_scores))
-    std = float(np.std(normal_scores))
-    if not math.isfinite(std) or std <= 1e-12:
-        std = 1.0
-    return mean, std
-
-
-def _logsumexp_multi(arrays: list[np.ndarray], tau: float = 1.0) -> np.ndarray:
-    stacked = np.stack([a / tau for a in arrays], axis=0)
-    max_vals = np.max(stacked, axis=0)
-    return tau * (max_vals + np.log(np.exp(stacked - max_vals).sum(axis=0)))
-
-
 def _macro_fault_pr_auc(
     original_labels: np.ndarray,
     scores: np.ndarray,
@@ -248,428 +216,70 @@ def _macro_fault_pr_auc(
     return float(np.mean(values)) if values else 0.0
 
 
-def _fit_logistic_meta_fusion(
-    val_parts: dict[str, np.ndarray],
-    test_parts: dict[str, np.ndarray],
-    val_labels: np.ndarray,
-    val_original_labels: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, dict] | None:
-    """Fit logistic meta-fusion with a fast Optuna HPO over C, class_weight, and component subset.
+def _fault_threshold_metrics(
+    original_labels: np.ndarray,
+    scores: np.ndarray,
+    threshold: float,
+) -> tuple[float, float, float]:
+    preds = (scores >= threshold).astype(int)
+    fault_f1_values: list[float] = []
+    fault_precision_values: list[float] = []
 
-    Objective: 0.85 * val_f1 + 0.15 * val_macro_fault_pr_auc (same as MAAT HPO).
-    All search is on val arrays only — test arrays are only scored with the winner.
-    """
-    all_components = [
-        name for name in ("mismatch_imbalance", "dc_voltage_drop", "product", "reconstruction", "drift_efficiency")
-        if name in val_parts and name in test_parts
-    ]
-    if len(all_components) < 2:
-        return None
+    for fault_label in sorted(float(x) for x in np.unique(original_labels) if float(x) != 0.0):
+        mask = (original_labels == fault_label) | (original_labels == 0)
+        labels_bin = (original_labels[mask] == fault_label).astype(int)
+        if labels_bin.sum() == 0 or labels_bin.sum() == len(labels_bin):
+            continue
+        preds_bin = preds[mask]
+        fault_f1_values.append(float(f1_score(labels_bin, preds_bin, zero_division=0)))
+        fault_precision_values.append(float(precision_score(labels_bin, preds_bin, zero_division=0)))
 
-    labels = np.asarray(val_labels, dtype=int)
-    if len(np.unique(labels)) < 2:
-        return None
+    macro_fault_f1 = float(np.mean(fault_f1_values)) if fault_f1_values else 0.0
+    worst_fault_precision = float(min(fault_precision_values)) if fault_precision_values else 0.0
+    normal_mask = original_labels == 0
+    normal_fpr = float(preds[normal_mask].mean()) if int(normal_mask.sum()) > 0 else 1.0
+    return macro_fault_f1, worst_fault_precision, normal_fpr
 
-    def _score_subset(trial: optuna.Trial) -> float:
-        # Component subset: always keep product; optionally include others
-        subset = ["product"] + [
-            c for c in all_components if c != "product"
-            and trial.suggest_categorical(f"use_{c}", [True, False])
-        ]
-        if len(subset) < 2:
-            raise optuna.TrialPruned()
 
-        C = trial.suggest_float("C", 1e-3, 10.0, log=True)
-        cw_choice = trial.suggest_categorical("class_weight", ["balanced", "none", "recall_boost"])
+def _calibrate_threshold_macro_fault_f1(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    original_labels: np.ndarray,
+) -> tuple[float, float, float, float, dict[str, float]]:
+    if original_labels is None or original_labels.size == 0:
+        raise ValueError("original_labels are required for macro-fault threshold calibration")
+    prec, rec, thresholds = precision_recall_curve(labels, scores)
+    best: tuple[float, float, float, float, dict[str, float]] | None = None
 
-        x_val = np.column_stack([np.asarray(val_parts[n], dtype=float) for n in subset])
-        if not np.all(np.isfinite(x_val)):
-            raise optuna.TrialPruned()
-
-        means = x_val.mean(axis=0)
-        safe_stds = np.where((s := x_val.std(axis=0)) > 1e-12, s, 1.0)
-        x_val_s = (x_val - means) / safe_stds
-
-        if cw_choice == "recall_boost":
-            # Up-weight positives 3× to push recall on hard faults (targets class-2)
-            cw = {0: 1.0, 1: 3.0}
-        elif cw_choice == "balanced":
-            cw = "balanced"
-        else:
-            cw = None
-
-        clf = LogisticRegression(class_weight=cw, C=C, max_iter=1000, random_state=0, solver="lbfgs")
-        clf.fit(x_val_s, labels)
-        val_scores = clf.decision_function(x_val_s)
-
-        _, val_f1, _, _ = _calibrate_threshold(val_scores, labels)
-        macro_pr = (
-            _macro_fault_pr_auc(val_original_labels, val_scores)
-            if val_original_labels is not None and val_original_labels.size > 0
-            else 0.0
+    for idx, thr in enumerate(thresholds):
+        threshold = float(thr)
+        macro_fault_f1, worst_fault_precision, normal_fpr = _fault_threshold_metrics(
+            original_labels,
+            scores,
+            threshold,
         )
-        return 0.85 * val_f1 + 0.15 * macro_pr
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=0, n_startup_trials=10),
-        pruner=optuna.pruners.NopPruner(),
-    )
-    # Anchor: enqueue the prior fixed-config (C=0.25, balanced, full 5-component)
-    # as trial 0 so fusion HPO can never regress below the existing baseline.
-    study.enqueue_trial({
-        "C": 0.25,
-        "class_weight": "balanced",
-        "use_mismatch_imbalance": True,
-        "use_dc_voltage_drop":    True,
-        "use_reconstruction":     True,
-        "use_drift_efficiency":   True,
-    })
-    study.optimize(_score_subset, n_trials=60, show_progress_bar=False)
-
-    # Refit winner on full val set, score test
-    bp = study.best_params
-    best_subset = ["product"] + [
-        c for c in all_components if c != "product" and bp.get(f"use_{c}", False)
-    ]
-    best_C = float(bp["C"])
-    cw_choice = bp["class_weight"]
-    cw = {0: 1.0, 1: 3.0} if cw_choice == "recall_boost" else (None if cw_choice == "none" else "balanced")
-
-    x_val = np.column_stack([np.asarray(val_parts[n], dtype=float) for n in best_subset])
-    x_test = np.column_stack([np.asarray(test_parts[n], dtype=float) for n in best_subset])
-    if not np.all(np.isfinite(x_val)) or not np.all(np.isfinite(x_test)):
-        return None
-
-    means = x_val.mean(axis=0)
-    safe_stds = np.where((s := x_val.std(axis=0)) > 1e-12, s, 1.0)
-    x_val_s = (x_val - means) / safe_stds
-    x_test_s = (x_test - means) / safe_stds
-
-    clf = LogisticRegression(class_weight=cw, C=best_C, max_iter=1000, random_state=0, solver="lbfgs")
-    clf.fit(x_val_s, labels)
-
-    metadata = {
-        "score_fusion": "logreg_meta",
-        "score_components": best_subset,
-        "score_tau": None,
-        "meta_model": {
-            "type": "logistic_regression",
-            "coefficients": [float(x) for x in clf.coef_[0].tolist()],
-            "intercept": float(clf.intercept_[0]),
-            "hpo_C": best_C,
-            "hpo_class_weight": cw_choice,
-            "hpo_best_val_selection": float(study.best_value),
-            "input_stats": {
-                name: {"mean": float(m), "std": float(sd)}
-                for name, m, sd in zip(best_subset, means.tolist(), safe_stds.tolist(), strict=True)
+        candidate = (
+            threshold,
+            macro_fault_f1,
+            float(prec[idx]),
+            float(rec[idx]),
+            {
+                "macro_fault_f1": macro_fault_f1,
+                "worst_fault_precision": worst_fault_precision,
+                "normal_fpr": normal_fpr,
+                "constraints_satisfied": 1.0,
             },
-        },
-    }
-    return clf.decision_function(x_val_s), clf.decision_function(x_test_s), metadata
+        )
+        if best is None or macro_fault_f1 > best[1]:
+            best = candidate
 
-
-def _logsumexp_pair(a: np.ndarray, b: np.ndarray, tau: float) -> np.ndarray:
-    stacked = np.stack([a / tau, b / tau], axis=0)
-    max_vals = np.max(stacked, axis=0)
-    return tau * (max_vals + np.log(np.exp(stacked - max_vals).sum(axis=0)))
+    if best is not None:
+        return best
+    raise ValueError("Unable to calibrate threshold for macro-fault F1")
 
 
 def _is_finite_array(arr: np.ndarray | None) -> bool:
     return arr is not None and np.all(np.isfinite(arr))
-
-
-def _add_score_entry(
-    report: dict,
-    name: str,
-    val_scores: np.ndarray,
-    test_scores: np.ndarray,
-    val_labels: np.ndarray,
-    test_labels: np.ndarray,
-    val_original_labels: np.ndarray,
-    test_original_labels: np.ndarray,
-) -> None:
-    threshold, _, _, _ = _calibrate_threshold(val_scores, val_labels)
-    report["scores"][name] = {
-        "threshold_policy": "diagnostic_pr_curve_f1",
-        "val_macro_fault_pr_auc": _macro_fault_pr_auc(val_original_labels, val_scores),
-        "test_macro_fault_pr_auc": _macro_fault_pr_auc(test_original_labels, test_scores),
-        "val": _score_metrics(val_scores, val_labels, threshold),
-        "test": _score_metrics(test_scores, test_labels, threshold),
-    }
-
-
-def _build_score_decomposition_report(
-    val_parts: dict[str, np.ndarray],
-    test_parts: dict[str, np.ndarray],
-    val_labels: np.ndarray,
-    test_labels: np.ndarray,
-    val_original_labels: np.ndarray,
-    test_original_labels: np.ndarray,
-) -> tuple[dict, dict | None]:
-    _best_tracker: dict = {}
-    selection_weights = {"val_f1": 0.85, "val_macro_fault_pr_auc": 0.15}
-    report: dict = {
-        "version": 2,
-        "selection": {
-            "objective": "0.85*val_f1_at_threshold + 0.15*val_macro_fault_pr_auc",
-            "weights": selection_weights,
-        },
-        "naming": {
-            "channels": {
-                "product": "MAAT product score",
-                "reconstruction": "MAAT reconstruction score",
-                "association_discrepancy": "MAAT association discrepancy score",
-                "association_affinity": "MAAT association affinity score",
-                "dc_voltage_drop": "Physics DC voltage-drop score (vdc1/vdc2)",
-                "mismatch_imbalance": "Physics mismatch/imbalance score",
-                "drift_efficiency": "Drift/efficiency score",
-            },
-            "fusions": {
-                "max_z_*": "Element-wise max of z-scored components",
-                "logsumexp_z_*": "Smooth max (logsumexp) over z-scored components",
-            },
-        },
-        "scores": {},
-    }
-
-    def _track_add(
-        name: str,
-        val_s: np.ndarray,
-        test_s: np.ndarray,
-        metadata: dict | None = None,
-    ) -> None:
-        _add_score_entry(
-            report, name, val_s, test_s,
-            val_labels, test_labels, val_original_labels, test_original_labels,
-        )
-        if metadata:
-            report["scores"][name].update(metadata)
-        entry_f1 = report["scores"][name]["val"]["f1_at_threshold"]
-        entry_macro_pr = report["scores"][name]["val_macro_fault_pr_auc"]
-        entry_selection = (
-            selection_weights["val_f1"] * entry_f1
-            + selection_weights["val_macro_fault_pr_auc"] * entry_macro_pr
-        )
-        entry_thr = report["scores"][name]["val"]["threshold"]
-        if entry_selection > _best_tracker.get("selection_score", -1.0):
-            _best_tracker.update({
-                "name": name,
-                "val_scores": val_s,
-                "test_scores": test_s,
-                "threshold": entry_thr,
-                "val_f1": entry_f1,
-                "val_macro_fault_pr_auc": entry_macro_pr,
-                "selection_score": entry_selection,
-                "metadata": metadata or {},
-            })
-
-    for name in ("product", "reconstruction", "association_discrepancy", "association_affinity"):
-        _track_add(
-            name,
-            val_parts[name],
-            test_parts[name],
-            {
-                "score_fusion": "raw",
-                "score_components": [name],
-                "score_tau": None,
-            },
-        )
-
-    val_recon_z, test_recon_z = _zscore_from_val(
-        val_parts["reconstruction"], test_parts["reconstruction"]
-    )
-    val_product_z, test_product_z = _zscore_from_val(val_parts["product"], test_parts["product"])
-    val_clean_max = np.maximum(val_recon_z, val_product_z)
-    test_clean_max = np.maximum(test_recon_z, test_product_z)
-    _track_add(
-        "max_z_recon_product",
-        val_clean_max,
-        test_clean_max,
-        {"score_fusion": "max_z", "score_components": ["reconstruction", "product"], "score_tau": None},
-    )
-    for tau in (0.5, 1.0):
-        _track_add(
-            f"logsumexp_z_recon_product_tau_{tau:g}",
-            _logsumexp_pair(val_recon_z, val_product_z, tau=tau),
-            _logsumexp_pair(test_recon_z, test_product_z, tau=tau),
-            {"score_fusion": "logsumexp_z", "score_components": ["reconstruction", "product"], "score_tau": tau},
-        )
-
-    if "drift_efficiency" in val_parts and "drift_efficiency" in test_parts:
-        _track_add(
-            "drift_efficiency",
-            val_parts["drift_efficiency"],
-            test_parts["drift_efficiency"],
-            {"score_fusion": "raw", "score_components": ["drift_efficiency"], "score_tau": None},
-        )
-        val_drift_z, test_drift_z = _zscore_from_val(
-            val_parts["drift_efficiency"], test_parts["drift_efficiency"]
-        )
-        _track_add(
-            "max_z_product_drift",
-            np.maximum(val_product_z, val_drift_z),
-            np.maximum(test_product_z, test_drift_z),
-            {"score_fusion": "max_z", "score_components": ["product", "drift_efficiency"], "score_tau": None},
-        )
-        _track_add(
-            "max_z_recon_product_drift",
-            np.maximum(np.maximum(val_recon_z, val_product_z), val_drift_z),
-            np.maximum(np.maximum(test_recon_z, test_product_z), test_drift_z),
-            {"score_fusion": "max_z", "score_components": ["reconstruction", "product", "drift_efficiency"], "score_tau": None},
-        )
-        for tau in (0.5, 1.0):
-            _track_add(
-                f"logsumexp_z_product_drift_tau_{tau:g}",
-                _logsumexp_pair(val_product_z, val_drift_z, tau=tau),
-                _logsumexp_pair(test_product_z, test_drift_z, tau=tau),
-                {"score_fusion": "logsumexp_z", "score_components": ["product", "drift_efficiency"], "score_tau": tau},
-            )
-
-    if "dc_voltage_drop" in val_parts and "dc_voltage_drop" in test_parts:
-        _track_add(
-            "dc_voltage_drop",
-            val_parts["dc_voltage_drop"],
-            test_parts["dc_voltage_drop"],
-            {"score_fusion": "raw", "score_components": ["dc_voltage_drop"], "score_tau": None},
-        )
-        val_vdrop_z, test_vdrop_z = _zscore_from_val(
-            val_parts["dc_voltage_drop"], test_parts["dc_voltage_drop"]
-        )
-        _track_add(
-            "max_z_product_voltage",
-            np.maximum(val_product_z, val_vdrop_z),
-            np.maximum(test_product_z, test_vdrop_z),
-            {"score_fusion": "max_z", "score_components": ["product", "dc_voltage_drop"], "score_tau": None},
-        )
-        _track_add(
-            "max_z_recon_product_voltage",
-            np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z),
-            np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z),
-            {"score_fusion": "max_z", "score_components": ["reconstruction", "product", "dc_voltage_drop"], "score_tau": None},
-        )
-        for tau in (0.5, 1.0):
-            _track_add(
-                f"logsumexp_z_product_voltage_tau_{tau:g}",
-                _logsumexp_pair(val_product_z, val_vdrop_z, tau=tau),
-                _logsumexp_pair(test_product_z, test_vdrop_z, tau=tau),
-                {"score_fusion": "logsumexp_z", "score_components": ["product", "dc_voltage_drop"], "score_tau": tau},
-            )
-
-    if (
-        "mismatch_imbalance" in val_parts
-        and "mismatch_imbalance" in test_parts
-        and "dc_voltage_drop" in val_parts
-        and "dc_voltage_drop" in test_parts
-    ):
-        _track_add(
-            "mismatch_imbalance",
-            val_parts["mismatch_imbalance"],
-            test_parts["mismatch_imbalance"],
-            {"score_fusion": "raw", "score_components": ["mismatch_imbalance"], "score_tau": None},
-        )
-        val_mismatch_z, test_mismatch_z = _zscore_from_val(
-            val_parts["mismatch_imbalance"], test_parts["mismatch_imbalance"]
-        )
-        _track_add(
-            "max_z_recon_product_dc_voltage_mismatch",
-            np.maximum(np.maximum(np.maximum(val_recon_z, val_product_z), val_vdrop_z), val_mismatch_z),
-            np.maximum(np.maximum(np.maximum(test_recon_z, test_product_z), test_vdrop_z), test_mismatch_z),
-            {"score_fusion": "max_z", "score_components": ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"], "score_tau": None},
-        )
-        for tau in (0.5, 1.0):
-            val_dvm = _logsumexp_pair(
-                _logsumexp_pair(val_recon_z, val_product_z, tau=tau),
-                _logsumexp_pair(val_vdrop_z, val_mismatch_z, tau=tau),
-                tau=tau,
-            )
-            test_dvm = _logsumexp_pair(
-                _logsumexp_pair(test_recon_z, test_product_z, tau=tau),
-                _logsumexp_pair(test_vdrop_z, test_mismatch_z, tau=tau),
-                tau=tau,
-            )
-            _track_add(
-                f"logsumexp_z_recon_product_dc_voltage_mismatch_tau_{tau:g}",
-                val_dvm,
-                test_dvm,
-                {
-                    "score_fusion": "logsumexp_z",
-                    "score_components": ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"],
-                    "score_tau": tau,
-                },
-            )
-
-    smart_fusion = _fit_logistic_meta_fusion(val_parts, test_parts, val_labels, val_original_labels)
-    if smart_fusion is not None:
-        val_smart, test_smart, smart_meta = smart_fusion
-        _track_add("smart_logreg_core_physics", val_smart, test_smart, smart_meta)
-
-    by_fault: dict[str, dict] = {}
-    for fault_label in sorted(float(x) for x in np.unique(test_original_labels) if float(x) != 0.0):
-        mask = (test_original_labels == fault_label) | (test_original_labels == 0)
-        labels = (test_original_labels[mask] == fault_label).astype(int)
-        if labels.sum() == 0 or labels.sum() == len(labels):
-            continue
-        by_fault[f"{fault_label:g}"] = {
-            "n_windows": int(mask.sum()),
-            "n_fault_windows": int(labels.sum()),
-            "product_pr_auc": _safe_pr_auc(labels, test_parts["product"][mask]),
-            "reconstruction_pr_auc": _safe_pr_auc(labels, test_parts["reconstruction"][mask]),
-            "association_discrepancy_pr_auc": _safe_pr_auc(
-                labels, test_parts["association_discrepancy"][mask]
-            ),
-            "association_affinity_pr_auc": _safe_pr_auc(
-                labels, test_parts["association_affinity"][mask]
-            ),
-            "max_z_recon_product_pr_auc": _safe_pr_auc(labels, test_clean_max[mask]),
-        }
-        if "drift_efficiency" in test_parts:
-            by_fault[f"{fault_label:g}"]["drift_efficiency_pr_auc"] = _safe_pr_auc(
-                labels, test_parts["drift_efficiency"][mask]
-            )
-        if "dc_voltage_drop" in test_parts:
-            by_fault[f"{fault_label:g}"]["dc_voltage_drop_pr_auc"] = _safe_pr_auc(
-                labels, test_parts["dc_voltage_drop"][mask]
-            )
-        if "mismatch_imbalance" in test_parts:
-            by_fault[f"{fault_label:g}"]["mismatch_imbalance_pr_auc"] = _safe_pr_auc(
-                labels, test_parts["mismatch_imbalance"][mask]
-            )
-        if smart_fusion is not None:
-            by_fault[f"{fault_label:g}"]["smart_logreg_core_physics_pr_auc"] = _safe_pr_auc(
-                labels, test_smart[mask]
-            )
-    report["test_by_fault_vs_normal"] = by_fault
-    return report, (_best_tracker if _best_tracker else None)
-
-
-# Lookup table used by the override block to reconstruct fusion metadata from
-# the decomposition score name, without re-parsing the string.
-_FUSION_METADATA: dict[str, tuple[str, list[str], float | None]] = {
-    "product":                                     ("raw",         ["product"],                                                                    None),
-    "reconstruction":                              ("raw",         ["reconstruction"],                                                             None),
-    "association_discrepancy":                     ("raw",         ["association_discrepancy"],                                                    None),
-    "association_affinity":                        ("raw",         ["association_affinity"],                                                       None),
-    "dc_voltage_drop":                             ("raw",         ["dc_voltage_drop"],                                                            None),
-    "mismatch_imbalance":                          ("raw",         ["mismatch_imbalance"],                                                         None),
-    "drift_efficiency":                            ("raw",         ["drift_efficiency"],                                                           None),
-    "max_z_recon_product":                         ("max_z",       ["reconstruction", "product"],                                                  None),
-    "logsumexp_z_recon_product_tau_0.5":           ("logsumexp_z", ["reconstruction", "product"],                                                  0.5),
-    "logsumexp_z_recon_product_tau_1":             ("logsumexp_z", ["reconstruction", "product"],                                                  1.0),
-    "max_z_product_drift":                         ("max_z",       ["product", "drift_efficiency"],                                                None),
-    "max_z_recon_product_drift":                   ("max_z",       ["reconstruction", "product", "drift_efficiency"],                              None),
-    "logsumexp_z_product_drift_tau_0.5":           ("logsumexp_z", ["product", "drift_efficiency"],                                                0.5),
-    "logsumexp_z_product_drift_tau_1":             ("logsumexp_z", ["product", "drift_efficiency"],                                                1.0),
-    "max_z_product_voltage":                       ("max_z",       ["product", "dc_voltage_drop"],                                                 None),
-    "max_z_recon_product_voltage":                 ("max_z",       ["reconstruction", "product", "dc_voltage_drop"],                               None),
-    "logsumexp_z_product_voltage_tau_0.5":         ("logsumexp_z", ["product", "dc_voltage_drop"],                                                 0.5),
-    "logsumexp_z_product_voltage_tau_1":           ("logsumexp_z", ["product", "dc_voltage_drop"],                                                 1.0),
-    "max_z_recon_product_dc_voltage_mismatch":     ("max_z",       ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"],         None),
-    "logsumexp_z_recon_product_dc_voltage_mismatch_tau_0.5": (
-        "logsumexp_z", ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"],  0.5),
-    "logsumexp_z_recon_product_dc_voltage_mismatch_tau_1": (
-        "logsumexp_z", ["reconstruction", "product", "dc_voltage_drop", "mismatch_imbalance"],  1.0),
-}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -697,7 +307,7 @@ class MAATLightningModule(pl.LightningModule):
         total_steps: int = 1,
         warmup_steps: int = 0,
         min_lr_ratio: float = 0.01,
-        score_reduction: str = "center",
+        score_reduction: str = "max",
         drift_feature_idx: int | None = None,
         voltage_drop_feature_indices: list[int] | None = None,
         power_imbalance_feature_idx: int | None = None,
@@ -716,6 +326,10 @@ class MAATLightningModule(pl.LightningModule):
         self.warmup_steps = warmup_steps
         self.min_lr_ratio = min_lr_ratio
         self.score_reduction = score_reduction
+        if self.score_reduction != "max":
+            raise ValueError(
+                f"MAAT official scoring requires score_reduction='max', got '{self.score_reduction}'"
+            )
         self.drift_feature_idx = drift_feature_idx
         self.voltage_drop_feature_indices = voltage_drop_feature_indices or []
         self.power_imbalance_feature_idx = power_imbalance_feature_idx
@@ -730,28 +344,14 @@ class MAATLightningModule(pl.LightningModule):
         self.best_val_macro_fault_pr_auc: float = 0.0
         self.best_val_selection_score: float = 0.0
         self.val_threshold: float = 0.5
-        self._pv_score_stats: dict[str, tuple[float, float]] | None = None
-        self._diag_score_stats: dict[str, dict[str, tuple[float, float]]] = {}
         self._val_scores_np: np.ndarray | None = None
         self._val_product_scores_np: np.ndarray | None = None
         self._val_labels_np: np.ndarray | None = None
-        self._val_recon_scores_np: np.ndarray | None = None
-        self._val_assoc_scores_np: np.ndarray | None = None
-        self._val_assoc_affinity_scores_np: np.ndarray | None = None
-        self._val_drift_scores_np: np.ndarray | None = None
-        self._val_voltage_drop_scores_np: np.ndarray | None = None
-        self._val_mismatch_scores_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
         self._val_group_ids_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_product_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
-        self._test_recon_scores_np: np.ndarray | None = None
-        self._test_assoc_scores_np: np.ndarray | None = None
-        self._test_assoc_affinity_scores_np: np.ndarray | None = None
-        self._test_drift_scores_np: np.ndarray | None = None
-        self._test_voltage_drop_scores_np: np.ndarray | None = None
-        self._test_mismatch_scores_np: np.ndarray | None = None
         self._test_original_labels_np: np.ndarray | None = None
         self._test_group_ids_np: np.ndarray | None = None
         self._nan_count: int = 0
@@ -839,103 +439,6 @@ class MAATLightningModule(pl.LightningModule):
         # default: center
         return scores[:, scores.size(1) // 2]
 
-    def _diag_window_reductions(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        max_scores = scores.max(dim=1).values
-        q95_scores = torch.quantile(scores, 0.95, dim=1)
-        topk = max(1, int(math.ceil(scores.size(1) * 0.10)))
-        top10_scores = scores.topk(k=topk, dim=1).values.mean(dim=1)
-        return max_scores, q95_scores, top10_scores
-
-    def _reduce_scores_by_mode(self, scores: torch.Tensor, mode: str) -> torch.Tensor:
-        if mode == "max":
-            return scores.max(dim=1).values
-        if mode == "q95":
-            return torch.quantile(scores, 0.95, dim=1)
-        if mode == "top10mean":
-            topk = max(1, int(math.ceil(scores.size(1) * 0.10)))
-            return scores.topk(k=topk, dim=1).values.mean(dim=1)
-        raise ValueError(f"Unknown reduction mode: {mode}")
-
-    def _component_scores_by_mode(
-        self,
-        x: torch.Tensor,
-        product_scores: torch.Tensor,
-        mode: str,
-    ) -> dict[str, torch.Tensor]:
-        product = self._reduce_scores_by_mode(product_scores, mode)
-
-        voltage = None
-        if self.voltage_drop_feature_indices:
-            voltage_parts: list[torch.Tensor] = []
-            for idx in self.voltage_drop_feature_indices:
-                series = torch.clamp(-x[:, :, idx], min=0.0)
-                voltage_parts.append(self._reduce_scores_by_mode(series, mode))
-            voltage = torch.stack(voltage_parts, dim=1).max(dim=1).values
-
-        mismatch = None
-        mismatch_parts: list[torch.Tensor] = []
-        if self.power_imbalance_feature_idx is not None:
-            series = torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0)
-            mismatch_parts.append(self._reduce_scores_by_mode(series, mode))
-        if self.current_imbalance_feature_idx is not None:
-            series = torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0)
-            mismatch_parts.append(self._reduce_scores_by_mode(series, mode))
-        if self.voltage_imbalance_feature_idx is not None:
-            series = torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0)
-            mismatch_parts.append(self._reduce_scores_by_mode(series, mode))
-        if mismatch_parts:
-            mismatch = torch.stack(mismatch_parts, dim=1).max(dim=1).values
-
-        return {
-            "product": product,
-            "dc_voltage_drop": voltage,
-            "mismatch_imbalance": mismatch,
-        }
-
-    def _fuse_components_np(
-        self,
-        components: dict[str, np.ndarray],
-        labels: np.ndarray,
-    ) -> tuple[np.ndarray, dict[str, tuple[float, float]]]:
-        product = components["product"]
-        voltage = components.get("dc_voltage_drop")
-        mismatch = components.get("mismatch_imbalance")
-        if voltage is None or mismatch is None:
-            p_mu, p_sd = _fit_normal_stats(product, labels)
-            fused = _zscore_with_stats(product, p_mu, p_sd)
-            return fused, {"product": (p_mu, p_sd)}
-
-        p_mu, p_sd = _fit_normal_stats(product, labels)
-        v_mu, v_sd = _fit_normal_stats(voltage, labels)
-        m_mu, m_sd = _fit_normal_stats(mismatch, labels)
-        fused = _logsumexp_multi(
-            [
-                _zscore_with_stats(product, p_mu, p_sd),
-                _zscore_with_stats(voltage, v_mu, v_sd),
-                _zscore_with_stats(mismatch, m_mu, m_sd),
-            ],
-            tau=1.0,
-        )
-        return fused, {
-            "product": (p_mu, p_sd),
-            "dc_voltage_drop": (v_mu, v_sd),
-            "mismatch_imbalance": (m_mu, m_sd),
-        }
-
-    def _fuse_components_with_stats_np(
-        self,
-        components: dict[str, np.ndarray],
-        stats: dict[str, tuple[float, float]],
-    ) -> np.ndarray:
-        if "product" not in stats:
-            return components["product"]
-        product = _zscore_with_stats(components["product"], *stats["product"])
-        if "dc_voltage_drop" not in stats or "mismatch_imbalance" not in stats:
-            return product
-        voltage = _zscore_with_stats(components["dc_voltage_drop"], *stats["dc_voltage_drop"])
-        mismatch = _zscore_with_stats(components["mismatch_imbalance"], *stats["mismatch_imbalance"])
-        return _logsumexp_multi([product, voltage, mismatch], tau=1.0)
-
     def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
         if len(batch) == 4:
             x, labels, original_labels, group_ids = batch
@@ -950,34 +453,9 @@ class MAATLightningModule(pl.LightningModule):
             x_hat, series_list, prior_list, _ = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)  # [B, W]
-        assoc_dis = compute_association_discrepancy(series_list, prior_list)  # [B, W]
-        assoc_affinity = torch.softmax(-assoc_dis * self.temperature, dim=-1)
-        drift_scores = None
-        if self.drift_feature_idx is not None:
-            drift_series = torch.clamp(-x[:, :, self.drift_feature_idx], min=0.0)
-            drift_scores = drift_series.mean(dim=1)
-        voltage_drop_scores = None
-        voltage_parts: list[torch.Tensor] = []
-        for idx in self.voltage_drop_feature_indices:
-            voltage_parts.append(torch.clamp(-x[:, :, idx], min=0.0).max(dim=1).values)
-        if voltage_parts:
-            voltage_drop_scores = torch.stack(voltage_parts, dim=1).max(dim=1).values
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         product_window_scores = self._reduce_scores(product_scores)
-        diag_max = self._component_scores_by_mode(x, product_scores, "max")
-        diag_q95 = self._component_scores_by_mode(x, product_scores, "q95")
-        diag_top10 = self._component_scores_by_mode(x, product_scores, "top10mean")
         center_scores = product_window_scores.cpu()
-        mismatch_scores = None
-        mismatch_parts: list[torch.Tensor] = []
-        if self.power_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if self.current_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if self.voltage_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if mismatch_parts:
-            mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         center_labels = labels.cpu()
 
         rec_loss = nn.functional.mse_loss(x_hat, x)
@@ -986,26 +464,9 @@ class MAATLightningModule(pl.LightningModule):
         self._val_outputs.append({
             "scores": center_scores,
             "product_scores": product_window_scores.cpu(),
-            "recon_scores": self._reduce_scores(recon_error).cpu(),
-            "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
-            "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
-            "drift_scores": drift_scores.cpu() if drift_scores is not None else None,
-            "voltage_drop_scores": (
-                voltage_drop_scores.cpu() if voltage_drop_scores is not None else None
-            ),
-            "mismatch_scores": mismatch_scores.cpu() if mismatch_scores is not None else None,
             "labels": center_labels,
             "original_labels": original_labels.cpu(),
             "group_ids": list(group_ids) if group_ids is not None else None,
-            "diag_max_product": diag_max["product"].cpu(),
-            "diag_max_voltage": diag_max["dc_voltage_drop"].cpu() if diag_max["dc_voltage_drop"] is not None else None,
-            "diag_max_mismatch": diag_max["mismatch_imbalance"].cpu() if diag_max["mismatch_imbalance"] is not None else None,
-            "diag_q95_product": diag_q95["product"].cpu(),
-            "diag_q95_voltage": diag_q95["dc_voltage_drop"].cpu() if diag_q95["dc_voltage_drop"] is not None else None,
-            "diag_q95_mismatch": diag_q95["mismatch_imbalance"].cpu() if diag_q95["mismatch_imbalance"] is not None else None,
-            "diag_top10_product": diag_top10["product"].cpu(),
-            "diag_top10_voltage": diag_top10["dc_voltage_drop"].cpu() if diag_top10["dc_voltage_drop"] is not None else None,
-            "diag_top10_mismatch": diag_top10["mismatch_imbalance"].cpu() if diag_top10["mismatch_imbalance"] is not None else None,
             "rec_loss": rec_loss.item(),
             "s_loss": s_loss.item(),
             "p_loss": p_loss.item(),
@@ -1017,60 +478,8 @@ class MAATLightningModule(pl.LightningModule):
 
         all_scores = torch.cat([o["scores"] for o in self._val_outputs]).numpy()
         all_product_scores = torch.cat([o["product_scores"] for o in self._val_outputs]).numpy()
-        all_recon_scores = torch.cat([o["recon_scores"] for o in self._val_outputs]).numpy()
-        all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._val_outputs]).numpy()
-        all_assoc_affinity_scores = torch.cat(
-            [o["assoc_affinity_scores"] for o in self._val_outputs]
-        ).numpy()
-        drift_present = self._val_outputs[0].get("drift_scores") is not None
-        vdrop_present = self._val_outputs[0].get("voltage_drop_scores") is not None
-        mismatch_present = self._val_outputs[0].get("mismatch_scores") is not None
-        all_drift_scores = (
-            torch.cat([o["drift_scores"] for o in self._val_outputs]).numpy() if drift_present else None
-        )
-        all_voltage_drop_scores = (
-            torch.cat([o["voltage_drop_scores"] for o in self._val_outputs]).numpy()
-            if vdrop_present else None
-        )
-        all_mismatch_scores = (
-            torch.cat([o["mismatch_scores"] for o in self._val_outputs]).numpy()
-            if mismatch_present else None
-        )
         all_labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._val_outputs]).numpy()
-        all_diag_max_product = torch.cat([o["diag_max_product"] for o in self._val_outputs]).numpy()
-        all_diag_q95_product = torch.cat([o["diag_q95_product"] for o in self._val_outputs]).numpy()
-        all_diag_top10_product = torch.cat([o["diag_top10_product"] for o in self._val_outputs]).numpy()
-        all_diag_max_voltage = (
-            torch.cat([o["diag_max_voltage"] for o in self._val_outputs]).numpy()
-            if self._val_outputs[0].get("diag_max_voltage") is not None
-            else None
-        )
-        all_diag_q95_voltage = (
-            torch.cat([o["diag_q95_voltage"] for o in self._val_outputs]).numpy()
-            if self._val_outputs[0].get("diag_q95_voltage") is not None
-            else None
-        )
-        all_diag_top10_voltage = (
-            torch.cat([o["diag_top10_voltage"] for o in self._val_outputs]).numpy()
-            if self._val_outputs[0].get("diag_top10_voltage") is not None
-            else None
-        )
-        all_diag_max_mismatch = (
-            torch.cat([o["diag_max_mismatch"] for o in self._val_outputs]).numpy()
-            if self._val_outputs[0].get("diag_max_mismatch") is not None
-            else None
-        )
-        all_diag_q95_mismatch = (
-            torch.cat([o["diag_q95_mismatch"] for o in self._val_outputs]).numpy()
-            if self._val_outputs[0].get("diag_q95_mismatch") is not None
-            else None
-        )
-        all_diag_top10_mismatch = (
-            torch.cat([o["diag_top10_mismatch"] for o in self._val_outputs]).numpy()
-            if self._val_outputs[0].get("diag_top10_mismatch") is not None
-            else None
-        )
         all_group_ids = None
         if self._val_outputs[0].get("group_ids") is not None:
             all_group_ids = np.array(
@@ -1096,58 +505,26 @@ class MAATLightningModule(pl.LightningModule):
         self._val_scores_np = all_scores
         self._val_product_scores_np = all_product_scores
         self._val_labels_np = all_labels
-        self._val_recon_scores_np = all_recon_scores
-        self._val_assoc_scores_np = all_assoc_scores
-        self._val_assoc_affinity_scores_np = all_assoc_affinity_scores
-        self._val_drift_scores_np = all_drift_scores
-        self._val_voltage_drop_scores_np = all_voltage_drop_scores
-        self._val_mismatch_scores_np = all_mismatch_scores
         self._val_original_labels_np = all_original_labels
         self._val_group_ids_np = all_group_ids
 
-        if all_voltage_drop_scores is not None and all_mismatch_scores is not None:
-            if (
-                not _is_finite_array(all_product_scores)
-                or not _is_finite_array(all_voltage_drop_scores)
-                or not _is_finite_array(all_mismatch_scores)
-            ):
-                self.log("val_pv_maat_f1", 0.0, prog_bar=True)
-                self.log("val_episode_macro_f1", 0.0)
-                self.log("val_selection_score", 0.0, prog_bar=True)
-                return
-            p_mu, p_sd = _fit_normal_stats(all_product_scores, all_labels)
-            v_mu, v_sd = _fit_normal_stats(all_voltage_drop_scores, all_labels)
-            m_mu, m_sd = _fit_normal_stats(all_mismatch_scores, all_labels)
-            pv_scores = _logsumexp_multi(
-                [
-                    _zscore_with_stats(all_product_scores, p_mu, p_sd),
-                    _zscore_with_stats(all_voltage_drop_scores, v_mu, v_sd),
-                    _zscore_with_stats(all_mismatch_scores, m_mu, m_sd),
-                ],
-                tau=1.0,
-            )
-            self._pv_score_stats = {
-                "product": (p_mu, p_sd),
-                "dc_voltage_drop": (v_mu, v_sd),
-                "mismatch_imbalance": (m_mu, m_sd),
-            }
-        else:
-            if not _is_finite_array(all_product_scores):
-                self.log("val_pv_maat_f1", 0.0, prog_bar=True)
-                self.log("val_episode_macro_f1", 0.0)
-                self.log("val_selection_score", 0.0, prog_bar=True)
-                return
-            pv_scores = all_product_scores
-            p_mu, p_sd = _fit_normal_stats(all_product_scores, all_labels)
-            self._pv_score_stats = {"product": (p_mu, p_sd)}
-
+        if not _is_finite_array(all_product_scores):
+            self.log("val_pv_maat_f1", 0.0, prog_bar=True)
+            self.log("val_episode_macro_f1", 0.0)
+            self.log("val_selection_score", 0.0, prog_bar=True)
+            return
+        pv_scores = all_product_scores
         if not _is_finite_array(pv_scores):
             self.log("val_pv_maat_f1", 0.0, prog_bar=True)
             self.log("val_episode_macro_f1", 0.0)
             self.log("val_selection_score", 0.0, prog_bar=True)
             return
 
-        threshold, val_f1, val_prec, val_rec = _calibrate_threshold(pv_scores, all_labels)
+        threshold, macro_fault_f1, val_prec, val_rec, threshold_meta = _calibrate_threshold_macro_fault_f1(
+            pv_scores,
+            all_labels,
+            all_original_labels,
+        )
         if not math.isfinite(threshold):
             self.log("val_pv_maat_f1", 0.0, prog_bar=True)
             self.log("val_episode_macro_f1", 0.0)
@@ -1156,7 +533,8 @@ class MAATLightningModule(pl.LightningModule):
 
         val_preds = (pv_scores >= threshold).astype(int)
         val_episode_macro_f1 = _episode_macro_f1_binary(all_labels, val_preds, all_group_ids)
-        val_selection_score = val_f1
+        val_f1 = float(f1_score(all_labels, val_preds, zero_division=0))
+        val_selection_score = macro_fault_f1
         val_acc = float(accuracy_score(all_labels, val_preds))
         val_pv_pr_auc = _safe_pr_auc(all_labels, pv_scores)
 
@@ -1165,7 +543,8 @@ class MAATLightningModule(pl.LightningModule):
             if all_original_labels is not None and all_original_labels.size > 0
             else 0.0
         )
-        val_selection_score = 0.85 * val_f1 + 0.15 * val_macro_fault_pr_auc
+        worst_fault_precision = float(threshold_meta["worst_fault_precision"])
+        normal_fpr = float(threshold_meta["normal_fpr"])
 
         self.best_val_pv_maat_f1 = max(self.best_val_pv_maat_f1, val_f1)
         self.best_val_episode_macro_f1 = max(self.best_val_episode_macro_f1, val_episode_macro_f1)
@@ -1173,37 +552,14 @@ class MAATLightningModule(pl.LightningModule):
         self.best_val_selection_score = max(self.best_val_selection_score, val_selection_score)
         self.val_threshold = threshold
         self._val_scores_np = pv_scores
-        max_fused, max_stats = self._fuse_components_np(
-            {
-                "product": all_diag_max_product,
-                "dc_voltage_drop": all_diag_max_voltage,
-                "mismatch_imbalance": all_diag_max_mismatch,
-            },
-            all_labels,
-        )
-        q95_fused, q95_stats = self._fuse_components_np(
-            {
-                "product": all_diag_q95_product,
-                "dc_voltage_drop": all_diag_q95_voltage,
-                "mismatch_imbalance": all_diag_q95_mismatch,
-            },
-            all_labels,
-        )
-        top10_fused, top10_stats = self._fuse_components_np(
-            {
-                "product": all_diag_top10_product,
-                "dc_voltage_drop": all_diag_top10_voltage,
-                "mismatch_imbalance": all_diag_top10_mismatch,
-            },
-            all_labels,
-        )
-        self._val_diag_scores = {"max": max_fused, "q95": q95_fused, "top10mean": top10_fused}
-        self._diag_score_stats = {"max": max_stats, "q95": q95_stats, "top10mean": top10_stats}
 
         self.log("val_pr_auc", val_pr_auc)
         self.log("val_pv_maat_pr_auc", val_pv_pr_auc)
         self.log("val_pv_maat_f1", val_f1, prog_bar=True)
         self.log("val_macro_fault_pr_auc", val_macro_fault_pr_auc)
+        self.log("val_macro_fault_f1", macro_fault_f1)
+        self.log("val_worst_fault_precision", worst_fault_precision)
+        self.log("val_normal_fpr", normal_fpr)
         self.log("val_episode_macro_f1", val_episode_macro_f1)
         self.log("val_selection_score", val_selection_score, prog_bar=True)
         self.log("val_roc_auc", val_roc_auc)
@@ -1229,57 +585,15 @@ class MAATLightningModule(pl.LightningModule):
             x_hat, series_list, prior_list, _ = self.model(x)
 
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
-        assoc_dis = compute_association_discrepancy(series_list, prior_list)
-        assoc_affinity = torch.softmax(-assoc_dis * self.temperature, dim=-1)
-        drift_scores = None
-        if self.drift_feature_idx is not None:
-            drift_series = torch.clamp(-x[:, :, self.drift_feature_idx], min=0.0)
-            drift_scores = drift_series.mean(dim=1)
-        voltage_drop_scores = None
-        voltage_parts: list[torch.Tensor] = []
-        for idx in self.voltage_drop_feature_indices:
-            voltage_parts.append(torch.clamp(-x[:, :, idx], min=0.0).max(dim=1).values)
-        if voltage_parts:
-            voltage_drop_scores = torch.stack(voltage_parts, dim=1).max(dim=1).values
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
         product_window_scores = self._reduce_scores(product_scores)
-        diag_max = self._component_scores_by_mode(x, product_scores, "max")
-        diag_q95 = self._component_scores_by_mode(x, product_scores, "q95")
-        diag_top10 = self._component_scores_by_mode(x, product_scores, "top10mean")
         window_scores = product_window_scores
-        mismatch_scores = None
-        mismatch_parts: list[torch.Tensor] = []
-        if self.power_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if self.current_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if self.voltage_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if mismatch_parts:
-            mismatch_scores = torch.stack(mismatch_parts, dim=1).max(dim=1).values
         self._test_outputs.append({
             "scores": window_scores.cpu(),
             "product_scores": product_window_scores.cpu(),
-            "recon_scores": self._reduce_scores(recon_error).cpu(),
-            "assoc_scores": self._reduce_scores(assoc_dis).cpu(),
-            "assoc_affinity_scores": self._reduce_scores(assoc_affinity).cpu(),
-            "drift_scores": drift_scores.cpu() if drift_scores is not None else None,
-            "voltage_drop_scores": (
-                voltage_drop_scores.cpu() if voltage_drop_scores is not None else None
-            ),
-            "mismatch_scores": mismatch_scores.cpu() if mismatch_scores is not None else None,
             "labels": labels.cpu(),
             "original_labels": original_labels.cpu(),
             "group_ids": list(group_ids) if group_ids is not None else None,
-            "diag_max_product": diag_max["product"].cpu(),
-            "diag_max_voltage": diag_max["dc_voltage_drop"].cpu() if diag_max["dc_voltage_drop"] is not None else None,
-            "diag_max_mismatch": diag_max["mismatch_imbalance"].cpu() if diag_max["mismatch_imbalance"] is not None else None,
-            "diag_q95_product": diag_q95["product"].cpu(),
-            "diag_q95_voltage": diag_q95["dc_voltage_drop"].cpu() if diag_q95["dc_voltage_drop"] is not None else None,
-            "diag_q95_mismatch": diag_q95["mismatch_imbalance"].cpu() if diag_q95["mismatch_imbalance"] is not None else None,
-            "diag_top10_product": diag_top10["product"].cpu(),
-            "diag_top10_voltage": diag_top10["dc_voltage_drop"].cpu() if diag_top10["dc_voltage_drop"] is not None else None,
-            "diag_top10_mismatch": diag_top10["mismatch_imbalance"].cpu() if diag_top10["mismatch_imbalance"] is not None else None,
         })
 
     def on_test_epoch_end(self) -> None:
@@ -1288,60 +602,8 @@ class MAATLightningModule(pl.LightningModule):
 
         all_scores = torch.cat([o["scores"] for o in self._test_outputs]).numpy()
         all_product_scores = torch.cat([o["product_scores"] for o in self._test_outputs]).numpy()
-        all_recon_scores = torch.cat([o["recon_scores"] for o in self._test_outputs]).numpy()
-        all_assoc_scores = torch.cat([o["assoc_scores"] for o in self._test_outputs]).numpy()
-        all_assoc_affinity_scores = torch.cat(
-            [o["assoc_affinity_scores"] for o in self._test_outputs]
-        ).numpy()
-        drift_present = self._test_outputs[0].get("drift_scores") is not None
-        vdrop_present = self._test_outputs[0].get("voltage_drop_scores") is not None
-        mismatch_present = self._test_outputs[0].get("mismatch_scores") is not None
-        all_drift_scores = (
-            torch.cat([o["drift_scores"] for o in self._test_outputs]).numpy() if drift_present else None
-        )
-        all_voltage_drop_scores = (
-            torch.cat([o["voltage_drop_scores"] for o in self._test_outputs]).numpy()
-            if vdrop_present else None
-        )
-        all_mismatch_scores = (
-            torch.cat([o["mismatch_scores"] for o in self._test_outputs]).numpy()
-            if mismatch_present else None
-        )
         all_labels = torch.cat([o["labels"] for o in self._test_outputs]).numpy()
         all_original_labels = torch.cat([o["original_labels"] for o in self._test_outputs]).numpy()
-        all_diag_max_product = torch.cat([o["diag_max_product"] for o in self._test_outputs]).numpy()
-        all_diag_q95_product = torch.cat([o["diag_q95_product"] for o in self._test_outputs]).numpy()
-        all_diag_top10_product = torch.cat([o["diag_top10_product"] for o in self._test_outputs]).numpy()
-        all_diag_max_voltage = (
-            torch.cat([o["diag_max_voltage"] for o in self._test_outputs]).numpy()
-            if self._test_outputs[0].get("diag_max_voltage") is not None
-            else None
-        )
-        all_diag_q95_voltage = (
-            torch.cat([o["diag_q95_voltage"] for o in self._test_outputs]).numpy()
-            if self._test_outputs[0].get("diag_q95_voltage") is not None
-            else None
-        )
-        all_diag_top10_voltage = (
-            torch.cat([o["diag_top10_voltage"] for o in self._test_outputs]).numpy()
-            if self._test_outputs[0].get("diag_top10_voltage") is not None
-            else None
-        )
-        all_diag_max_mismatch = (
-            torch.cat([o["diag_max_mismatch"] for o in self._test_outputs]).numpy()
-            if self._test_outputs[0].get("diag_max_mismatch") is not None
-            else None
-        )
-        all_diag_q95_mismatch = (
-            torch.cat([o["diag_q95_mismatch"] for o in self._test_outputs]).numpy()
-            if self._test_outputs[0].get("diag_q95_mismatch") is not None
-            else None
-        )
-        all_diag_top10_mismatch = (
-            torch.cat([o["diag_top10_mismatch"] for o in self._test_outputs]).numpy()
-            if self._test_outputs[0].get("diag_top10_mismatch") is not None
-            else None
-        )
         all_group_ids = None
         if self._test_outputs[0].get("group_ids") is not None:
             all_group_ids = np.array(
@@ -1350,62 +612,13 @@ class MAATLightningModule(pl.LightningModule):
             )
         self._test_outputs.clear()
 
-        if (
-            self._pv_score_stats is not None
-            and all_voltage_drop_scores is not None
-            and all_mismatch_scores is not None
-        ):
-            p_mu, p_sd = self._pv_score_stats["product"]
-            v_mu, v_sd = self._pv_score_stats["dc_voltage_drop"]
-            m_mu, m_sd = self._pv_score_stats["mismatch_imbalance"]
-            all_scores = _logsumexp_multi(
-                [
-                    _zscore_with_stats(all_product_scores, p_mu, p_sd),
-                    _zscore_with_stats(all_voltage_drop_scores, v_mu, v_sd),
-                    _zscore_with_stats(all_mismatch_scores, m_mu, m_sd),
-                ],
-                tau=1.0,
-            )
-        else:
-            all_scores = all_product_scores
+        all_scores = all_product_scores
 
         self._test_scores_np = all_scores
         self._test_product_scores_np = all_product_scores
         self._test_labels_np = all_labels
-        self._test_recon_scores_np = all_recon_scores
-        self._test_assoc_scores_np = all_assoc_scores
-        self._test_assoc_affinity_scores_np = all_assoc_affinity_scores
-        self._test_drift_scores_np = all_drift_scores
-        self._test_voltage_drop_scores_np = all_voltage_drop_scores
-        self._test_mismatch_scores_np = all_mismatch_scores
         self._test_original_labels_np = all_original_labels
         self._test_group_ids_np = all_group_ids
-        self._test_diag_scores = {
-            "max": self._fuse_components_with_stats_np(
-                {
-                    "product": all_diag_max_product,
-                    "dc_voltage_drop": all_diag_max_voltage,
-                    "mismatch_imbalance": all_diag_max_mismatch,
-                },
-                self._diag_score_stats.get("max", self._pv_score_stats or {}),
-            ),
-            "q95": self._fuse_components_with_stats_np(
-                {
-                    "product": all_diag_q95_product,
-                    "dc_voltage_drop": all_diag_q95_voltage,
-                    "mismatch_imbalance": all_diag_q95_mismatch,
-                },
-                self._diag_score_stats.get("q95", self._pv_score_stats or {}),
-            ),
-            "top10mean": self._fuse_components_with_stats_np(
-                {
-                    "product": all_diag_top10_product,
-                    "dc_voltage_drop": all_diag_top10_voltage,
-                    "mismatch_imbalance": all_diag_top10_mismatch,
-                },
-                self._diag_score_stats.get("top10mean", self._pv_score_stats or {}),
-            ),
-        }
 
         if not _is_finite_array(all_scores) or not math.isfinite(self.val_threshold):
             self.log("test_pv_maat_pr_auc", 0.0)
@@ -1440,79 +653,8 @@ class MAATLightningModule(pl.LightningModule):
         x_hat, series_list, prior_list, _ = self.model(x)
         recon_error = ((x - x_hat) ** 2).mean(dim=-1)
         product_scores = compute_maat_scores(series_list, prior_list, recon_error, self.temperature)
-        product = product_scores.max(dim=1).values.detach().cpu().numpy()
-
-        voltage = None
-        voltage_parts: list[torch.Tensor] = []
-        for idx in self.voltage_drop_feature_indices:
-            voltage_parts.append(torch.clamp(-x[:, :, idx], min=0.0).max(dim=1).values)
-        if voltage_parts:
-            voltage = torch.stack(voltage_parts, dim=1).max(dim=1).values
-
-        mismatch = None
-        mismatch_parts: list[torch.Tensor] = []
-        if self.power_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.power_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if self.current_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.current_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if self.voltage_imbalance_feature_idx is not None:
-            mismatch_parts.append(torch.clamp(x[:, :, self.voltage_imbalance_feature_idx], min=0.0).max(dim=1).values)
-        if mismatch_parts:
-            mismatch = torch.stack(mismatch_parts, dim=1).max(dim=1).values
-
-        if self._pv_score_stats is None:
-            raise ValueError("MAAT score calibration stats are missing; cannot compute pv_maat_score")
-
-        if voltage is None or mismatch is None:
-            if (
-                "dc_voltage_drop" in self._pv_score_stats
-                or "mismatch_imbalance" in self._pv_score_stats
-            ):
-                raise ValueError(
-                    "MAAT physics features unavailable at inference but fused calibration requires them"
-                )
-            p_mu, p_sd = self._pv_score_stats["product"]
-            fused = _zscore_with_stats(product, p_mu, p_sd)
-        else:
-            if "dc_voltage_drop" not in self._pv_score_stats or "mismatch_imbalance" not in self._pv_score_stats:
-                raise ValueError("MAAT physics calibration stats missing for fused pv_maat_score")
-            voltage_np = voltage.detach().cpu().numpy()
-            mismatch_np = mismatch.detach().cpu().numpy()
-            p_mu, p_sd = self._pv_score_stats["product"]
-            v_mu, v_sd = self._pv_score_stats["dc_voltage_drop"]
-            m_mu, m_sd = self._pv_score_stats["mismatch_imbalance"]
-            fused = _logsumexp_multi(
-                [
-                    _zscore_with_stats(product, p_mu, p_sd),
-                    _zscore_with_stats(voltage_np, v_mu, v_sd),
-                    _zscore_with_stats(mismatch_np, m_mu, m_sd),
-                ],
-                tau=1.0,
-            )
-        return torch.from_numpy(fused).to(device=x.device, dtype=x.dtype)
-
-    def on_save_checkpoint(self, checkpoint: dict) -> None:
-        checkpoint["pv_score_stats"] = self._pv_score_stats
-        checkpoint["diag_score_stats"] = self._diag_score_stats
-
-    def on_load_checkpoint(self, checkpoint: dict) -> None:
-        loaded = checkpoint.get("pv_score_stats")
-        if isinstance(loaded, dict):
-            self._pv_score_stats = {
-                str(k): (float(v[0]), float(v[1])) for k, v in loaded.items() if isinstance(v, (list, tuple)) and len(v) == 2
-            }
-        loaded_diag = checkpoint.get("diag_score_stats")
-        if isinstance(loaded_diag, dict):
-            casted: dict[str, dict[str, tuple[float, float]]] = {}
-            for mode, stats in loaded_diag.items():
-                if not isinstance(stats, dict):
-                    continue
-                casted[str(mode)] = {
-                    str(k): (float(v[0]), float(v[1]))
-                    for k, v in stats.items()
-                    if isinstance(v, (list, tuple)) and len(v) == 2
-                }
-            self._diag_score_stats = casted
+        product = self._reduce_scores(product_scores).detach().cpu().numpy()
+        return torch.from_numpy(product).to(device=x.device, dtype=x.dtype)
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
@@ -1944,8 +1086,6 @@ def run_maat(config: dict | None = None) -> None:
         )
         pruning_warmup_epochs = int(hpo_cfg.get("pruning_warmup_epochs", 3))
 
-        hpo_mode = str(hpo_cfg.get("mode", "conditional")).strip().lower()
-
         def _conditional_objective(trial: optuna.Trial) -> float:
             trial_p = suggest_conditional_params(trial)
             trial_p["score_reduction"] = "max"
@@ -2010,29 +1150,19 @@ def run_maat(config: dict | None = None) -> None:
             load_if_exists=True,
         )
 
-        # Warm-start: enqueue known-good params as trial 0
-        warm_start_source = (
-            getattr(args, "warm_start_from", None)
-            or maat_cfg.get("hpo_conditional", {}).get("warm_start_from")
-        )
-        warm_params = load_warm_start_params(warm_start_source)
-        if warm_params:
-            study.enqueue_trial(warm_params)
-            logger.info(f"HPO warm-start enqueued: {warm_params}")
-
         logger.info(f"Running conditional HPO | n_trials={n_trials} | study={study_name}")
         study.optimize(_conditional_objective, n_trials=n_trials)
 
         stage_results = [HPOStageResult(
             name="conditional",
-            best_params=study.best_params,
+            best_params=normalize_conditional_params(study.best_params),
             best_value=float(study.best_value),
             study=study,
         )]
 
-        # Validation-only selection: top-decile by blended score, tiebreak by simplicity
+        # Validation-only selection: top-decile by macro-fault F1, tiebreak by simplicity
         def _simplicity_score(t: optuna.trial.FrozenTrial) -> tuple:
-            p = t.params
+            p = normalize_conditional_params(t.params)
             return (
                 -int(p.get("d_model", 64)),
                 -int(p.get("e_layers", 2)),
@@ -2050,14 +1180,14 @@ def run_maat(config: dict | None = None) -> None:
             top_n = max(1, len(completed) // 10)
             top_decile = sorted(completed, key=lambda t: t.value, reverse=True)[:top_n]
             picked = max(top_decile, key=_simplicity_score)
-            best_params = dict(picked.params)
+            best_params = normalize_conditional_params(dict(picked.params))
             logger.info(
                 f"[conditional] val-only select | top-decile={top_n}/{len(completed)} | "
                 f"picked selection_score={picked.value:.4f} (study max={study.best_value:.4f}) | "
                 f"params={best_params}"
             )
         else:
-            best_params = dict(study.best_params)
+            best_params = normalize_conditional_params(dict(study.best_params))
 
         logger.info(f"HPO validation-only selected params: {best_params}")
     else:
@@ -2162,25 +1292,10 @@ def run_maat(config: dict | None = None) -> None:
     test_scores = final_lit._test_scores_np
     test_product_scores = final_lit._test_product_scores_np
     test_labels = final_lit._test_labels_np
-    val_recon_scores = final_lit._val_recon_scores_np
-    val_assoc_scores = final_lit._val_assoc_scores_np
-    val_assoc_affinity_scores = final_lit._val_assoc_affinity_scores_np
     val_original_labels = final_lit._val_original_labels_np
-    test_recon_scores = final_lit._test_recon_scores_np
-    test_assoc_scores = final_lit._test_assoc_scores_np
-    test_assoc_affinity_scores = final_lit._test_assoc_affinity_scores_np
-    val_drift_scores = final_lit._val_drift_scores_np
-    test_drift_scores = final_lit._test_drift_scores_np
-    val_voltage_drop_scores = final_lit._val_voltage_drop_scores_np
-    test_voltage_drop_scores = final_lit._test_voltage_drop_scores_np
-    val_mismatch_scores = final_lit._val_mismatch_scores_np
-    test_mismatch_scores = final_lit._test_mismatch_scores_np
     test_original_labels = final_lit._test_original_labels_np
     val_group_ids = final_lit._val_group_ids_np
     test_group_ids = final_lit._test_group_ids_np
-    val_diag_scores = getattr(final_lit, "_val_diag_scores", None)
-    test_diag_scores = getattr(final_lit, "_test_diag_scores", None)
-
     if val_scores is None or test_scores is None:
         logger.error("Score arrays not populated — test may not have run.")
         return
@@ -2196,7 +1311,12 @@ def run_maat(config: dict | None = None) -> None:
         if val_original_labels is not None and val_original_labels.size > 0
         else 0.0
     )
-    val_selection_score = 0.85 * val_f1 + 0.15 * _val_macro_fault_pr_auc_base
+    val_macro_fault_f1, val_worst_fault_precision, val_normal_fpr = _fault_threshold_metrics(
+        val_original_labels,
+        val_scores,
+        threshold,
+    )
+    val_selection_score = val_macro_fault_f1
     val_prec = float(precision_score(val_labels, val_preds, zero_division=0))
     val_rec = float(recall_score(val_labels, val_preds, zero_division=0))
     val_acc = float(accuracy_score(val_labels, val_preds))
@@ -2218,22 +1338,17 @@ def run_maat(config: dict | None = None) -> None:
     )
 
     _val_n_pos = int(val_labels.sum()) if val_labels is not None else 0
-    _threshold_method = (
-        "smoothed_argmax_5"
-        if _val_n_pos >= 50 and len(np.unique(val_scores)) >= 7
-        else "raw_argmax"
-    )
+    _threshold_method = "max_macro_fault_f1"
 
     metrics: dict = {
         "score_name": "pv_maat_score",
-        "score_fusion": "logsumexp_z",
-        "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
-        "score_tau": 1.0,
-        "threshold_policy": "validation_pr_curve_f1",
-        "selection_metric": "0.85*val_pv_maat_f1 + 0.15*val_macro_fault_pr_auc",
+        "score_fusion": OFFICIAL_SCORE_FUSION,
+        "score_components": ["product"],
+        "score_tau": None,
+        "threshold_policy": THRESHOLD_POLICY_NAME,
+        "selection_metric": SELECTION_METRIC_NAME,
         "official_score_reduction": "max",
-        "score_reduction_scope": "all_components_temporal",
-        "diagnostic_score_reductions": ["q95", "top10mean"],
+        "score_reduction_scope": "product_temporal",
         "val_positive_count": _val_n_pos,
         "threshold_selection_method": _threshold_method,
         "val_pr_auc": val_pr_auc,
@@ -2247,6 +1362,9 @@ def run_maat(config: dict | None = None) -> None:
         "threshold": threshold,
         "product_val_pr_auc": product_val_pr_auc,
         "val_macro_fault_pr_auc": _val_macro_fault_pr_auc_base,
+        "val_macro_fault_f1": val_macro_fault_f1,
+        "val_worst_fault_precision": val_worst_fault_precision,
+        "val_normal_fpr": val_normal_fpr,
         "test_pv_maat_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "product_test_pr_auc": product_test_pr_auc,
@@ -2274,11 +1392,8 @@ def run_maat(config: dict | None = None) -> None:
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
     manifest_path = artifacts_dir / "features_manifest.json"
-    decomposition_path = artifacts_dir / "score_decomposition_metrics.json"
     calibration_path = artifacts_dir / "score_calibration.json"
-    diag_reductions_path = artifacts_dir / "diagnostic_score_reductions.json"
 
-    write_json(global_metrics_path, metrics)
     joblib.dump(scaler, scaler_path)
     params_path.write_text(json.dumps(best_params, indent=2, default=str), encoding="utf-8")
     config_path.write_text(
@@ -2286,19 +1401,23 @@ def run_maat(config: dict | None = None) -> None:
         encoding="utf-8",
     )
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    score_fusion_name = OFFICIAL_SCORE_FUSION
+    score_components = ["product"]
+    score_tau = None
+    write_json(global_metrics_path, metrics)
+
     calibration_payload = {
         **build_score_calibration_payload(
             threshold=threshold,
-            threshold_policy="validation_pr_curve_f1",
+            threshold_policy=THRESHOLD_POLICY_NAME,
             threshold_quantile=None,
         ),
         "score_name": "pv_maat_score",
-        "score_fusion": "logsumexp_z",
-        "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
+        "score_fusion": score_fusion_name,
+        "score_components": score_components,
+        "score_tau": score_tau,
         "official_score_reduction": "max",
-        "score_reduction_scope": "all_components_temporal",
-        "pv_score_stats": final_lit._pv_score_stats,
-        "diag_score_stats": final_lit._diag_score_stats,
+        "score_reduction_scope": "product_temporal",
     }
     write_json(calibration_path, calibration_payload)
     per_class_labels = test_original_labels if test_original_labels is not None else test_labels
@@ -2335,14 +1454,13 @@ def run_maat(config: dict | None = None) -> None:
         extras={
             "checkpoint_available": bool(best_ckpt_path),
             "score_name": "pv_maat_score",
-            "score_fusion": "logsumexp_z",
-            "score_components": ["product", "dc_voltage_drop", "mismatch_imbalance"],
-            "score_tau": 1.0,
-            "threshold_policy": "validation_pr_curve_f1",
-            "selection_metric": "val_pv_maat_f1",
+            "score_fusion": score_fusion_name,
+            "score_components": score_components,
+            "score_tau": score_tau,
+            "threshold_policy": THRESHOLD_POLICY_NAME,
+            "selection_metric": SELECTION_METRIC_NAME,
             "official_score_reduction": "max",
-            "score_reduction_scope": "all_components_temporal",
-            "diagnostic_score_reductions": ["q95", "top10mean"],
+            "score_reduction_scope": "product_temporal",
             "score_calibration_artifact": calibration_path.name,
         },
     )
@@ -2354,245 +1472,17 @@ def run_maat(config: dict | None = None) -> None:
     _save_score_histogram(val_scores, val_labels, threshold, histogram_path)
     _save_score_timeline(test_scores, test_labels, threshold, timeline_path)
 
-    decomposition_report = None
-    if all(
-        x is not None for x in (
-            val_recon_scores,
-            val_assoc_scores,
-            val_assoc_affinity_scores,
-            val_original_labels,
-            test_recon_scores,
-            test_assoc_scores,
-            test_assoc_affinity_scores,
-            val_mismatch_scores,
-            test_mismatch_scores,
-            val_voltage_drop_scores,
-            test_voltage_drop_scores,
-            test_original_labels,
-        )
-    ):
-        val_parts = {
-            "product": val_product_scores,
-            "reconstruction": val_recon_scores,
-            "association_discrepancy": val_assoc_scores,
-            "association_affinity": val_assoc_affinity_scores,
-            "dc_voltage_drop": val_voltage_drop_scores,
-            "mismatch_imbalance": val_mismatch_scores,
-        }
-        test_parts = {
-            "product": test_product_scores,
-            "reconstruction": test_recon_scores,
-            "association_discrepancy": test_assoc_scores,
-            "association_affinity": test_assoc_affinity_scores,
-            "dc_voltage_drop": test_voltage_drop_scores,
-            "mismatch_imbalance": test_mismatch_scores,
-        }
-        if val_drift_scores is not None and test_drift_scores is not None:
-            val_parts["drift_efficiency"] = val_drift_scores
-            test_parts["drift_efficiency"] = test_drift_scores
-
-        decomposition_report, _decomp_best = _build_score_decomposition_report(
-            val_parts=val_parts,
-            test_parts=test_parts,
-            val_labels=val_labels,
-            test_labels=test_labels,
-            val_original_labels=val_original_labels,
-            test_original_labels=test_original_labels,
-        )
-        decomposition_path.write_text(
-            json.dumps(decomposition_report, indent=2, default=str), encoding="utf-8"
-        )
-        max_recon_product = decomposition_report["scores"]["max_z_recon_product"]
-        logger.info(
-            "Score decomposition — max_z_recon_product test_pr_auc={:.4f} test_macro_fault_pr_auc={:.4f}",
-            max_recon_product["test"]["pr_auc"], max_recon_product["test_macro_fault_pr_auc"],
-        )
-
-        # If any decomposition variant has a better blended validation objective
-        # (0.85*val_f1 + 0.15*val_macro_fault_pr_auc) than the current headline
-        # (pv_maat_score), override the headline with that variant. Selection is
-        # purely val-based, so benchmark protocol remains intact.
-        _base_selection_score = 0.85 * val_f1 + 0.15 * _macro_fault_pr_auc(val_original_labels, val_scores)
-        if _decomp_best and _decomp_best.get("selection_score", -1.0) > _base_selection_score:
-            _alt_val_s = _decomp_best["val_scores"]
-            _alt_test_s = _decomp_best["test_scores"]
-            _alt_thr = _decomp_best["threshold"]
-            _alt_name = _decomp_best["name"]
-            _alt_val_preds = (_alt_val_s >= _alt_thr).astype(int)
-            _alt_test_preds = (_alt_test_s >= _alt_thr).astype(int)
-
-            _alt_meta = dict(_decomp_best.get("metadata", {}))
-            # Resolve fusion method, component names, and tau from tracked metadata,
-            # falling back to the static lookup for legacy decomposition entries.
-            _alt_fusion_method, _alt_components, _alt_tau = _FUSION_METADATA.get(
-                _alt_name, ("unknown", [_alt_name], None)
-            )
-            _alt_fusion_method = str(_alt_meta.get("score_fusion", _alt_fusion_method))
-            _alt_components = list(_alt_meta.get("score_components", _alt_components))
-            _alt_tau = _alt_meta.get("score_tau", _alt_tau)
-            _alt_meta_model = _alt_meta.get("meta_model")
-            # Per-component z-score stats needed to reproduce the alt fusion at deploy time.
-            # Std fallback matches _zscore_from_val exactly: <= 1e-12 or non-finite → 1.0.
-            def _safe_std(arr: np.ndarray) -> float:
-                s = float(np.std(arr))
-                return s if s > 1e-12 and math.isfinite(s) else 1.0
-
-            _alt_zscore_stats = {
-                comp: {
-                    "mean": float(np.mean(val_parts[comp])),
-                    "std": _safe_std(val_parts[comp]),
-                }
-                for comp in _alt_components
-                if comp in val_parts and _alt_fusion_method in {"max_z", "logsumexp_z"}
-            }
-            # Threshold method for the alt score.
-            # len(f1_vals) in _calibrate_threshold equals len(np.unique(scores)) (sklearn
-            # precision_recall_curve appends a trailing precision=1/recall=0 point, so
-            # len(prec[:-1]) == len(thresholds) == len(np.unique(scores))).
-            _alt_threshold_method = (
-                "smoothed_argmax_5"
-                if _val_n_pos >= 50 and len(np.unique(_alt_val_s)) >= 7
-                else "raw_argmax"
-            )
-
-            logger.info(
-                "Decomp-best fusion '{}' selection={:.4f} (val_f1={:.4f}, val_macro_fault_pr_auc={:.4f}) "
-                "> pv_maat selection={:.4f} — overriding headline metrics.",
-                _alt_name,
-                float(_decomp_best.get("selection_score", 0.0)),
-                float(_decomp_best.get("val_f1", 0.0)),
-                float(_decomp_best.get("val_macro_fault_pr_auc", 0.0)),
-                _base_selection_score,
-            )
-
-            val_f1 = _decomp_best["val_f1"]
-            val_prec = float(precision_score(val_labels, _alt_val_preds, zero_division=0))
-            val_rec = float(recall_score(val_labels, _alt_val_preds, zero_division=0))
-            val_acc = float(accuracy_score(val_labels, _alt_val_preds))
-            val_episode_macro_f1 = _episode_macro_f1_binary(val_labels, _alt_val_preds, val_group_ids)
-            val_pr_auc = _safe_pr_auc(val_labels, _alt_val_s)
-            val_roc_auc = _safe_roc_auc(val_labels, _alt_val_s)
-            val_selection_score = float(_decomp_best.get("selection_score", val_f1))
-            threshold = _alt_thr
-
-            test_f1 = float(f1_score(test_labels, _alt_test_preds, zero_division=0))
-            test_pr_auc = _safe_pr_auc(test_labels, _alt_test_s)
-            test_roc_auc = _safe_roc_auc(test_labels, _alt_test_s)
-            test_prec = float(precision_score(test_labels, _alt_test_preds, zero_division=0))
-            test_rec = float(recall_score(test_labels, _alt_test_preds, zero_division=0))
-            test_acc = float(accuracy_score(test_labels, _alt_test_preds))
-            test_episode_macro_f1 = _episode_macro_f1_binary(
-                test_labels, _alt_test_preds, test_group_ids
-            )
-
-            for _k, _v in {
-                "score_name": _alt_name, "headline_fusion": _alt_name,
-                "score_fusion": _alt_fusion_method,
-                "score_components": _alt_components,
-                "score_tau": _alt_tau,
-                "threshold_selection_method": _alt_threshold_method,
-                "selection_metric": "0.85*val_pv_maat_f1 + 0.15*val_macro_fault_pr_auc",
-                "val_macro_fault_pr_auc": float(_decomp_best.get("val_macro_fault_pr_auc", 0.0)),
-                "headline_selection_score": val_selection_score,
-                "val_pr_auc": val_pr_auc, "val_roc_auc": val_roc_auc,
-                "val_pv_maat_f1": val_f1, "val_pv_maat_accuracy": val_acc,
-                "val_pv_maat_precision": val_prec, "val_pv_maat_recall": val_rec,
-                "val_episode_macro_f1": val_episode_macro_f1, "val_selection_score": val_selection_score,
-                "threshold": threshold,
-                "test_pv_maat_pr_auc": test_pr_auc, "test_roc_auc": test_roc_auc,
-                "test_pv_maat_f1": test_f1, "test_pv_maat_accuracy": test_acc,
-                "test_pv_maat_precision": test_prec, "test_pv_maat_recall": test_rec,
-                "test_episode_macro_f1": test_episode_macro_f1,
-            }.items():
-                metrics[_k] = _v
-            write_json(global_metrics_path, metrics)
-
-            # Re-generate all reporting artifacts with the winning fusion.
-            _alt_per_class_labels = (
-                test_original_labels if test_original_labels is not None else test_labels
-            )
-            write_json(
-                per_class_metrics_path,
-                compute_anomaly_per_class_metrics(
-                    labels=_alt_per_class_labels, scores=_alt_test_s, threshold=_alt_thr,
-                ),
-            )
-            _save_pr_curve(_alt_val_s, val_labels, _alt_test_s, test_labels, pr_curve_path)
-            _save_score_histogram(_alt_val_s, val_labels, _alt_thr, histogram_path)
-            _save_score_timeline(_alt_test_s, test_labels, _alt_thr, timeline_path)
-
-            # Calibration: update threshold + record headline fusion. pv_score_stats
-            # is retained as-is (it documents the base model's scoring pipeline).
-            # alt_fusion_zscore_stats is included only for z-score-based fusions.
-            write_json(calibration_path, {
-                **build_score_calibration_payload(
-                    threshold=_alt_thr,
-                    threshold_policy="validation_pr_curve_f1",
-                    threshold_quantile=None,
-                ),
-                "score_name": _alt_name,
-                "score_fusion": _alt_fusion_method,
-                "score_components": _alt_components,
-                "score_tau": _alt_tau,
-                "official_score_reduction": "max",
-                "score_reduction_scope": "all_components_temporal",
-                "headline_fusion": _alt_name,
-                "headline_threshold": _alt_thr,
-                "pv_score_stats": final_lit._pv_score_stats,
-                "diag_score_stats": final_lit._diag_score_stats,
-                **({"alt_fusion_meta_model": _alt_meta_model} if _alt_meta_model is not None else {}),
-                **({"alt_fusion_zscore_stats": _alt_zscore_stats} if _alt_zscore_stats else {}),
-            })
-
-            # Deployment manifest: update threshold and score identity.
-            write_json(deployment_manifest_path, build_deployment_manifest(
-                task=args.task,
-                model="maat",
-                model_family="anomaly_dl",
-                model_artifact=model_artifact_rel,
-                scaler_artifact=scaler_path.name,
-                feature_names=features,
-                label_column=label_col,
-                threshold=_alt_thr,
-                window_size=int(final_maat_cfg["win_size"]),
-                score_direction="higher_is_more_anomalous",
-                classes=[str(c) for c in sorted(np.unique(_alt_per_class_labels).tolist())],
-                extras={
-                    "checkpoint_available": bool(best_ckpt_path),
-                    "score_name": _alt_name,
-                    "score_fusion": _alt_fusion_method,
-                    "score_components": _alt_components,
-                    "score_tau": _alt_tau,
-                    "threshold_policy": "validation_pr_curve_f1",
-                    "selection_metric": "0.85*val_pv_maat_f1 + 0.15*val_macro_fault_pr_auc",
-                    "official_score_reduction": "max",
-                    "score_reduction_scope": "all_components_temporal",
-                    "score_calibration_artifact": calibration_path.name,
-                    **({"alt_fusion_meta_model": _alt_meta_model} if _alt_meta_model is not None else {}),
-                    **({"alt_fusion_zscore_stats": _alt_zscore_stats} if _alt_zscore_stats else {}),
-                },
-            ))
+    logger.info(
+        "Final MAAT score uses '{}' over components={} (tau={})",
+        score_fusion_name,
+        score_components,
+        score_tau,
+    )
 
     if stage_results:
         for sr in stage_results:
             trials_df = sr.study.trials_dataframe()
             trials_df.to_csv(artifacts_dir / f"hpo_trials_{sr.name}.csv", index=False)
-
-    if val_diag_scores is not None and test_diag_scores is not None:
-        diag_report: dict[str, dict[str, float]] = {}
-        for name in ("q95", "top10mean"):
-            val_s = val_diag_scores[name]
-            test_s = test_diag_scores[name]
-            normal_val = val_s[val_labels == 0]
-            diag_thr = float(np.quantile(normal_val, 0.95)) if len(normal_val) else float(np.quantile(val_s, 0.95))
-            diag_report[name] = {
-                "threshold": diag_thr,
-                "val_f1": float(f1_score(val_labels, (val_s >= diag_thr).astype(int), zero_division=0)),
-                "test_f1": float(f1_score(test_labels, (test_s >= diag_thr).astype(int), zero_division=0)),
-                "val_pr_auc": _safe_pr_auc(val_labels, val_s),
-                "test_pr_auc": _safe_pr_auc(test_labels, test_s),
-            }
-        write_json(diag_reductions_path, diag_report)
 
     logger.info(f"Artifacts saved → {artifacts_dir}")
 
@@ -2634,9 +1524,7 @@ def run_maat(config: dict | None = None) -> None:
                 histogram_path,
                 timeline_path,
                 manifest_path,
-                decomposition_path,
                 calibration_path,
-                diag_reductions_path,
             ):
                 if p.exists():
                     mlflow.log_artifact(str(p))
@@ -2666,13 +1554,13 @@ def run_maat(config: dict | None = None) -> None:
                 "block_size": int(final_maat_cfg["block_size"]),
                 "score_reduction": final_maat_cfg.get("score_reduction", "center"),
                 "score_name": metrics.get("score_name", "pv_maat_score"),
-                "score_fusion": metrics.get("score_fusion", "logsumexp_z"),
-                "score_components": metrics.get("score_components", ["product", "dc_voltage_drop", "mismatch_imbalance"]),
-                "score_tau": metrics.get("score_tau", 1.0),
+                "score_fusion": metrics.get("score_fusion", OFFICIAL_SCORE_FUSION),
+                "score_components": metrics.get("score_components", []),
+                "score_tau": metrics.get("score_tau"),
                 "headline_fusion": metrics.get("headline_fusion", "pv_maat_score"),
-                "threshold_policy": "validation_pr_curve_f1",
-                "selection_metric": metrics.get("selection_metric", "val_pv_maat_f1"),
-                "score_reduction_scope": "all_components_temporal",
+                "threshold_policy": THRESHOLD_POLICY_NAME,
+                "selection_metric": metrics.get("selection_metric", SELECTION_METRIC_NAME),
+                "score_reduction_scope": "product_temporal",
                 "threshold": threshold,
                 "val_pr_auc": val_pr_auc,
                 "val_roc_auc": val_roc_auc,
