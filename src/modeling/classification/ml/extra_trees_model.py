@@ -277,8 +277,8 @@ def run_extra_trees(config: dict | None = None) -> None:
                 sampler_name=hpo_sampler,
                 pruner_name=str(hpo_pruner) if hpo_pruner is not None else None,
                 storage_url=str(hpo_storage) if hpo_storage else None,
-                study_name=f"{hpo_study_prefix}_{args.dataset}_{args.split_path}_{effective_profile}",
-                load_if_exists=True,
+                study_name=f"{hpo_study_prefix}_{args.dataset}_{args.split_path}_{effective_profile}_{run_name}",
+                load_if_exists=False,
             )
             best_params = _build_extra_trees_params(
                 best_base_params,

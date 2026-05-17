@@ -497,8 +497,8 @@ def run_lightgbm(config: dict | None = None) -> None:
                 sampler_name=hpo_sampler,
                 pruner_name=str(hpo_pruner) if hpo_pruner is not None else None,
                 storage_url=str(hpo_storage) if hpo_storage else None,
-                study_name=f"{hpo_study_prefix}_{args.dataset}_{args.split_path}_{effective_profile}",
-                load_if_exists=True,
+                study_name=f"{hpo_study_prefix}_{args.dataset}_{args.split_path}_{effective_profile}_{run_name}",
+                load_if_exists=False,
                 on_trial_complete=on_trial_complete,
             )
 
@@ -517,7 +517,7 @@ def run_lightgbm(config: dict | None = None) -> None:
                     if isinstance(v, (str, int, float, bool))
                 }
             )
-            logger.info("Optuna complete | best_val_f1_weighted={:.6f}", float(study.best_value))
+            logger.info("Optuna complete | best_val_f1_macro={:.6f}", float(study.best_value))
 
             trials_artifact = (
                 get_experiments_root() / "metrics" / "classification_optuna_trials.csv"

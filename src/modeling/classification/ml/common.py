@@ -8,6 +8,7 @@ from typing import Any, cast
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, ClassifierMixin
 import yaml
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import (
@@ -433,25 +434,21 @@ def resolve_calibration_config(config: dict) -> dict:
     }
 
 
-class _PrefitEstimator:
+class _PrefitEstimator(ClassifierMixin, BaseEstimator):
     """Wraps a fitted model so CalibratedClassifierCV never refits it.
 
     sklearn >= 1.4 removed cv='prefit'. CalibratedClassifierCV with an iterable cv
     still clones and calls .fit() on each fold's train split. This wrapper makes
     .fit() a no-op while forwarding predict_proba to the original fitted model,
     so the calibrator is fitted on val probabilities without touching the base model.
+
+    Inheriting BaseEstimator provides __sklearn_tags__ (required by sklearn 1.8+)
+    and the standard get_params/set_params via __init__ introspection.
+    ClassifierMixin sets estimator_type='classifier' so is_classifier() returns True.
     """
 
     def __init__(self, fitted_model=None):
         self.fitted_model = fitted_model
-
-    def get_params(self, deep: bool = True) -> dict:
-        return {"fitted_model": self.fitted_model}
-
-    def set_params(self, **params):
-        for k, v in params.items():
-            setattr(self, k, v)
-        return self
 
     def fit(self, X, y, **kwargs):
         return self
