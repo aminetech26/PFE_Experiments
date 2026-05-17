@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, precision_score, recall_score
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -35,6 +35,21 @@ def q95_normal_val_threshold(
     return float(np.quantile(finite_scores, float(quantile)))
 
 
+def _optimal_f1_threshold(
+    scores: np.ndarray,
+    binary_labels: np.ndarray,
+) -> tuple[float, float]:
+    """Return (threshold, best_f1) maximising F1 on the PR curve."""
+    prec, rec, thresholds = precision_recall_curve(binary_labels, scores)
+    f1_vals = np.where(
+        (prec[:-1] + rec[:-1]) > 0,
+        2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1]),
+        0.0,
+    )
+    best_idx = int(np.argmax(f1_vals))
+    return float(thresholds[best_idx]), float(f1_vals[best_idx])
+
+
 def build_score_calibration_payload(
     *,
     threshold: float,
@@ -42,6 +57,7 @@ def build_score_calibration_payload(
     threshold_quantile: float | None = 0.95,
     score_direction: str = "higher_is_more_anomalous",
     score_stats: dict | None = None,
+    candidate_per_true_class_thresholds: dict | None = None,
 ) -> dict:
     """Build score_calibration.json payload.
 
@@ -58,7 +74,53 @@ def build_score_calibration_payload(
     }
     if threshold_quantile is not None:
         payload["threshold_quantile"] = float(threshold_quantile)
+    if candidate_per_true_class_thresholds is not None:
+        payload["candidate_per_true_class_thresholds"] = candidate_per_true_class_thresholds
     return payload
+
+
+def compute_macro_per_class_pr_auc(
+    *,
+    labels: np.ndarray,
+    scores: np.ndarray,
+    normal_label: float | int = 0,
+) -> dict[str, float | dict[str, float | None] | None]:
+    """Compute class-vs-normal PR-AUC aggregates across non-normal classes.
+
+    Returns macro/worst PR-AUC and a per-class map for ``{normal_label, cls}``
+    one-vs-normal subsets.
+    """
+    labels_arr = np.asarray(labels)
+    scores_arr = np.asarray(scores, dtype=float)
+
+    per_class: dict[str, float | None] = {}
+    values: list[float] = []
+    unique_labels = sorted(np.unique(labels_arr).tolist())
+    for cls in unique_labels:
+        if float(cls) == float(normal_label):
+            continue
+
+        class_mask = (labels_arr == cls) | (labels_arr == normal_label)
+        y_true = (labels_arr[class_mask] == cls).astype(int)
+        if y_true.sum() == 0 or (y_true == 0).sum() == 0:
+            continue
+
+        cls_scores = scores_arr[class_mask]
+        cls_key = str(int(cls) if float(cls).is_integer() else cls)
+        try:
+            pr_auc = float(average_precision_score(y_true, cls_scores))
+            values.append(pr_auc)
+            per_class[cls_key] = pr_auc
+        except Exception:
+            per_class[cls_key] = None
+
+    macro = float(np.mean(values)) if values else None
+    worst = float(np.min(values)) if values else None
+    return {
+        "macro_per_class_pr_auc": macro,
+        "worst_class_pr_auc": worst,
+        "per_class_pr_auc_vs_normal": per_class,
+    }
 
 
 def compute_anomaly_per_class_metrics(
@@ -66,18 +128,25 @@ def compute_anomaly_per_class_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
     threshold: float,
+    val_labels: np.ndarray | None = None,
+    val_scores: np.ndarray | None = None,
     normal_label: float | int = 0,
 ) -> dict[str, dict[str, float | int | None]]:
     """Compute class-vs-normal metrics for each non-normal class.
 
     For each fault class ``cls``, metrics are evaluated on the filtered subset
-    ``{normal_label, cls}`` only. This matches Task A semantics (fault vs normal)
-    and avoids penalizing a binary anomaly detector for not separating fault
-    classes from each other.
+    ``{normal_label, cls}`` only (test side). If ``val_labels`` and ``val_scores``
+    are provided, also computes a per-class optimal threshold ``T_k*`` calibrated
+    on the val subset ``{normal_label, cls}`` and reports metrics at ``T_k*`` on test.
+    Existing global-threshold fields are preserved for backward compatibility.
     """
     labels_arr = np.asarray(labels)
     scores_arr = np.asarray(scores, dtype=float)
     threshold_val = float(threshold)
+
+    has_val = val_labels is not None and val_scores is not None
+    val_labels_arr = np.asarray(val_labels) if has_val else None
+    val_scores_arr = np.asarray(val_scores, dtype=float) if has_val else None
 
     out: dict[str, dict[str, float | int | None]] = {}
     unique_labels = sorted(np.unique(labels_arr).tolist())
@@ -107,6 +176,31 @@ def compute_anomaly_per_class_metrics(
         recall = float(recall_score(y_true, cls_preds, zero_division=0))
         f1 = float(f1_score(y_true, cls_preds, zero_division=0))
 
+        # Per-class optimal threshold calibrated on val
+        per_class_thr: float | None = None
+        prec_at_pc: float | None = None
+        rec_at_pc: float | None = None
+        f1_at_pc: float | None = None
+        val_support_fault: int | None = None
+        val_support_normal: int | None = None
+        val_f1_at_pc: float | None = None
+
+        if has_val:
+            val_class_mask = (val_labels_arr == cls) | (val_labels_arr == normal_label)
+            y_val_k = (val_labels_arr[val_class_mask] == cls).astype(int)
+            s_val_k = val_scores_arr[val_class_mask]
+            if y_val_k.sum() >= 2 and int((y_val_k == 0).sum()) >= 1:
+                try:
+                    per_class_thr, val_f1_at_pc = _optimal_f1_threshold(s_val_k, y_val_k)
+                    val_support_fault = int(y_val_k.sum())
+                    val_support_normal = int((val_labels_arr[val_class_mask] == normal_label).sum())
+                    cls_preds_pc = (cls_scores >= per_class_thr).astype(int)
+                    prec_at_pc = float(precision_score(y_true, cls_preds_pc, zero_division=0))
+                    rec_at_pc = float(recall_score(y_true, cls_preds_pc, zero_division=0))
+                    f1_at_pc = float(f1_score(y_true, cls_preds_pc, zero_division=0))
+                except Exception:
+                    pass
+
         out[str(int(cls) if float(cls).is_integer() else cls)] = {
             "support_fault": support,
             "support_normal": support_normal,
@@ -114,8 +208,60 @@ def compute_anomaly_per_class_metrics(
             "precision_at_threshold_vs_normal": precision,
             "recall_at_threshold_vs_normal": recall,
             "f1_at_threshold_vs_normal": f1,
+            "per_class_threshold": per_class_thr,
+            "precision_at_per_class_threshold": prec_at_pc,
+            "recall_at_per_class_threshold": rec_at_pc,
+            "f1_at_per_class_threshold": f1_at_pc,
+            "candidate_per_true_class_threshold": per_class_thr,
+            "precision_at_candidate_per_true_class_threshold": prec_at_pc,
+            "recall_at_candidate_per_true_class_threshold": rec_at_pc,
+            "f1_at_candidate_per_true_class_threshold": f1_at_pc,
+            "val_support_fault": val_support_fault,
+            "val_support_normal": val_support_normal,
+            "val_f1_at_per_class_threshold": val_f1_at_pc,
+            "val_f1_at_candidate_per_true_class_threshold": val_f1_at_pc,
         }
     return out
+
+
+def build_candidate_per_true_class_thresholds(
+    per_class_metrics: dict[str, dict[str, float | int | None]],
+    *,
+    normal_label: float | int = 0,
+) -> dict:
+    """Build diagnostic candidate thresholds payload for score calibration artifacts."""
+    thresholds: dict[str, dict[str, float | int | None]] = {}
+    for cls_str, m in per_class_metrics.items():
+        threshold = m.get("candidate_per_true_class_threshold", m.get("per_class_threshold"))
+        if threshold is None:
+            continue
+        thresholds[cls_str] = {
+            "threshold": threshold,
+            "val_f1": m.get("val_f1_at_per_class_threshold"),
+            "val_support_fault": m.get("val_support_fault"),
+            "val_support_normal": m.get("val_support_normal"),
+            "test_precision": m.get(
+                "precision_at_candidate_per_true_class_threshold",
+                m.get("precision_at_per_class_threshold"),
+            ),
+            "test_recall": m.get(
+                "recall_at_candidate_per_true_class_threshold",
+                m.get("recall_at_per_class_threshold"),
+            ),
+            "test_f1": m.get(
+                "f1_at_candidate_per_true_class_threshold",
+                m.get("f1_at_per_class_threshold"),
+            ),
+            "test_pr_auc": m.get("pr_auc_vs_normal"),
+        }
+
+    return {
+        "threshold_policy": "validation_true_class_pr_curve_f1",
+        "deployment_ready": False,
+        "intended_use": "diagnostic_or_candidate_class_conditioned_gate",
+        "normal_label": normal_label,
+        "thresholds": thresholds,
+    }
 
 
 def build_run_manifest(

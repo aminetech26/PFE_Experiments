@@ -29,9 +29,11 @@ from sklearn.svm import OneClassSVM
 from src.evaluation.leakage_checks import performance_sanity_check
 from src.mlflow_setup import init_tracking
 from src.modeling.common.artifact_contract import (
+    build_candidate_per_true_class_thresholds,
     build_deployment_manifest,
     build_run_manifest,
     build_score_calibration_payload,
+    compute_macro_per_class_pr_auc,
     compute_anomaly_per_class_metrics,
     write_json,
 )
@@ -390,9 +392,9 @@ def run_one_class_svm(config: dict | None = None) -> None:
         model = OneClassSVM(kernel=kernel, **fixed_params, **trial_params)
         model.fit(x_fit)
         scores = _anomaly_score(model, x_val_scaled)
-        thr, f1, _, _ = _calibrate_threshold(scores, y_val_bin)
-        preds = (scores >= thr).astype(int)
-        return float(f1_score(y_val_bin, preds, zero_division=0))
+        macro = compute_macro_per_class_pr_auc(labels=y_val, scores=scores)
+        val_macro = macro.get("macro_per_class_pr_auc")
+        return float(val_macro) if isinstance(val_macro, (int, float, np.integer, np.floating)) else 0.0
 
     if args.no_optuna:
         best_params = midpoint_params_from_space(search_space)
@@ -410,7 +412,11 @@ def run_one_class_svm(config: dict | None = None) -> None:
             pruner_name=str(hpo_cfg.get("pruner", "none")),
             study_name=(f"{hpo_cfg.get('study_name_prefix', 'anomaly_ml')}_ocsvm_{kernel}"),
         )
-        logger.info(f"Best params: {best_params} | Best val objective (F1@val_best_thr): {study.best_value:.4f}")
+        logger.info(
+            "Best params: {} | Best val objective (macro per-class PR-AUC): {:.4f}",
+            best_params,
+            study.best_value,
+        )
 
     # ── Final model ───────────────────────────────────────────────────────────
     logger.info("Fitting final model…")
@@ -448,7 +454,17 @@ def run_one_class_svm(config: dict | None = None) -> None:
 
     val_episode_macro_f1 = episode_macro_f1_binary(y_val_bin, val_preds, val_group_ids)
     test_episode_macro_f1 = episode_macro_f1_binary(y_test_bin, test_preds, test_group_ids)
-    val_selection_score = val_f1
+    val_macro_stats = compute_macro_per_class_pr_auc(labels=y_val, scores=val_scores)
+    test_macro_stats = compute_macro_per_class_pr_auc(labels=y_test, scores=test_scores)
+    val_macro_per_class_pr_auc = val_macro_stats.get("macro_per_class_pr_auc")
+    val_worst_class_pr_auc = val_macro_stats.get("worst_class_pr_auc")
+    test_macro_per_class_pr_auc = test_macro_stats.get("macro_per_class_pr_auc")
+    test_worst_class_pr_auc = test_macro_stats.get("worst_class_pr_auc")
+    val_selection_score = (
+        float(val_macro_per_class_pr_auc)
+        if isinstance(val_macro_per_class_pr_auc, (int, float, np.integer, np.floating))
+        else 0.0
+    )
 
     metrics: dict = {
         "val_pr_auc": val_pr_auc,
@@ -458,6 +474,8 @@ def run_one_class_svm(config: dict | None = None) -> None:
         "val_precision_at_threshold": val_prec,
         "val_recall_at_threshold": val_rec,
         "val_episode_macro_f1": val_episode_macro_f1,
+        "val_macro_per_class_pr_auc": val_macro_per_class_pr_auc,
+        "val_worst_class_pr_auc": val_worst_class_pr_auc,
         "val_selection_score": val_selection_score,
         "threshold": threshold,
         "threshold_policy": "validation_pr_curve_f1",
@@ -468,6 +486,12 @@ def run_one_class_svm(config: dict | None = None) -> None:
         "test_precision_at_threshold": test_prec_val,
         "test_recall_at_threshold": test_rec_val,
         "test_episode_macro_f1": test_episode_macro_f1,
+        "test_macro_per_class_pr_auc": test_macro_per_class_pr_auc,
+        "test_worst_class_pr_auc": test_worst_class_pr_auc,
+        "test_class1_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("1"),
+        "test_class2_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("2"),
+        "test_class3_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("3"),
+        "test_class4_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("4"),
         "n_train_total": int(len(x_train)),
         "n_train_used_for_fit": int(len(x_fit)),
         "sampling_groups": int(sampling_meta.get("n_groups", 0)),
@@ -505,6 +529,12 @@ def run_one_class_svm(config: dict | None = None) -> None:
         labels=y_test,
         scores=test_scores,
         threshold=threshold,
+        val_labels=y_val,
+        val_scores=val_scores,
+    )
+    candidate_per_true_class_thresholds = build_candidate_per_true_class_thresholds(
+        per_class_metrics,
+        normal_label=0,
     )
     run_name = f"anomaly_one_class_svm_{kernel}_{ts}"
     run_manifest = build_run_manifest(
@@ -541,6 +571,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
             threshold=threshold,
             threshold_policy="validation_pr_curve_f1",
             threshold_quantile=None,
+            candidate_per_true_class_thresholds=candidate_per_true_class_thresholds,
         ),
     )
     write_json(global_metrics_path, metrics)
@@ -617,6 +648,17 @@ def run_one_class_svm(config: dict | None = None) -> None:
                 }
             )
             mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
+            for cls_str, m in per_class_metrics.items():
+                if m.get("per_class_threshold") is not None:
+                    mlflow.log_metric(f"test_f1_class{cls_str}_per_class", m["f1_at_per_class_threshold"])
+                    mlflow.log_metric(f"test_f1_class{cls_str}_global", m["f1_at_threshold_vs_normal"])
+                    mlflow.log_metric(f"per_class_threshold_class{cls_str}", m["per_class_threshold"])
+                    mlflow.log_metric(
+                        f"candidate_per_true_class_threshold_class{cls_str}",
+                        m["candidate_per_true_class_threshold"],
+                    )
+                if m.get("pr_auc_vs_normal") is not None:
+                    mlflow.log_metric(f"test_pr_auc_class{cls_str}_vs_normal", m["pr_auc_vs_normal"])
             for p in (
                 global_metrics_path,
                 per_class_metrics_path,
@@ -661,9 +703,17 @@ def run_one_class_svm(config: dict | None = None) -> None:
                 "val_pr_auc": val_pr_auc,
                 "val_roc_auc": val_roc_auc,
                 "val_f1_at_threshold": val_f1,
+                "val_macro_per_class_pr_auc": val_macro_per_class_pr_auc,
+                "val_worst_class_pr_auc": val_worst_class_pr_auc,
                 "val_accuracy_at_threshold": val_acc,
                 "test_pr_auc": test_pr_auc,
                 "test_roc_auc": test_roc_auc,
+                "test_macro_per_class_pr_auc": test_macro_per_class_pr_auc,
+                "test_worst_class_pr_auc": test_worst_class_pr_auc,
+                "test_class1_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("1"),
+                "test_class2_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("2"),
+                "test_class3_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("3"),
+                "test_class4_pr_auc_vs_normal": test_macro_stats.get("per_class_pr_auc_vs_normal", {}).get("4"),
                 "test_accuracy_at_threshold": test_acc,
                 "test_f1_at_threshold": test_f1,
                 "test_precision_at_threshold": test_prec_val,
