@@ -11,13 +11,12 @@ This module provides:
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
 from loguru import logger
-from scipy.fft import rfft
-from scipy.signal import welch
 
 # ============================================================================
 # BASIC HELPERS
@@ -134,6 +133,7 @@ def add_rolling_statistics_features(
         original_index = None
 
     added: list[str] = []
+    generated_cols: dict[str, pd.Series] = {}
     grouped = out.groupby(segment_col, sort=False) if segment_col in out.columns else None
     for col in usable_cols:
         base_series = out[col]
@@ -181,11 +181,14 @@ def add_rolling_statistics_features(
             for stat_name, values in stats_data.items():
                 col_name = f"{col}_roll{w}_{stat_name}"
                 if grouped is not None:
-                    out[col_name] = values.reset_index(level=0, drop=True)
+                    series = values.reset_index(level=0, drop=True)
                 else:
-                    out[col_name] = values
-                out[col_name] = out[col_name].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    series = values
+                generated_cols[col_name] = series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
                 added.append(col_name)
+
+    if generated_cols:
+        out = pd.concat([out, pd.DataFrame(generated_cols, index=out.index)], axis=1)
 
     if original_index is not None:
         out = out.loc[original_index]
@@ -475,10 +478,8 @@ def extract_window_statistics(x: np.ndarray) -> np.ndarray:
     """
     Collapse windows to statistical features.
     Input: (n_windows, window_size, n_features)
-    Output: (n_windows, n_features * 8)
+    Output: (n_windows, n_features * 6)
     """
-    from scipy.stats import kurtosis, skew
-
     n, w, f = x.shape
     features = []
     for i in range(f):
@@ -487,30 +488,11 @@ def extract_window_statistics(x: np.ndarray) -> np.ndarray:
         features.append(ch.std(axis=1))
         features.append(ch.min(axis=1))
         features.append(ch.max(axis=1))
-        features.append(skew(ch, axis=1))
-        features.append(kurtosis(ch, axis=1))
         features.append(np.sqrt((ch**2).mean(axis=1)))
         zcr = ((np.diff(np.sign(ch), axis=1) != 0).sum(axis=1)) / max(w - 1, 1)
         features.append(zcr)
 
     return np.column_stack(features).astype(np.float32)
-
-
-def extract_fft_features(x: np.ndarray, n_top_freqs: int = 5) -> np.ndarray:
-    """
-    Extract top-N spectral power features from each window and channel.
-    Input: (n_windows, window_size, n_features)
-    Output: (n_windows, n_features * n_top_freqs)
-    """
-    _, _, f = x.shape
-    results = []
-    for i in range(f):
-        ch = x[:, :, i]
-        fft_mag = np.abs(rfft(ch, axis=1))[:, 1:]
-        idx = np.argsort(fft_mag, axis=1)[:, -n_top_freqs:]
-        top_mags = np.take_along_axis(fft_mag, idx, axis=1)
-        results.append(top_mags)
-    return np.concatenate(results, axis=1).astype(np.float32)
 
 
 def add_multiscale_window_features(
@@ -521,11 +503,6 @@ def add_multiscale_window_features(
     label_col: str | None = None,
     segment_col: str = "segment_id",
     fs: float = 1.0,
-    # per-method spectral flags
-    enable_fft: bool = False,
-    n_top_freqs: int = 5,
-    enable_psd: bool = False,
-    psd_n_bands: int = 5,
     enable_wpd: bool = False,
     wpd_level: int = 3,
     wpd_wavelet: str = "db4",
@@ -536,7 +513,7 @@ def add_multiscale_window_features(
 ) -> tuple[pd.DataFrame, list[str]]:
     """
     Collapse a row-aligned DataFrame into fixed-size windows with multi-scale statistics
-    and optional spectral features (PSD, WPD, CEEMDAN — Path B only).
+    and optional spectral features (WPD, CEEMDAN — Path B only).
 
     The largest value in window_sizes is the primary window (determines row count and stride).
     Each smaller scale takes the last `w` samples of the primary window — nested sub-windows.
@@ -555,17 +532,12 @@ def add_multiscale_window_features(
         return pd.DataFrame(), []
 
     _spectral_ok = fs >= spectral_min_fs
-    if not _spectral_ok and any([enable_fft, enable_psd, enable_wpd, enable_ceemdan]):
+    if not _spectral_ok and any([enable_wpd, enable_ceemdan]):
         logger.warning(
             f"Sampling rate {fs} Hz < spectral_min_fs {spectral_min_fs} Hz — "
             "skipping all spectral features for this dataset."
         )
-        enable_fft = enable_psd = enable_wpd = enable_ceemdan = False
-
-    # PSD subsumes raw FFT top-N — disable FFT if PSD is active
-    if enable_psd and enable_fft:
-        logger.info("PSD enabled: auto-disabling raw FFT top-N (PSD subsumes it).")
-        enable_fft = False
+        enable_wpd = enable_ceemdan = False
 
     groups: list[tuple] = (
         list(df.groupby(segment_col, sort=False)) if segment_col in df.columns else [(None, df)]
@@ -589,7 +561,7 @@ def add_multiscale_window_features(
         for w in window_sizes_sorted:
             scale_buffers[w].append(primary_windows[:, primary - w :, :])
 
-        if any([enable_fft, enable_psd, enable_wpd, enable_ceemdan]):
+        if any([enable_wpd, enable_ceemdan]):
             primary_buffer.append(primary_windows)
 
         if labels is not None:
@@ -601,7 +573,7 @@ def add_multiscale_window_features(
         logger.warning("No windows produced — check window_size vs segment lengths.")
         return pd.DataFrame(), []
 
-    stat_names = ["mean", "std", "min", "max", "skew", "kurtosis", "rms", "zcr"]
+    stat_names = ["mean", "std", "min", "max", "rms", "zcr"]
     parts: list[np.ndarray] = []
     col_names: list[str] = []
 
@@ -615,20 +587,6 @@ def add_multiscale_window_features(
 
     if primary_buffer:
         x_primary = np.concatenate(primary_buffer, axis=0)
-
-        if enable_fft:
-            fft_feats = extract_fft_features(x_primary, n_top_freqs)
-            parts.append(fft_feats)
-            for feat in usable_cols:
-                for k in range(1, n_top_freqs + 1):
-                    col_names.append(f"{feat}_fft_top{k}")
-
-        if enable_psd:
-            psd_feats = extract_psd_features(x_primary, fs=fs, n_bands=psd_n_bands)
-            parts.append(psd_feats)
-            for feat in usable_cols:
-                for b in range(psd_n_bands):
-                    col_names.append(f"{feat}_psd_band{b}")
 
         if enable_wpd:
             wpd_feats = extract_wpd_features(x_primary, wavelet=wpd_wavelet, level=wpd_level)
@@ -658,39 +616,6 @@ def add_multiscale_window_features(
         result_df[label_col] = label_buffer
 
     return result_df, col_names
-
-
-# ============================================================================
-# SPECTRAL FEATURES (Path B only)
-# ============================================================================
-
-
-def extract_psd_features(
-    x: np.ndarray,
-    fs: float = 1.0,
-    n_bands: int = 5,
-) -> np.ndarray:
-    """
-    Welch PSD band energies per window and channel.
-
-    Input:  (n_windows, window_size, n_features)
-    Output: (n_windows, n_features * n_bands)
-
-    Each channel's PSD is divided into n_bands equal-width bins across [0, Nyquist].
-    The feature per band is the integral (sum) of PSD in that bin.
-    """
-    n_wins, win_size, n_feats = x.shape
-    nperseg = min(win_size, max(8, win_size // 4))
-    results = []
-    for i in range(n_feats):
-        ch = x[:, :, i]  # (n_wins, win_size)
-        freqs, psd_all = welch(ch, fs=fs, nperseg=nperseg, axis=-1)  # psd_all: (n_wins, n_freqs)
-        bin_edges = np.linspace(0, len(freqs), n_bands + 1, dtype=int)
-        band_energies = np.zeros((n_wins, n_bands), dtype=np.float32)
-        for b in range(n_bands):
-            band_energies[:, b] = psd_all[:, bin_edges[b] : bin_edges[b + 1]].sum(axis=1)
-        results.append(band_energies)
-    return np.hstack(results).astype(np.float32)
 
 
 def extract_wpd_features(
@@ -751,35 +676,63 @@ def extract_ceemdan_features(
     Requires emd-signal package (already in project deps).
     """
     try:
-        import emd as _emd
-
-        _complete_ensemble_sift = _emd.sift.complete_ensemble_sift
-    except (ImportError, AttributeError):
-        logger.error(
-            "emd-signal not available or missing complete_ensemble_sift — skipping CEEMDAN features."
-        )
-        n_wins, _, n_feats = x.shape
-        return np.zeros((n_wins, n_feats * n_imfs), dtype=np.float32)
+        from PyEMD import CEEMDAN
+    except ImportError as exc:
+        raise ImportError(
+            "PyEMD is required for CEEMDAN features but is not available. "
+            "Install dependency 'EMD-signal' / 'PyEMD' before running CEEMDAN profiles."
+        ) from exc
 
     n_wins, _, n_feats = x.shape
     results = []
+    ceemdan = CEEMDAN(trials=n_ensemble)
+    min_energy = 1e-12
+    min_std = 1e-8
+    skipped_flat = 0
+    skipped_nonfinite = 0
+    failed_decomp = 0
+
     for i in range(n_feats):
         ch = x[:, :, i]
         imf_energies = np.zeros((n_wins, n_imfs), dtype=np.float32)
         for w in range(n_wins):
-            signal = ch[w].astype(np.float64)
-            total_energy = float(np.sum(signal**2)) + 1e-10
+            signal = np.nan_to_num(ch[w].astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+            if not np.all(np.isfinite(signal)):
+                skipped_nonfinite += 1
+                continue
+
+            total_energy = float(np.sum(signal**2))
+            if total_energy <= min_energy or float(np.std(signal)) <= min_std:
+                skipped_flat += 1
+                continue
+
             try:
-                imfs, _ = _complete_ensemble_sift(
-                    signal,
-                    nensembles=n_ensemble,
-                    nprocesses=1,
-                )
-                for k in range(min(n_imfs, imfs.shape[1])):
-                    imf_energies[w, k] = float(np.sum(imfs[:, k] ** 2)) / total_energy
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    imfs = np.asarray(ceemdan.ceemdan(signal, max_imf=n_imfs), dtype=np.float64)
+
+                if imfs.ndim != 2 or imfs.shape[0] == 0:
+                    continue
+
+                imfs = np.nan_to_num(imfs, nan=0.0, posinf=0.0, neginf=0.0)
+                usable_imfs = imfs[:-1] if imfs.shape[0] > 1 else imfs
+                for k in range(min(n_imfs, usable_imfs.shape[0])):
+                    imf_energies[w, k] = float(np.sum(usable_imfs[k] ** 2)) / total_energy
             except Exception as e:
+                failed_decomp += 1
                 logger.debug(f"CEEMDAN failed for window {w}, feature {i}: {e}")
         results.append(imf_energies)
+
+    total_pairs = n_wins * n_feats
+    if skipped_flat or skipped_nonfinite or failed_decomp:
+        logger.info(
+            "CEEMDAN guards: skipped_flat={} skipped_nonfinite={} failed_decomp={} total_pairs={}",
+            skipped_flat,
+            skipped_nonfinite,
+            failed_decomp,
+            total_pairs,
+        )
+
     return np.hstack(results).astype(np.float32)
 
 
@@ -851,7 +804,9 @@ def apply_hygiene_pruning(
     if {"pdc", "pdc1", "pdc2"}.issubset(keep_set):
         lhs = train_df["pdc"].to_numpy(dtype=np.float64)
         rhs = (train_df["pdc1"] + train_df["pdc2"]).to_numpy(dtype=np.float64)
-        if np.allclose(lhs, rhs, equal_nan=True, atol=1e-9, rtol=1e-9):
+        close_mask = np.isclose(lhs, rhs, equal_nan=True, atol=1e-9, rtol=1e-9)
+        close_ratio = float(np.mean(close_mask)) if close_mask.size else 0.0
+        if np.all(close_mask):
             keep = [c for c in keep if c != "pdc"]
             dropped_log.append(
                 {
@@ -859,6 +814,11 @@ def apply_hygiene_pruning(
                     "paired_with": "pdc1+pdc2",
                     "reason": "deterministic_alias",
                 }
+            )
+        else:
+            logger.info(
+                "Hygiene alias check kept 'pdc': equivalence with pdc1+pdc2 holds for {:.2%} rows",
+                close_ratio,
             )
 
     keep_extra = [c for c in train_df.columns if c not in feature_cols]
@@ -882,6 +842,8 @@ def apply_mrmr_selection(
     feature_cols: list[str],
     label_col: str,
     k: int,
+    max_rows: int | None = 30000,
+    seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], list[dict]]:
     """Greedy mRMR (MID criterion): maximize relevance - redundancy."""
     from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
@@ -893,18 +855,105 @@ def apply_mrmr_selection(
         logger.warning("mRMR skipped: missing label column")
         return train_df, val_df, test_df, cols, []
 
-    if k <= 0 or k >= len(cols):
+    if k <= 0:
+        logger.info("mRMR skipped: k={} is non-positive", k)
         return train_df, val_df, test_df, cols, []
 
-    x_df = train_df[cols].replace([np.inf, -np.inf], np.nan)
-    x_df = x_df.fillna(x_df.median(numeric_only=True))
-    x = x_df.to_numpy(dtype=np.float64)
+    if k >= len(cols):
+        logger.info("mRMR skipped: k={} >= available feature count {}", k, len(cols))
+        return train_df, val_df, test_df, cols, []
 
     y_raw = train_df[label_col]
     y_codes, _ = pd.factorize(y_raw, sort=True)
     if len(np.unique(y_codes)) <= 1:
         logger.warning("mRMR skipped: single-class train target")
         return train_df, val_df, test_df, cols, []
+
+    x_df = train_df[cols].replace([np.inf, -np.inf], np.nan)
+    x_df = x_df.fillna(x_df.median(numeric_only=True))
+
+    if max_rows and len(x_df) > max_rows:
+
+        def _proportional_quotas(counts: dict[int, int], total: int) -> dict[int, int]:
+            total_count = sum(counts.values())
+            raw = {k: (v / total_count) * total for k, v in counts.items()}
+            q = {k: int(np.floor(v)) for k, v in raw.items()}
+            rem = total - sum(q.values())
+            if rem > 0:
+                order = sorted(counts.keys(), key=lambda k: raw[k] - q[k], reverse=True)
+                for k in order[:rem]:
+                    q[k] += 1
+            return q
+
+        def _pick_group_col(df: pd.DataFrame) -> str | None:
+            for c in ("episode_id", "segment_id", "operating_day_id"):
+                if c in df.columns and bool(df[c].notna().any()):
+                    return c
+            return None
+
+        rng = np.random.default_rng(seed)
+        y_arr = np.asarray(y_codes)
+        cls_counts = {int(c): int(np.sum(y_arr == c)) for c in np.unique(y_arr)}
+        cls_quota = _proportional_quotas(cls_counts, int(max_rows))
+        group_col = _pick_group_col(train_df)
+        sampled_idx: list[int] = []
+
+        for cls, quota in cls_quota.items():
+            cls_idx = np.flatnonzero(y_arr == cls)
+            if quota <= 0 or len(cls_idx) == 0:
+                continue
+            if quota >= len(cls_idx):
+                sampled_idx.extend(cls_idx.tolist())
+                continue
+
+            if group_col is None:
+                sampled_idx.extend(rng.choice(cls_idx, size=quota, replace=False).tolist())
+                continue
+
+            groups = train_df.iloc[cls_idx][group_col].fillna("__NA__")
+            grp_counts = groups.value_counts().to_dict()
+            grp_quota = _proportional_quotas(
+                {i: int(v) for i, v in enumerate(grp_counts.values())}, quota
+            )
+            grp_keys = list(grp_counts.keys())
+
+            for gi, gval in enumerate(grp_keys):
+                g_rows = cls_idx[np.flatnonzero(groups.to_numpy() == gval)]
+                gq = int(grp_quota.get(gi, 0))
+                if gq <= 0:
+                    continue
+                if gq >= len(g_rows):
+                    sampled_idx.extend(g_rows.tolist())
+                else:
+                    # Temporal spacing within group to reduce autocorrelation.
+                    g_rows_sorted = np.array(sorted(g_rows), dtype=np.int64)
+                    pos = np.linspace(0, len(g_rows_sorted) - 1, num=gq, dtype=int)
+                    sampled_idx.extend(g_rows_sorted[pos].tolist())
+
+        sampled_idx = sorted(set(int(i) for i in sampled_idx))
+        if len(sampled_idx) < max_rows:
+            remaining = np.setdiff1d(
+                np.arange(len(x_df), dtype=np.int64), np.array(sampled_idx, dtype=np.int64)
+            )
+            top_up = rng.choice(remaining, size=max_rows - len(sampled_idx), replace=False)
+            sampled_idx.extend(int(i) for i in top_up.tolist())
+            sampled_idx = sorted(set(sampled_idx))
+        elif len(sampled_idx) > max_rows:
+            sampled_idx = sorted(
+                rng.choice(
+                    np.array(sampled_idx, dtype=np.int64), size=max_rows, replace=False
+                ).tolist()
+            )
+
+        x_df = x_df.iloc[sampled_idx]
+        y_codes = y_codes[sampled_idx]
+        logger.info(
+            "mRMR row cap applied: sampled {} / {} rows (strategy=proportional stratified group-aware)",
+            len(sampled_idx),
+            len(train_df),
+        )
+
+    x = x_df.to_numpy(dtype=np.float64)
 
     relevance_arr = mutual_info_classif(x, y_codes, random_state=42)
     relevance = {c: float(relevance_arr[i]) for i, c in enumerate(cols)}
@@ -940,6 +989,8 @@ def apply_mrmr_selection(
             break
         selected.append(best_col)
         remaining.remove(best_col)
+        if len(selected) % 5 == 0 or len(selected) == k:
+            logger.info("mRMR progress: selected {}/{} features", len(selected), k)
 
     dropped_log = [
         {"dropped": c, "reason": "mrmr_not_selected", "relevance": relevance.get(c, 0.0)}

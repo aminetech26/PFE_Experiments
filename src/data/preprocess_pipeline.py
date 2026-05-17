@@ -46,10 +46,35 @@ def get_active_dataset(config: dict) -> str:
 def get_feature_cols(config: dict, dataset: str) -> list[str]:
     """Resolve dataset-aware base feature columns used by preprocessing."""
     dataset_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
+    preprocess_sensor_cols = dataset_cfg.get("preprocessing", {}).get("sensor_columns")
+    if preprocess_sensor_cols:
+        return list(preprocess_sensor_cols)
+
     sensor_cols = dataset_cfg.get("feature_engineering", {}).get("sensor_columns")
     if sensor_cols:
         return list(sensor_cols)
     return list(DEFAULT_BASE_FEATURE_COLUMNS)
+
+
+def get_label_col(config: dict, dataset: str) -> str:
+    """Resolve dataset-aware label column name."""
+    dataset_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
+    return str(dataset_cfg.get("label_col", "label"))
+
+
+def _restore_costa_power_channels(df: pd.DataFrame, dataset: str) -> pd.DataFrame:
+    """Restore Costa power-channel invariants from cleaned primary sensors."""
+    if dataset != "costa":
+        return df
+    required = {"vdc1", "vdc2", "idc1", "idc2"}
+    if not required.issubset(df.columns):
+        return df
+
+    out = df.copy()
+    out["pdc1"] = out["vdc1"] * out["idc1"]
+    out["pdc2"] = out["vdc2"] * out["idc2"]
+    out["pdc"] = out["pdc1"] + out["pdc2"]
+    return out
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -69,17 +94,20 @@ def resolve_preprocess_config(config: dict, dataset: str) -> dict:
     return deep_merge(base_cfg, dataset_override)
 
 
-def normalize_preprocess_schema(preprocess_cfg: dict) -> dict:
-    """Normalize legacy config keys to the current preprocessing schema."""
-    normalized = dict(preprocess_cfg)
-    if "stationarity" in normalized and "physics_normalization" not in normalized:
-        normalized["physics_normalization"] = normalized.pop("stationarity")
-    return normalized
+# Note: physics_normalization / stationarity handling has been moved out of
+# preprocessing and into feature-engineering. We therefore don't perform any
+# schema promotion here; resolve_preprocess_config already returns the
+# effective preprocessing config for a dataset.
 
 
 def resolve_effective_preprocess_config(config: dict, dataset: str, split_path: str) -> dict:
-    """Resolve dataset and split-path aware preprocessing config."""
-    effective = normalize_preprocess_schema(resolve_preprocess_config(config, dataset))
+    """Resolve dataset and split-path aware preprocessing config.
+
+    This intentionally does not remap legacy `stationarity` keys into
+    `physics_normalization` — physics normalization is now considered
+    part of feature engineering and should be handled elsewhere.
+    """
+    effective = resolve_preprocess_config(config, dataset)
     dataset_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
     path_override = (
         dataset_cfg.get("splits", {})
@@ -88,7 +116,7 @@ def resolve_effective_preprocess_config(config: dict, dataset: str, split_path: 
         .get("preprocessing", {})
     )
     if path_override:
-        effective = deep_merge(effective, normalize_preprocess_schema(path_override))
+        effective = deep_merge(effective, path_override)
     return effective
 
 
@@ -113,7 +141,7 @@ def _sanity_check_subset(
     errors: list[str] = []
 
     # 1. Label integrity
-    if df[label_col].isna().any():
+    if bool(df[label_col].isna().any()):
         errors.append(f"{tag} label column contains NaN after preprocessing")
     if len(df) == 0:
         errors.append(f"{tag} output is empty — all rows dropped")
@@ -229,9 +257,10 @@ def preprocess_split(
     input_dir: Path,
     output_dir: Path,
     split_name: str,
+    dataset: str,
     feature_cols: list[str],
     preprocess_config: dict,
-    label_col: str = "Fault",
+    label_col: str = "label",
     split_path: str = "path_a",
 ) -> dict:
     """
@@ -241,6 +270,7 @@ def preprocess_split(
         input_dir: Directory containing train.parquet, val.parquet, test.parquet
         output_dir: Output directory for preprocessed files
         split_name: Name of the split for logging
+        dataset: Dataset name
         feature_cols: Feature columns to preprocess
         preprocess_config: Preprocessing configuration dict
         label_col: Label column name
@@ -256,7 +286,6 @@ def preprocess_split(
     processed_frames: dict[str, pd.DataFrame] = {}
 
     train_bounds = None
-    train_irr_residual_params = None
     processing_order = ["train", "val", "test"]
 
     for subset in processing_order:
@@ -285,14 +314,18 @@ def preprocess_split(
             logger.warning("  No segment_id column, creating single segment")
             df["segment_id"] = 0
 
-        # Check for label column
-        if label_col not in df.columns:
-            # Try 'label' as fallback
-            if "label" in df.columns:
-                df[label_col] = df["label"]
-            else:
-                logger.error(f"  No label column '{label_col}' found!")
-                continue
+        # Resolve label column for this subset without fabricating schema
+        if label_col in df.columns:
+            active_label_col = label_col
+        elif "label" in df.columns:
+            logger.warning(
+                "  Requested label column '{}' missing, using fallback 'label'",
+                label_col,
+            )
+            active_label_col = "label"
+        else:
+            logger.error(f"  No label column '{label_col}' or fallback 'label' found!")
+            continue
 
         total_input_rows += len(df)
 
@@ -303,10 +336,11 @@ def preprocess_split(
             config=preprocess_config,
             timestamp_col="timestamp",
             segment_col="segment_id",
-            label_col=label_col,
+            label_col=active_label_col,
             outlier_reference_bounds=train_bounds if subset != "train" else None,
-            irr_residual_reference_params=train_irr_residual_params if subset != "train" else None,
         )
+
+        df_processed = _restore_costa_power_channels(df_processed, dataset)
 
         total_output_rows += len(df_processed)
 
@@ -316,7 +350,7 @@ def preprocess_split(
             subset=subset,
             split_name=split_name,
             feature_cols=available_features,
-            label_col=label_col,
+            label_col=active_label_col,
         )
 
         # Save
@@ -334,9 +368,6 @@ def preprocess_split(
                 col: tuple(bounds)
                 for col, bounds in stats.get("outliers", {}).get("bounds", {}).items()
             }
-            raw_params = stats.get("physics_normalization", {}).get("irr_residual_params", {})
-            if raw_params:
-                train_irr_residual_params = {feat: tuple(vals) for feat, vals in raw_params.items()}
 
     # Cross-split checks after all subsets processed
     _sanity_check_cross_split(processed_frames, split_name, split_path=split_path)
@@ -360,28 +391,19 @@ def create_manifest(
     manifest = {
         "version": 1,
         "created_at": datetime.now(UTC).isoformat(),
-        "config_used": config.get("preprocessing", {}),
+        # Only include explicit preprocessing config (exclude physics_normalization);
+        # physics_normalization is a feature-engineering concern now.
+        "config_used": (
+            lambda c: {
+                k: v
+                for k, v in (c.get("preprocessing") or {}).items()
+                if k != "physics_normalization"
+            }
+        )(config),
         "split_path": config.get("split_path", "path_a"),
         "splits": split_stats,
         "features_created": [],
     }
-
-    stat_config = config.get("preprocessing", {}).get("physics_normalization") or {}
-    if stat_config.get("irradiance_normalize"):
-        features = stat_config["irradiance_normalize"].get("features", [])
-        suffix = stat_config["irradiance_normalize"].get("suffix", "_norm")
-        manifest["features_created"].extend([f"{f}{suffix}" for f in features])
-
-    if stat_config.get("irr_residualize"):
-        features = stat_config["irr_residualize"].get("features", [])
-        suffix = stat_config["irr_residualize"].get("suffix", "_irr_residual")
-        manifest["features_created"].extend([f"{f}{suffix}" for f in features])
-
-    # Embed train-fit OLS params so downstream steps can verify/reproduce
-    train_stats = split_stats.get("train", {}).get("subset_stats", {}).get("train", {})
-    irr_params = train_stats.get("physics_normalization", {}).get("irr_residual_params", {})
-    if irr_params:
-        manifest["irr_residual_params"] = irr_params
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str)
@@ -413,7 +435,7 @@ def main() -> None:
 
     preprocess_config = resolve_effective_preprocess_config(config, args.dataset, args.split_path)
     feature_cols = get_feature_cols(config, args.dataset)
-    label_col = "Fault"
+    label_col = get_label_col(config, args.dataset)
 
     logger.info(f"Feature columns: {feature_cols}")
     logger.info(f"Label column: {label_col}")
@@ -449,6 +471,7 @@ def main() -> None:
             input_dir=input_dir,
             output_dir=output_dir,
             split_name=split_name,
+            dataset=args.dataset,
             feature_cols=feature_cols,
             preprocess_config=preprocess_config,
             label_col=label_col,

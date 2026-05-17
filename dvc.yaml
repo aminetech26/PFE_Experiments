@@ -42,7 +42,7 @@ stages:
       - data/processed/preprocessed/${active_dataset}/classification/
       - configs/data_config.yaml
     outs:
-      - data/processed/features/latest_runs.json
+      - data/processed/features/${active_dataset}/
 
   # Stage 3: active dataset Task B classification baseline
   train_classification:
@@ -51,16 +51,18 @@ stages:
       - src/modeling/classification/ml/run.py
       - src/modeling/classification/ml/lightgbm_trainer.py
       - src/modeling/classification/ml/lightgbm_model.py
-      - src/modeling/classification/ml/xgboost_model.py
       - src/modeling/classification/ml/catboost_model.py
       - src/modeling/classification/ml/extra_trees_model.py
       - src/modeling/common/feature_loader.py
       - src/modeling/common/hyperparameter_optimizer.py
       - src/modeling/common/system_resources.py
       - configs/model_config.yaml
-      - data/processed/features/latest_runs.json
+      - data/processed/features/${active_dataset}/latest_runs.json
+    # Classification runners create timestamped artifact dirs under
+    # experiments/classification/<model>/<run_name>/
+    # and append aggregate records under experiments/metrics/*.jsonl.
     metrics:
-      - experiments/metrics/classification_results.json:
+      - experiments/metrics/classification_comparison_records.jsonl:
           cache: false
     outs:
       - experiments/checkpoints/classification/lightgbm_model.pkl

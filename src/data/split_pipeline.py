@@ -18,6 +18,9 @@ import argparse
 import json
 from pathlib import Path
 
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import polars as pl
 import yaml
@@ -33,6 +36,7 @@ from src.data.splitting import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "configs" / "data_config.yaml"
+matplotlib.use("Agg")
 
 
 def load_config() -> dict:
@@ -84,7 +88,7 @@ def load_and_segment_data(config: dict, dataset: str = "reunion") -> pd.DataFram
     Returns DataFrame with standardised columns: timestamp | label | segment_id | <sensors>
     """
     paths = config["paths"]
-    split_cfg = config["splits"]
+    split_cfg = effective_split_cfg(config, dataset)
 
     # Resolve dataset config from registry
     dataset_cfg = paths.get("datasets", {}).get(dataset)
@@ -175,6 +179,24 @@ def dataset_split_cfg(config: dict, dataset: str) -> dict:
     return config.get("paths", {}).get("datasets", {}).get(dataset, {}).get("splits", {})
 
 
+def _merge_dict(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def effective_split_cfg(config: dict, dataset: str) -> dict:
+    """Resolve split settings with dataset overrides on top of global defaults."""
+    global_cfg = dict(config.get("splits", {}))
+    ds_cfg = dict(dataset_split_cfg(config, dataset))
+    ds_cfg.pop("comparison_paths", None)
+    return _merge_dict(global_cfg, ds_cfg)
+
+
 def available_group_columns(df: pd.DataFrame) -> list[str]:
     return [
         c
@@ -218,6 +240,169 @@ def build_multilabel_support_report(
     return report
 
 
+def _label_key(value: object) -> str:
+    """Stable JSON key for class labels."""
+    try:
+        f = float(value)
+        if f.is_integer():
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def _group_support(frame: pd.DataFrame, label: object, group_col: str) -> int:
+    if group_col not in frame.columns:
+        return 0
+    subset = frame[frame["label"] == label]
+    if subset.empty:
+        return 0
+    return int(subset[group_col].nunique())
+
+
+def _window_support(frame: pd.DataFrame, label: object, window_size: int) -> int:
+    rows = int((frame["label"] == label).sum())
+    if window_size <= 0:
+        return rows
+    return rows // window_size
+
+
+def _numeric_feature_columns(df: pd.DataFrame) -> list[str]:
+    excluded = {
+        "label",
+        "timestamp",
+        "segment_id",
+        "episode_id",
+        "continuity_segment_id",
+        "operating_day",
+        "operating_day_id",
+    }
+    cols: list[str] = []
+    for col in df.columns:
+        if col in excluded:
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            cols.append(col)
+    return cols
+
+
+def _ks_2sample(sample_a: np.ndarray, sample_b: np.ndarray) -> float:
+    """Compute two-sample KS statistic without scipy dependency."""
+    if sample_a.size == 0 or sample_b.size == 0:
+        return 0.0
+    a = np.sort(sample_a)
+    b = np.sort(sample_b)
+    combined = np.concatenate([a, b])
+    cdf_a = np.searchsorted(a, combined, side="right") / a.size
+    cdf_b = np.searchsorted(b, combined, side="right") / b.size
+    return float(np.max(np.abs(cdf_a - cdf_b)))
+
+
+def _wasserstein_1d(sample_a: np.ndarray, sample_b: np.ndarray) -> float:
+    """Approximate 1D Wasserstein distance on a common quantile grid."""
+    if sample_a.size == 0 or sample_b.size == 0:
+        return 0.0
+    q = np.linspace(0.0, 1.0, 101)
+    qa = np.quantile(sample_a, q)
+    qb = np.quantile(sample_b, q)
+    return float(np.mean(np.abs(qa - qb)))
+
+
+def write_representativeness_artifacts(
+    output_dir: Path,
+    split_frames: dict[str, pd.DataFrame],
+    group_col: str,
+    window_size: int,
+    normal_label: float = 0.0,
+) -> None:
+    """Write split representativeness tables and drift plots for thesis reporting."""
+    val_df = split_frames["val"]
+    test_df = split_frames["test"]
+    labels = sorted(set(val_df["label"].dropna().unique()).union(test_df["label"].dropna().unique()))
+
+    support: dict[str, dict[str, int]] = {}
+    for label in labels:
+        key = _label_key(label)
+        support[key] = {
+            "val_rows": int((val_df["label"] == label).sum()),
+            "test_rows": int((test_df["label"] == label).sum()),
+            "val_episodes": _group_support(val_df, label, group_col),
+            "test_episodes": _group_support(test_df, label, group_col),
+            "val_windows": _window_support(val_df, label, window_size),
+            "test_windows": _window_support(test_df, label, window_size),
+        }
+
+    with open(output_dir / "representativeness_support.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "group_column": group_col,
+                "window_size": window_size,
+                "val_rows": len(val_df),
+                "test_rows": len(test_df),
+                "class_support": support,
+            },
+            f,
+            indent=2,
+        )
+
+    support_df = pd.DataFrame.from_dict(support, orient="index")
+    support_df.index.name = "label"
+    support_df.to_csv(output_dir / "representativeness_support.csv")
+
+    feature_cols = _numeric_feature_columns(pd.concat([val_df, test_df], axis=0, ignore_index=True))
+    if not feature_cols:
+        logger.warning("No numeric features found for representativeness drift in {}", output_dir)
+        return
+
+    normal_val = val_df[val_df["label"] == normal_label]
+    normal_test = test_df[test_df["label"] == normal_label]
+    drift_rows: list[dict[str, float | str]] = []
+    for col in feature_cols:
+        val_all = val_df[col].to_numpy(dtype=float)
+        test_all = test_df[col].to_numpy(dtype=float)
+        val_all = val_all[np.isfinite(val_all)]
+        test_all = test_all[np.isfinite(test_all)]
+
+        val_norm = normal_val[col].to_numpy(dtype=float) if not normal_val.empty else np.array([])
+        test_norm = normal_test[col].to_numpy(dtype=float) if not normal_test.empty else np.array([])
+        val_norm = val_norm[np.isfinite(val_norm)]
+        test_norm = test_norm[np.isfinite(test_norm)]
+
+        drift_rows.append(
+            {
+                "feature": col,
+                "ks_all": _ks_2sample(val_all, test_all),
+                "wasserstein_all": _wasserstein_1d(val_all, test_all),
+                "ks_normal_only": _ks_2sample(val_norm, test_norm),
+                "wasserstein_normal_only": _wasserstein_1d(val_norm, test_norm),
+            }
+        )
+
+    drift_df = pd.DataFrame(drift_rows).sort_values(
+        by=["ks_normal_only", "ks_all"], ascending=False
+    )
+    drift_df.to_csv(output_dir / "representativeness_feature_drift.csv", index=False)
+
+    top_drift = drift_df.head(12)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = np.arange(len(top_drift))
+    ax.bar(x - 0.18, top_drift["ks_normal_only"], width=0.36, label="KS normal-only")
+    ax.bar(x + 0.18, top_drift["ks_all"], width=0.36, label="KS all rows")
+    ax.set_xticks(x)
+    ax.set_xticklabels(top_drift["feature"], rotation=45, ha="right")
+    ax.set_ylabel("KS statistic")
+    ax.set_title("Top val/test feature drift")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "representativeness_feature_drift.png", dpi=150)
+    plt.close(fig)
+
+    logger.info(
+        "Representativeness artifacts written: support + drift for {} features", len(feature_cols)
+    )
+
+
 def run_anomaly_semisup_split(
     df: pd.DataFrame, config: dict, output_base: Path, dataset: str
 ) -> None:
@@ -226,7 +411,7 @@ def run_anomaly_semisup_split(
     logger.info("[1/3] Anomaly Detection — Semi-Supervised (Temporal Hybrid)")
     logger.info("Train: Normal-only (temporal) | Val/Test: Normal + faults (temporal)")
 
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
 
     artifacts = hybrid_semisup_split(
         df=df,
@@ -255,6 +440,12 @@ def run_anomaly_semisup_split(
             "available_group_columns": available_group_columns(df),
         },
     )
+    write_representativeness_artifacts(
+        output_dir=output_base / "anomaly_semisup",
+        split_frames={"train": artifacts.train, "val": artifacts.val, "test": artifacts.test},
+        group_col=atomic_group_col,
+        window_size=30,
+    )
 
     # Verify train is normal-only
     train_labels = artifacts.train["label"].unique()
@@ -270,7 +461,7 @@ def run_anomaly_supervised_split(
     logger.info("[2/3] Anomaly Detection — Supervised (Temporal-Stratified)")
     logger.info("All sets: Temporal order preserved within each class")
 
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
 
     artifacts = segment_stratified_split(
         df=df,
@@ -299,6 +490,12 @@ def run_anomaly_supervised_split(
             "available_group_columns": available_group_columns(df),
         },
     )
+    write_representativeness_artifacts(
+        output_dir=output_base / "anomaly_supervised",
+        split_frames={"train": artifacts.train, "val": artifacts.val, "test": artifacts.test},
+        group_col=atomic_group_col,
+        window_size=30,
+    )
 
 
 def run_classification_split(
@@ -308,7 +505,7 @@ def run_classification_split(
     logger.info("=" * 50)
     logger.info("[3/3] Fault Classification (Temporal-Stratified, Evaluable Classes)")
 
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
     dataset_split_cfg = (
         config.get("paths", {}).get("datasets", {}).get(dataset, {}).get("splits", {})
     )
@@ -378,6 +575,13 @@ def run_classification_split(
     with open(output_dir / "split_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str)
 
+    write_representativeness_artifacts(
+        output_dir=output_dir,
+        split_frames={"train": train_filtered, "val": val_filtered, "test": test_filtered},
+        group_col=dataset_split_cfg.get("atomic_group_col", "segment_id"),
+        window_size=30,
+    )
+
     logger.success(
         f"classification: train={len(train_filtered):,}, "
         f"val={len(val_filtered):,}, test={len(test_filtered):,}"
@@ -392,7 +596,7 @@ def run_classification_split(
 
 def run_path_b_splits(df: pd.DataFrame, config: dict, output_base: Path, dataset: str) -> None:
     """Generate Costa Path B day-based chronological splits with day-level purge."""
-    split_cfg = config.get("splits", {})
+    split_cfg = effective_split_cfg(config, dataset)
     ds_split_cfg = dataset_split_cfg(config, dataset)
     path_b_cfg = ds_split_cfg.get("comparison_paths", {}).get("path_b", {})
     if dataset != "costa" or not path_b_cfg.get("enabled", False):
@@ -430,6 +634,16 @@ def run_path_b_splits(df: pd.DataFrame, config: dict, output_base: Path, dataset
             "forward_boundary_purge_fraction": boundary_purge_fraction,
         },
     )
+    write_representativeness_artifacts(
+        output_dir=path_b_base / "anomaly_semisup",
+        split_frames={
+            "train": semisup_artifacts.train,
+            "val": semisup_artifacts.val,
+            "test": semisup_artifacts.test,
+        },
+        group_col=group_col,
+        window_size=30,
+    )
 
     supervised_artifacts = blocked_temporal_split(
         df=df,
@@ -453,6 +667,16 @@ def run_path_b_splits(df: pd.DataFrame, config: dict, output_base: Path, dataset
             "available_group_columns": available_group_columns(df),
             "forward_boundary_purge_fraction": boundary_purge_fraction,
         },
+    )
+    write_representativeness_artifacts(
+        output_dir=path_b_base / "anomaly_supervised",
+        split_frames={
+            "train": supervised_artifacts.train,
+            "val": supervised_artifacts.val,
+            "test": supervised_artifacts.test,
+        },
+        group_col=group_col,
+        window_size=30,
     )
 
     evaluable_classes = ds_split_cfg.get("evaluable_classes", [])
@@ -497,6 +721,12 @@ def run_path_b_splits(df: pd.DataFrame, config: dict, output_base: Path, dataset
     }
     with open(cls_output_dir / "split_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, default=str)
+    write_representativeness_artifacts(
+        output_dir=cls_output_dir,
+        split_frames={"train": train_filtered, "val": val_filtered, "test": test_filtered},
+        group_col=group_col,
+        window_size=30,
+    )
     logger.success(
         "path_b/classification: train={}, val={}, test={}",
         len(train_filtered),

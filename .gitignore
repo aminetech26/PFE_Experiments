@@ -34,6 +34,7 @@ experiments/
 # ── Jupyter ───────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+notebooks/colab_baseline_runner.ipynb  # Contains credentials
 
 # ── IDEs ──────────────────────────────────────────────────────────────────
 .vscode/settings.json

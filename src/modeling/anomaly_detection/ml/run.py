@@ -6,7 +6,9 @@ from pathlib import Path
 
 import yaml
 
-from src.modeling.anomaly_detection.ml.matrix_profile_model import run_matrix_profile
+from src.modeling.anomaly_detection.ml.isolation_forest_model import run_isolation_forest
+from src.modeling.anomaly_detection.ml.one_class_svm_model import run_one_class_svm
+from src.modeling.anomaly_detection.ml.xgboost_model import run_xgboost_anomaly
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 MODEL_CONFIG_PATH = PROJECT_ROOT / "configs" / "model_config.yaml"
@@ -42,14 +44,22 @@ def main() -> None:
     config = _load_model_config()
     active_model = str(known_args.model or _resolve_active_model(config))
 
-    if active_model == "matrix_profile":
-        run_matrix_profile(config=config)
+    if active_model == "one_class_svm":
+        run_one_class_svm(config=config)
         return
 
-    if active_model in {"isolation_forest", "one_class_svm", "xgboost", "switching_kalman", "bocd"}:
-        raise NotImplementedError(
-            f"Anomaly ML model '{active_model}' is scaffolded but not implemented yet."
-        )
+    if active_model == "isolation_forest":
+        run_isolation_forest(config=config)
+        return
+
+    if active_model == "xgboost":
+        run_xgboost_anomaly(config=config)
+        return
+
+    if active_model == "bocd":
+        from src.modeling.anomaly_detection.ml.bocd_model import run_bocd  # noqa: PLC0415
+        run_bocd(config=config)
+        return
 
     raise ValueError(f"Unsupported anomaly_detection ml model: {active_model}")
 

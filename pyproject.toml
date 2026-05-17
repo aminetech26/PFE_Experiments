@@ -61,6 +61,9 @@ gui = [
     "PySide6>=6.7",
     "pyqtgraph>=0.13",
 ]
+dl = [
+    "mamba-ssm>=2.2",
+]
 
 [tool.ruff]
 line-length = 100

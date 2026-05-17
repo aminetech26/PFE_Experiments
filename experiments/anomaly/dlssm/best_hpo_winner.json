@@ -1,0 +1,16 @@
+{
+  "learning_rate": 0.0002600098783730596,
+  "weight_decay": 3.074615848639492e-06,
+  "dropout": 0.11208016848837468,
+  "free_bits": 0.1,
+  "lambda_phys": 0.08902860484062682,
+  "lambda_oc": 0.14510009808910831,
+  "lambda_cons": 0.0349080490138233,
+  "aug_noise_std": 0.026784690310782268,
+  "aug_feature_dropout": 0.014832647051325464,
+  "lambda_kl_score": 0.1,
+  "lambda_pred_score": 0.1,
+  "lambda_oc_score": 0.1,
+  "lambda_phys_score": 0.05,
+  "score_reduction": "max"
+}

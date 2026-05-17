@@ -2,7 +2,7 @@
 # Modify experiment params here; training code reads from this file.
 
 experiment:
-  seed: 42
+  seeds: [42, 777, 1234]              # multi-seed suite; first seed is the canonical single-run seed
   n_cv_folds: 5
   cv_gap: 5          # windows to drop between folds (temporal CV)
   mlflow_experiment: "PV-FDD-PFE-2026"
@@ -11,45 +11,214 @@ experiment:
 # TASK A — Anomaly Detection
 # ============================================================================
 anomaly_detection:
-  # Runtime decomposition: ml and dl (no baseline namespace)
+  # Runtime decomposition: ml + dl
   ml:
-    active_model: isolation_forest
+    active_model: one_class_svm
+    hpo:
+      direction: maximize
+      validation_mode: holdout
+      sampler: tpe
+      pruner: none
+      study_name_prefix: anomaly_ml
+      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
+      n_trials_phase1: 50
+      timeout_seconds: null
     models:
       isolation_forest:
-        n_estimators: [100, 200]
-        contamination: [0.03, 0.05, 0.10]
+        scaling: standard
+        max_train_samples: null
+        contamination: auto
+        n_jobs: -1
+        bootstrap: false
+        warm_start: false
+        search_space:
+          n_estimators: {type: int, low: 200, high: 600, step: 100}
+          max_samples: {type: categorical, choices: [512, 1024, 2048, auto]}
+          max_features: {type: float, low: 0.5, high: 1.0, step: 0.1}
       one_class_svm:
-        kernel: [rbf]
-        nu: [0.03, 0.05, 0.10]
-      matrix_profile:
-        window_size: [30, 60, 120]
+        scaling: standard          # StandardScaler fitted on train only
+        max_train_samples: 40000   
+        cache_size_mb: 1000
+        shrinking: true
+        tol: 1.0e-3
+        kernels:
+          rbf:
+            nu: {type: float, low: 0.03, high: 0.10, log: true}
+            gamma: {type: float, low: 0.01, high: 0.08, log: true}
+          poly:
+            degree: 3              # cubic — fixed
+            nu: {type: float, low: 0.01, high: 0.20, log: true}
+            gamma: {type: categorical, choices: [scale, auto, 0.01, 0.1]}
+            coef0: {type: float, low: 0.0, high: 1.0}
+      xgboost:
+        scaling: none
+        max_train_samples: null
+        objective: binary:logistic
+        eval_metric: aucpr
+        tree_method: hist
+        n_jobs: -1
+        early_stopping_rounds: 50
+        auto_scale_pos_weight: true
+        search_space:
+          n_estimators: {type: int, low: 400, high: 2000, step: 100}
+          learning_rate: {type: float, low: 0.02, high: 0.08, log: true}
+          max_depth: {type: int, low: 3, high: 6}
+          min_child_weight: {type: float, low: 1.0, high: 32.0, log: true}
+          subsample: {type: float, low: 0.5, high: 0.9}
+          colsample_bytree: {type: float, low: 0.4, high: 0.9}
+          gamma: {type: categorical, choices: [0.0, 0.001, 0.01, 0.1, 0.3, 1.0, 3.0]}
+          reg_alpha: {type: categorical, choices: [0.0, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0]}
+          reg_lambda: {type: float, low: 1.0e-6, high: 100.0, log: true}
+          scale_pos_weight_multiplier: {type: categorical, choices: [0.25, 0.5, 1.0, 2.0]}
       bocd:
-        hazard_lambda: [100, 500]
-      switching_kalman:
-        n_states: [2, 4]
-        transition_stickiness: [0.90, 0.99]
+        scaling: standard
+        max_run_length: 200
+        kappa0: 1.0
+        alpha0: 2.0
+        search_space:
+          hazard_lambda: {type: float, low: 50.0, high: 2000.0, log: true}
 
   dl:
-    active_model: lstm_autoencoder
+    active_model: maat
+    hpo:
+      mode: conditional
+      sampler: tpe
+      pruner: hyperband
+      early_stopping: true
+      study_name_prefix: anomaly_dl_maat
+      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_dl.db"
+      trial_budget:
+        stage1_training: 35
+        stage2_architecture: 25
+      max_epochs_fraction: 0.45
+      min_hpo_epochs: 15
+      patience_fraction: 0.40
+      min_hpo_patience: 8
+      pruning_warmup_epochs: 7
     models:
-      lstm_autoencoder:
-        hidden_dim: [32, 64, 128]
-        num_layers: [2, 3]
-      seq2seq_autoencoder:
-        hidden_dim: [64, 128]
-        num_layers: [2, 3]
-      ssm:
-        d_model: [64, 128]
-        n_layers: [2, 4]
+      maat:
+        win_size: 30
+        block_size: 10
+        d_model: 64
+        n_heads: 2
+        e_layers: 2
+        d_ff: 256
+        dropout: 0.1
+        k: 3.0
+        temperature: 50
+        train_stride: 5
+        eval_stride: 1
+        score_reduction: max
+        scaling: standard
+        gate_mode: learned          # learned | attention_only | mamba_only
+        hpo_stage1:
+          learning_rate:     {type: float, low: 5.0e-5, high: 8.0e-4, log: true}
+          weight_decay:      {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+          dropout:           {type: float, low: 0.0, high: 0.25}
+          k:                 {type: float, low: 2.0, high: 6.0}
+          temperature:       {type: categorical, choices: [10, 25, 50, 100]}
+          batch_size:        {type: categorical, choices: [512, 1024, 2048]}
+          gradient_clip_val: {type: categorical, choices: [0.5, 1.0, 2.0]}
+        hpo_stage2:
+          win_size:     {type: categorical, choices: [30, 60, 90, 120]}
+          block_size:   {type: categorical, choices: [5, 10, 15, 30]}
+          d_model:      {type: categorical, choices: [32, 64, 128]}
+          n_heads:      {type: categorical, choices: [2, 4, 8]}
+          e_layers:     {type: int, low: 1, high: 4}
+          d_ff:         {type: categorical, choices: [128, 256, 512]}
+        # Single conditional study — replaces greedy two-stage when hpo.mode=conditional
+        # n_trials = stage1_training + stage2_architecture (back-compat sum)
 
-  primary_metric: pr_auc   # PR-AUC (not ROC) due to 97% normal class
-  threshold_calibration: pr_curve  # use precision-recall to set alarm threshold
+      dlssm:
+        win_size: 60
+        train_stride: 5
+        eval_stride: 1
+        hidden_dim: 128
+        latent_dim: 32
+        encoder_dim: 256
+        decoder_dim: 256
+        n_gru_layers: 1
+        dropout: 0.1
+
+        beta_kl: 0.1
+        kl_warmup_epochs: 5
+        free_bits: 0.05
+
+        lambda_phys: 0.1
+        physics_components:
+          string_power: true
+          imbalance: true
+          temperature_correction: false   # disabled until base is stable
+
+        # Semi-supervised paradigms — override via --one-class / --consistency CLI flags
+        one_class: false                  # Deep SVDD-style latent compactness
+        lambda_oc: 0.1                    # training loss weight
+        lambda_oc_score: 0.1              # scoring weight
+        oc_warmup_epochs: 3               # train pure ELBO first; then init c
+
+        consistency: false                # consistency regularization on q_mu
+        lambda_cons: 0.1
+        aug_noise_std: 0.05
+        aug_feature_dropout: 0.1
+
+        # Conditional VAE — overridden by --cvae CLI flag
+        cvae: false
+        conditioning:
+          features: [irr, pvt]
+          recon_skip_features: [irr, pvt, pdc_temp_corrected, pdc_temp_corrected_norm_irr]
+
+        alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
+        lambda_kl_score: 0.1
+        lambda_phys_score: 0.05
+        lambda_pred_score: 0.1
+        score_reduction: max
+
+        batch_size: 1024
+        learning_rate: 1.0e-3
+        weight_decay: 1.0e-5
+        gradient_clip_val: 1.0
+        accelerator: auto
+        scaling: standard
+
+        hpo:
+          mode: single_stage
+          sampler: tpe
+          pruner: median
+          n_trials: 80
+          timeout_seconds: 18000
+          max_epochs_fraction: 0.25
+          min_hpo_epochs: 10
+          patience_fraction: 0.33
+          min_hpo_patience: 5
+          pruning_warmup_epochs: 3
+          search_space:
+            learning_rate:        {type: float, low: 1.0e-4, high: 3.0e-3, log: true}
+            weight_decay:         {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+            dropout:              {type: float, low: 0.0,    high: 0.3}
+            free_bits:            {type: categorical, choices: [0.0, 0.05, 0.1]}
+            lambda_phys:          {type: float, low: 0.02, high: 0.3, log: true}
+            lambda_oc:            {type: float, low: 0.02, high: 0.3, log: true}
+            lambda_cons:          {type: float, low: 0.02, high: 0.3, log: true}
+            lambda_kl_score:      {type: float, low: 0.05, high: 0.3, log: true}
+            lambda_pred_score:    {type: float, low: 0.0,  high: 0.3}
+            lambda_oc_score:      {type: float, low: 0.0,  high: 0.3}
+            lambda_phys_score:    {type: float, low: 0.0,  high: 0.2}
+            aug_noise_std:        {type: float, low: 0.02, high: 0.15}
+            aug_feature_dropout:  {type: float, low: 0.0,  high: 0.2}
+            score_reduction:      {type: categorical, choices: [center, mean, max]}
+
+  primary_metric: f1
+  threshold_calibration: validation_pr_curve_f1
 
 # ============================================================================
 # TASK B — Fault Classification
 # ============================================================================
 classification:
-  # Runtime decomposition: ml and dl (no baseline namespace)
+  calibration:
+    enabled: true
+    method: sigmoid        # sigmoid (safe default) or isotonic
+
+  # Runtime decomposition: ml only
   ml:
     active_model: lightgbm
     models:
@@ -62,81 +231,58 @@ classification:
         reg_alpha: [1.0e-8, 10.0]
         reg_lambda: [1.0e-8, 10.0]
         min_child_samples: [10, 100]
-      xgboost:
-        n_estimators: [200, 500]
-        learning_rate: [0.03, 0.1]
-        max_depth: [4, 8]
       catboost:
-        iterations: [300, 500]
-        depth: [6, 8]
-        learning_rate: [0.05, 0.1]
+        iterations: {type: int, low: 300, high: 1200, step: 100}
+        depth: {type: int, low: 4, high: 8}
+        learning_rate: {type: float, low: 0.02, high: 0.15, log: true}
+        l2_leaf_reg: {type: float, low: 1.0e-2, high: 20.0, log: true}
+        random_strength: {type: float, low: 1.0e-8, high: 5.0, log: true}
+        bagging_temperature: {type: float, low: 0.0, high: 5.0}
+        border_count: {type: categorical, choices: [64, 128, 254]}
       extra_trees:
-        n_estimators: [200, 500]
-        max_features: [sqrt, log2]
+        n_estimators: {type: int, low: 300, high: 1200, step: 100}
+        criterion: {type: categorical, choices: [gini, entropy, log_loss]}
+        max_depth: {type: categorical, choices: [null, 8, 12, 16, 24, 32]}
+        min_samples_split: {type: int, low: 2, high: 20}
+        min_samples_leaf: {type: int, low: 1, high: 10}
+        max_features: {type: categorical, choices: [sqrt, log2, 0.5, 0.8, 1.0]}
+        bootstrap: {type: categorical, choices: [false, true]}
     hpo:
-      sampler: tpe
       direction: maximize
+      validation_mode: holdout      # holdout | segment_temporal_cv
+      sampler: tpe                  # ML policy default
+      pruner: none                  # ML policy: no pruner
+      study_name_prefix: classification_ml
+      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
       n_trials_phase1: 50
       timeout_seconds: null
 
-  dl:
-    active_model: tcn
-    models:
-      cnn_1d:
-        filters: [32, 64, 128]
-        kernel_sizes: [3, 5]
-        n_blocks: [2, 3, 4]
-      gru:
-        hidden_dim: [64, 128, 256]
-        num_layers: [2, 3]
-      lstm:
-        hidden_dim: [64, 128, 256]
-        num_layers: [2, 3]
-      tcn:
-        n_filters: [64, 128]
-        kernel_size: [3, 5]
-        n_levels: [4, 6]
-
   primary_metric: f1_weighted
-
-# ============================================================================
-# TASK C — Dropped (April 2026)
-# Performance forecasting residuals are structurally identical to reconstruction-
-# based anomaly detection (the family used in Task A). It is NOT a separate task.
-# Forecasting-based residuals may appear as ONE METHOD within Task A experiments,
-# not as a standalone contribution. Project scope is FDD: Task A + Task B.
-# ============================================================================
-
-# ============================================================================
-# MULTI-TASK LEARNING (Task A + Task B shared encoder)
-# ============================================================================
-multitask:
-  enabled: false           # Reserved for R2 phase once baselines are established
-  shared_encoder:
-    type: gru              # or tcn
-    hidden_dim: 128
-    num_layers: 3
-  task_weights:
-    anomaly: 1.0
-    classification: 1.0
-  weight_tuning: optuna    # tune α, β via Optuna
 
 # ============================================================================
 # TRAINING
 # ============================================================================
 training:
+  hardware_profile: colab_high
   optimizer: adamw
-  lr: 0.001
-  weight_decay: 0.01
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
   scheduler: cosine_annealing_warmup
   warmup_steps: 100
+  min_lr_ratio: 0.01
   max_epochs: 100
-  patience: 15             # early stopping
-  batch_size: 256
+  patience: 10             # early stopping
+  batch_size: 1024
   gradient_clip_val: 1.0
-  precision: 16-mixed       # mixed precision for faster training
+  accelerator: auto
+  devices: auto
+  precision: bf16-mixed     # bf16 training (A100 tensor cores); val/test trainers force 32-true for scoring
   threading:
     prefer_physical_cores: true
     reserve_cores: 1
     max_threads: null
     optuna_parallel_trials: 1
+    dl_num_workers: 12
+    dl_pin_memory: auto
+    dl_persistent_workers: true
+    dl_prefetch_factor: 4

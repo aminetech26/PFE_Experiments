@@ -40,13 +40,22 @@ def label_shuffle_test(
     Returns dict with real_score, shuffle_scores, is_leaking.
     """
     import copy
+    from functools import partial
     from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+
+    metric_fns: dict = {
+        "f1_weighted": partial(f1_score, average="weighted", zero_division=0),
+        "f1_macro": partial(f1_score, average="macro", zero_division=0),
+        "f1_binary": partial(f1_score, average="binary", zero_division=0),
+        "accuracy": accuracy_score,
+    }
+    score_fn = metric_fns.get(metric, partial(f1_score, average="weighted", zero_division=0))
 
     # Real score
     real_model = copy.deepcopy(model)
     real_model.fit(X_train, y_train)
     y_pred_real = real_model.predict(X_val)
-    real_score = f1_score(y_val, y_pred_real, average="weighted")
+    real_score = float(score_fn(y_val, y_pred_real))
 
     # Shuffle scores
     shuffle_scores = []
@@ -55,24 +64,27 @@ def label_shuffle_test(
         y_shuffled = np.random.permutation(y_train)
         shuffled_model.fit(X_train, y_shuffled)
         y_pred_shuffle = shuffled_model.predict(X_val)
-        n_classes = len(np.unique(y_train))
-        expected_random = 1.0 / n_classes
-        shuffle_scores.append(f1_score(y_val, y_pred_shuffle, average="weighted"))
+        shuffle_scores.append(float(score_fn(y_val, y_pred_shuffle)))
 
-    mean_shuffle = np.mean(shuffle_scores)
-    # Red flag: shuffle score > 50% of real score
+    mean_shuffle = float(np.mean(shuffle_scores))
     is_leaking = mean_shuffle > 0.5 * real_score
 
     result = {
-        "real_f1": real_score,
-        "mean_shuffle_f1": mean_shuffle,
+        "metric": metric,
+        "real_score": real_score,
+        "mean_shuffle_score": mean_shuffle,
         "is_leaking": is_leaking,
     }
     if is_leaking:
-        logger.warning(f"LEAKAGE ALERT (Label Shuffle): real={real_score:.3f}, "
-                       f"shuffle={mean_shuffle:.3f} (unexpectedly high!)")
+        logger.warning(
+            "LEAKAGE ALERT (Label Shuffle): real={:.3f}, shuffle={:.3f} (unexpectedly high!)",
+            real_score,
+            mean_shuffle,
+        )
     else:
-        logger.success(f"Label Shuffle OK: real={real_score:.3f}, shuffle={mean_shuffle:.3f}")
+        logger.success(
+            "Label Shuffle OK: real={:.3f}, shuffle={:.3f}", real_score, mean_shuffle
+        )
     return result
 
 
@@ -107,6 +119,36 @@ def duplicate_sample_check(
                        f"are exact duplicates of train samples!")
     else:
         logger.success(f"Duplicate Check OK: {overlap_pct:.2f}% overlap")
+    return result
+
+
+def exact_duplicate_overlap_check(
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    feature_cols: list[str],
+) -> dict:
+    """Strict exact-duplicate overlap check with zero-tolerance policy."""
+    train_set = set(df_train[feature_cols].apply(tuple, axis=1))
+    val_set = set(df_val[feature_cols].apply(tuple, axis=1))
+    overlap = train_set & val_set
+    overlap_count = len(overlap)
+    overlap_pct = (overlap_count / len(val_set) * 100.0) if len(val_set) > 0 else 0.0
+
+    result = {
+        "train_unique_samples": len(train_set),
+        "val_unique_samples": len(val_set),
+        "overlapping_samples": overlap_count,
+        "overlap_pct": overlap_pct,
+        "is_clean": overlap_count == 0,
+    }
+    if result["is_clean"]:
+        logger.success(f"Exact Duplicate Pre-Check OK: {overlap_count} overlaps")
+    else:
+        logger.warning(
+            "LEAKAGE ALERT (Exact Duplicates): {} overlapping rows ({:.4f}%) between train/val",
+            overlap_count,
+            overlap_pct,
+        )
     return result
 
 
@@ -272,37 +314,41 @@ def run_leakage_report(
     X_val: np.ndarray,
     y_val: np.ndarray,
     feature_names: list[str],
-    df_train: pd.DataFrame | None = None,
-    df_val: pd.DataFrame | None = None,
-    time_col: str | None = None,
+    X_eval: np.ndarray | None = None,
+    y_eval: np.ndarray | None = None,
+    metric: str = "f1_weighted",
 ) -> dict:
     """
-    Run all leakage checks and return a combined report.
-    Log results to console and return dict suitable for MLflow logging.
+    Run leakage checks and return a combined report suitable for MLflow logging.
+
+    X_eval / y_eval: the held-out set used for sanity_check and bootstrap_ci.
+    Pass the TRUE test set here when the final model was trained on train+val.
+    Falls back to X_val / y_val if not provided (only correct when the model
+    was NOT trained on val data).
     """
     logger.info("=" * 60)
     logger.info("LEAKAGE PREVENTION REPORT")
     logger.info("=" * 60)
 
+    x_eval_eff = X_eval if X_eval is not None else X_val
+    y_eval_eff = y_eval if y_eval is not None else y_val
+
     report = {}
 
-    # 1. Label shuffle
-    report["label_shuffle"] = label_shuffle_test(model, X_train, y_train, X_val, y_val)
+    # 1. Label shuffle — retrains a copy on X_train only, evaluates on X_val
+    report["label_shuffle"] = label_shuffle_test(
+        model, X_train, y_train, X_val, y_val, metric=metric
+    )
 
-    # 2. Duplicate check (only if DataFrames provided)
-    if df_train is not None and df_val is not None:
-        report["duplicate_check"] = duplicate_sample_check(df_train, df_val, feature_names)
-
-    # 3. Feature importance
+    # 2. Feature importance
     report["feature_importance"] = feature_importance_audit(model, feature_names)
 
-    # 4. Predictions for sanity + bootstrap
-    y_pred = model.predict(X_val)
-    val_f1 = f1_score(y_val, y_pred, average="weighted")
-    report["sanity_check"] = performance_sanity_check("val_f1_weighted", val_f1)
-    report["bootstrap_ci"] = bootstrap_confidence_interval(y_val, y_pred)
+    # 3. Sanity check + bootstrap on the true eval set
+    y_pred_eval = model.predict(x_eval_eff)
+    eval_f1 = f1_score(y_eval_eff, y_pred_eval, average="weighted", zero_division=0)
+    report["sanity_check"] = performance_sanity_check("eval_f1_weighted", eval_f1)
+    report["bootstrap_ci"] = bootstrap_confidence_interval(y_eval_eff, y_pred_eval, metric=metric)
 
-    # Summary
     flags = [k for k, v in report.items() if isinstance(v, dict) and v.get("is_leaking", False)]
     flags += [k for k, v in report.items() if isinstance(v, dict) and v.get("is_suspicious", False)]
     report["leakage_flags"] = flags
@@ -311,6 +357,6 @@ def run_leakage_report(
     if report["is_clean"]:
         logger.success("NO LEAKAGE DETECTED — results are credible")
     else:
-        logger.error(f"LEAKAGE FLAGS RAISED: {flags}")
+        logger.error("LEAKAGE FLAGS RAISED: {}", flags)
 
     return report
