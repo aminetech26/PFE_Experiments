@@ -471,7 +471,6 @@ feature_engineering:
       gvsao_candidates:
         window_size: [3, 5, 10, 20, 30, 60, 90]
         d_model_nhead_pairs:
-          - [32, 1]
           - [32, 2]
           - [64, 2]
           - [64, 4]
