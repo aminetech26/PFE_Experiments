@@ -44,9 +44,14 @@ def main() -> None:
         run_dlssm(config=config)
         return
 
+    if active_model == "pv_gdn":
+        from src.modeling.anomaly_detection.dl.pv_gdn.trainer import run_pv_gdn  # noqa: PLC0415
+        run_pv_gdn(config=config)
+        return
+
     raise ValueError(
         f"Unsupported anomaly_detection dl model: '{active_model}'. "
-        f"Supported: maat, dlssm"
+        f"Supported: maat, dlssm, pv_gdn"
     )
 
 

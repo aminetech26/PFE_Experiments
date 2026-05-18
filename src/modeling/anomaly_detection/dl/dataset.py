@@ -20,7 +20,8 @@ class TimeSeriesDataset(Dataset):
 
     Windows never cross group boundaries (episode_id → segment_id → operating_day_id).
     normal_only=True: filters rows to label==0 (for semisup train split).
-    Returns (x: Tensor[W, F], label: scalar int) where label is the center-step label.
+    Returns (x: Tensor[W, F], label: scalar int) where label is taken from the
+    configured target position (center or last step of the window).
     """
 
     def __init__(
@@ -33,12 +34,16 @@ class TimeSeriesDataset(Dataset):
         normal_only: bool = False,
         return_original_label: bool = False,
         return_group_id: bool = False,
+        target_position: str = "center",
     ) -> None:
         super().__init__()
         self.win_size = win_size
         self.stride = stride
         self.return_original_label = return_original_label
         self.return_group_id = return_group_id
+        if target_position not in {"center", "last"}:
+            raise ValueError(f"Unsupported target_position: {target_position}")
+        self.target_position = target_position
 
         if normal_only:
             n_before = len(df)
@@ -90,13 +95,13 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         start, end = self._windows[idx]
         x = torch.from_numpy(self._features[start:end])  # [W, F]
-        center = start + (end - start) // 2
-        label = torch.tensor(self._labels[center], dtype=torch.long)
+        target_idx = end - 1 if self.target_position == "last" else start + (end - start) // 2
+        label = torch.tensor(self._labels[target_idx], dtype=torch.long)
         if self.return_original_label and self.return_group_id:
-            original_label = torch.tensor(self._original_labels[center], dtype=torch.float64)
-            group_id = self._group_ids[center] if self._group_ids is not None else "row"
+            original_label = torch.tensor(self._original_labels[target_idx], dtype=torch.float64)
+            group_id = self._group_ids[target_idx] if self._group_ids is not None else "row"
             return x, label, original_label, group_id
         if self.return_original_label:
-            original_label = torch.tensor(self._original_labels[center], dtype=torch.float64)
+            original_label = torch.tensor(self._original_labels[target_idx], dtype=torch.float64)
             return x, label, original_label
         return x, label

@@ -207,6 +207,22 @@ anomaly_detection:
             aug_feature_dropout:  {type: float, low: 0.0,  high: 0.2}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
 
+      pv_gdn:
+        win_size: 30
+        train_stride: 5
+        eval_stride: 1
+        d_model: 64
+        temporal_kernel_size: 3
+        temporal_layers: 2
+        graph_top_k: 4
+        dropout: 0.1
+        batch_size: 1024
+        learning_rate: 1.0e-3
+        weight_decay: 1.0e-5
+        accelerator: auto
+        precision: 32-true
+        score_reduction: max_group
+
   primary_metric: f1
   threshold_calibration: validation_pr_curve_f1
 
