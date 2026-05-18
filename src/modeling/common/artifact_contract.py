@@ -41,11 +41,8 @@ def _optimal_f1_threshold(
 ) -> tuple[float, float]:
     """Return (threshold, best_f1) maximising F1 on the PR curve."""
     prec, rec, thresholds = precision_recall_curve(binary_labels, scores)
-    f1_vals = np.where(
-        (prec[:-1] + rec[:-1]) > 0,
-        2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1]),
-        0.0,
-    )
+    denom = prec[:-1] + rec[:-1]
+    f1_vals = np.where(denom > 0, 2 * prec[:-1] * rec[:-1] / np.maximum(denom, 1e-10), 0.0)
     best_idx = int(np.argmax(f1_vals))
     return float(thresholds[best_idx]), float(f1_vals[best_idx])
 

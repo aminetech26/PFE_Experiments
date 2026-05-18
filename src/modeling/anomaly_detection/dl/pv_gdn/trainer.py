@@ -89,7 +89,8 @@ def _calibrate_threshold(scores: np.ndarray, labels: np.ndarray) -> tuple[float,
     prec, rec, thresholds = precision_recall_curve(labels, scores)
     if thresholds.size == 0:
         raise ValueError("Validation threshold calibration produced no PR thresholds")
-    f1_vals = np.where((prec[:-1] + rec[:-1]) > 0, 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1]), 0.0)
+    denom = prec[:-1] + rec[:-1]
+    f1_vals = np.where(denom > 0, 2 * prec[:-1] * rec[:-1] / np.maximum(denom, 1e-10), 0.0)
     best_idx = int(np.argmax(f1_vals))
     return float(thresholds[best_idx]), float(f1_vals[best_idx]), float(prec[best_idx]), float(rec[best_idx])
 
@@ -164,10 +165,11 @@ def _reduce_scores(group_scores: dict[str, np.ndarray], mode: str) -> np.ndarray
             raise ValueError("score_reduction='string_only' requires a non-empty 'string' group")
         return group_scores["string"]
     # All named groups participate in max/mean — global anchors large-amplitude faults (class 4),
-    # specialized groups capture relational violations (classes 1/2/3)
+    # specialized groups capture relational violations (classes 1/2/3).
+    # "context" = mean |Z-scored context| catches sustained faults next-step prediction misses.
     all_groups = [
         group_scores[name]
-        for name in ("global", "voltage", "power", "string", "other")
+        for name in ("global", "voltage", "power", "string", "other", "context")
         if name in group_scores
     ]
     if mode == "mean_group":
@@ -253,6 +255,7 @@ class PVGDNLightning(pl.LightningModule):
         self._groups = groups or {}
         self._score_reduction = score_reduction
         self._val_residuals: list[np.ndarray] = []
+        self._val_context_dev: list[np.ndarray] = []
         self._val_labels_bin: list[np.ndarray] = []
         self._val_labels_orig: list[np.ndarray] = []
 
@@ -276,7 +279,10 @@ class PVGDNLightning(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
         residuals = (x_hat - target).abs().detach().cpu().numpy()
+        # context_dev: mean |Z-scored context| per feature — catches sustained fault distributions
+        context_dev = context.abs().mean(dim=1).detach().cpu().numpy()  # [B, F]
         self._val_residuals.append(residuals)
+        self._val_context_dev.append(context_dev)
         self._val_labels_bin.append(y_bin.detach().cpu().numpy().astype(int))
         self._val_labels_orig.append(y_orig)
 
@@ -296,9 +302,11 @@ class PVGDNLightning(pl.LightningModule):
         if not self._val_residuals:
             return
         residuals = np.concatenate(self._val_residuals)
+        context_dev = np.concatenate(self._val_context_dev)
         labels_bin = np.concatenate(self._val_labels_bin)
         labels_orig = np.concatenate(self._val_labels_orig)
         self._val_residuals.clear()
+        self._val_context_dev.clear()
         self._val_labels_bin.clear()
         self._val_labels_orig.clear()
 
@@ -308,10 +316,10 @@ class PVGDNLightning(pl.LightningModule):
         macro_pr_auc_val = 0.0
         per_class: dict = {}
         if self._groups and np.unique(labels_bin).size >= 2:
-            # Use unscaled residuals for monitoring (MAD scale is fit after full training).
-            # PR-AUC of unscaled grouped scores is monotonically aligned with the scaled version
-            # within a fixed training trajectory — valid as an early-stopping signal.
+            # Use unscaled residuals + context_dev for monitoring (MAD scale fit after full training).
+            # context group catches sustained faults where next-step residual is small.
             group_scores = _compute_group_scores(residuals, self._groups)
+            group_scores["context"] = context_dev.mean(axis=1)
             val_scores = _reduce_scores(group_scores, self._score_reduction)
             val_pr_auc_val = _safe_pr_auc(labels_bin, val_scores) or 0.0
             macro = compute_macro_per_class_pr_auc(labels=labels_orig, scores=val_scores)
@@ -333,9 +341,16 @@ def _infer_residuals(
     model: PVGDN,
     dl: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (residuals, labels_bin, labels_orig, group_ids, context_dev).
+
+    context_dev [N, F]: mean |Z-scored context| per feature per window.
+    For normal windows ≈ 0.8 (expected |N(0,1)|); for sustained faults >> 0.8.
+    Used as an additional scoring group to catch faults that next-step prediction misses.
+    """
     model.eval()
     all_residuals: list[np.ndarray] = []
+    all_context_dev: list[np.ndarray] = []
     all_labels_bin: list[np.ndarray] = []
     all_labels_orig: list[np.ndarray] = []
     all_group_ids: list[np.ndarray] = []
@@ -350,17 +365,20 @@ def _infer_residuals(
         target = x[:, -1, :]
         x_hat, _ = model(context)
         residuals = (x_hat - target).abs().detach().cpu().numpy()
+        context_dev = context.abs().mean(dim=1).detach().cpu().numpy()  # [B, F]
 
         all_residuals.append(residuals)
+        all_context_dev.append(context_dev)
         all_labels_bin.append(y_bin)
         all_labels_orig.append(y_orig)
         all_group_ids.append(group_ids)
 
     residuals = np.concatenate(all_residuals) if all_residuals else np.array([])
+    context_dev = np.concatenate(all_context_dev) if all_context_dev else np.array([])
     labels_bin = np.concatenate(all_labels_bin) if all_labels_bin else np.array([])
     labels_orig = np.concatenate(all_labels_orig) if all_labels_orig else np.array([])
     group_ids = np.concatenate(all_group_ids) if all_group_ids else np.array([])
-    return residuals, labels_bin, labels_orig, group_ids
+    return residuals, labels_bin, labels_orig, group_ids, context_dev
 
 
 def run_pv_gdn(config: dict | None = None) -> None:
@@ -511,21 +529,31 @@ def run_pv_gdn(config: dict | None = None) -> None:
     lit = lit.to(inferred_device)
     lit.model = lit.model.to(inferred_device)
     logger.info("PV-GDN groups: {}", group_membership)
-    train_residuals, _, _, _ = _infer_residuals(lit.model, train_dl, inferred_device)
+    train_residuals, _, _, _, train_context_dev = _infer_residuals(lit.model, train_dl, inferred_device)
     residual_scale = _fit_residual_scale(train_residuals)
-    val_residuals, val_labels_bin, val_labels_orig, val_group_ids = _infer_residuals(
+    context_dev_scale = _fit_residual_scale(train_context_dev)
+    val_residuals, val_labels_bin, val_labels_orig, val_group_ids, val_context_dev = _infer_residuals(
         lit.model, val_dl, inferred_device
     )
-    test_residuals, test_labels_bin, test_labels_orig, test_group_ids = _infer_residuals(
+    test_residuals, test_labels_bin, test_labels_orig, test_group_ids, test_context_dev = _infer_residuals(
         lit.model, test_dl, inferred_device
     )
 
     train_residuals_scaled = _apply_residual_scale(train_residuals, residual_scale)
     val_residuals_scaled = _apply_residual_scale(val_residuals, residual_scale)
     test_residuals_scaled = _apply_residual_scale(test_residuals, residual_scale)
+    train_context_dev_scaled = _apply_residual_scale(train_context_dev, context_dev_scale)
+    val_context_dev_scaled = _apply_residual_scale(val_context_dev, context_dev_scale)
+    test_context_dev_scaled = _apply_residual_scale(test_context_dev, context_dev_scale)
+
     train_group_scores = _compute_group_scores(train_residuals_scaled, groups)
     val_group_scores = _compute_group_scores(val_residuals_scaled, groups)
     test_group_scores = _compute_group_scores(test_residuals_scaled, groups)
+    # "context" group: mean MAD-scaled |Z-scored context| — catches sustained faults
+    train_group_scores["context"] = train_context_dev_scaled.mean(axis=1)
+    val_group_scores["context"] = val_context_dev_scaled.mean(axis=1)
+    test_group_scores["context"] = test_context_dev_scaled.mean(axis=1)
+
     val_scores = _reduce_scores(val_group_scores, score_reduction)
     test_scores = _reduce_scores(test_group_scores, score_reduction)
 
@@ -581,10 +609,13 @@ def run_pv_gdn(config: dict | None = None) -> None:
         "fit_time_s": round(fit_time, 2),
     }
 
+    cls1_mask = (test_labels_orig == 0) | (test_labels_orig == 1)
+    cls1_y = (test_labels_orig[cls1_mask] == 1).astype(int)
     cls2_mask = (test_labels_orig == 0) | (test_labels_orig == 2)
     cls2_y = (test_labels_orig[cls2_mask] == 2).astype(int)
     for g_name, g_scores in test_group_scores.items():
         metrics[f"test_pr_auc_group_{g_name}"] = _safe_pr_auc(test_labels_bin, g_scores)
+        metrics[f"test_class1_pr_auc_group_{g_name}"] = _safe_pr_auc(cls1_y, g_scores[cls1_mask])
         metrics[f"test_class2_pr_auc_group_{g_name}"] = _safe_pr_auc(cls2_y, g_scores[cls2_mask])
 
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
@@ -611,7 +642,8 @@ def run_pv_gdn(config: dict | None = None) -> None:
             "feature_names": features,
             "method": "mad",
             "epsilon_floor": 1e-6,
-            "residual_scale": {feature: float(scale) for feature, scale in zip(features, residual_scale, strict=False)},
+            "residual_scale": {f: float(s) for f, s in zip(features, residual_scale, strict=False)},
+            "context_dev_scale": {f: float(s) for f, s in zip(features, context_dev_scale, strict=False)},
         },
     )
     write_json(
@@ -690,6 +722,9 @@ def run_pv_gdn(config: dict | None = None) -> None:
             },
             "val_group_pr_auc": {g: _safe_pr_auc(val_labels_bin, s) for g, s in val_group_scores.items()},
             "test_group_pr_auc": {g: _safe_pr_auc(test_labels_bin, s) for g, s in test_group_scores.items()},
+            "test_class1_group_pr_auc": {
+                g: _safe_pr_auc(cls1_y, s[cls1_mask]) for g, s in test_group_scores.items()
+            },
             "test_class2_group_pr_auc": {
                 g: _safe_pr_auc(cls2_y, s[cls2_mask]) for g, s in test_group_scores.items()
             },
