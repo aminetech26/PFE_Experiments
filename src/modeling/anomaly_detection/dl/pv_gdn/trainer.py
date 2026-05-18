@@ -302,24 +302,27 @@ class PVGDNLightning(pl.LightningModule):
         self._val_labels_bin.clear()
         self._val_labels_orig.clear()
 
+        # Always log val_macro_per_class_pr_auc — Lightning's ModelCheckpoint/EarlyStopping
+        # crash during the pre-training sanity check if the monitored metric is absent even once.
+        val_pr_auc_val = 0.0
+        macro_pr_auc_val = 0.0
+        per_class: dict = {}
         if self._groups and np.unique(labels_bin).size >= 2:
             # Use unscaled residuals for monitoring (MAD scale is fit after full training).
             # PR-AUC of unscaled grouped scores is monotonically aligned with the scaled version
             # within a fixed training trajectory — valid as an early-stopping signal.
             group_scores = _compute_group_scores(residuals, self._groups)
             val_scores = _reduce_scores(group_scores, self._score_reduction)
-            val_pr_auc = _safe_pr_auc(labels_bin, val_scores)
+            val_pr_auc_val = _safe_pr_auc(labels_bin, val_scores) or 0.0
             macro = compute_macro_per_class_pr_auc(labels=labels_orig, scores=val_scores)
-            macro_pr_auc = macro.get("macro_per_class_pr_auc")
-            if val_pr_auc is not None:
-                self.log("val_pr_auc", val_pr_auc, prog_bar=True, on_step=False, on_epoch=True)
-            if macro_pr_auc is not None:
-                self.log("val_macro_per_class_pr_auc", macro_pr_auc, prog_bar=True, on_step=False, on_epoch=True)
+            macro_pr_auc_val = macro.get("macro_per_class_pr_auc") or 0.0
             per_class = macro.get("per_class_pr_auc_vs_normal", {})
-            for k in ("1", "2", "3", "4"):
-                v = per_class.get(k)
-                if v is not None:
-                    self.log(f"val_class{k}_pr_auc_vs_normal", v, prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_pr_auc", val_pr_auc_val, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_macro_per_class_pr_auc", macro_pr_auc_val, prog_bar=True, on_step=False, on_epoch=True)
+        for k in ("1", "2", "3", "4"):
+            v = per_class.get(k)
+            if v is not None:
+                self.log(f"val_class{k}_pr_auc_vs_normal", v, prog_bar=False, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)

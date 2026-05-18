@@ -47,7 +47,9 @@ class PVGDN(nn.Module):
         # Learned similarity graph over feature nodes
         z = nn.functional.normalize(self.node_emb, dim=-1)
         logits = z @ z.T  # [F, F]
-        logits.fill_diagonal_(float("-inf"))
+        # Use masked_fill (creates new tensor) rather than fill_diagonal_ (in-place on grad-tracked tensor)
+        diag_mask = torch.eye(self.n_features, dtype=torch.bool, device=logits.device)
+        logits = logits.masked_fill(diag_mask, float("-inf"))
 
         if self.graph_top_k > 0 and self.graph_top_k < self.n_features:
             topk = torch.topk(logits, k=self.graph_top_k, dim=-1).indices
@@ -73,7 +75,7 @@ class PVGDN(nn.Module):
         a = self._adjacency()  # [F, F]
         h_msg = torch.einsum("ij,bjd->bid", a, h_last)
         h = self.msg_norm(h_msg)
-        h = torch.gelu(h)
+        h = nn.functional.gelu(h)
 
         # Predict next-step feature values from past temporal context
         x_hat = self.readout(h).squeeze(-1)  # [B, F]
