@@ -1,0 +1,55 @@
+GTBAD v2 Experiment — Design Summary
+Architecture
+- New file: src/modeling/anomaly_detection/dl/train_gtbad_v2.py — single script for both profiles
+- Existing scripts: train_gtbad.py and train_gtbad_plus_physics.py left untouched
+- DVC: one stage train_gtbad_v2
+- Experiment name: Task_A_Anomaly (same MLflow experiment)
+GVSAO HPO — 7-parameter search
+Parameter	Type
+lr	continuous (log)
+batch_size	discrete
+window_size	discrete
+(d_model, nhead)	paired
+num_encoder_layers	discrete
+lstm_hidden	discrete
+- Config: GVSAO settings in model_config.yaml under gtbad_v2 entry; candidate lists in data_config.yaml under profile
+- Fitness: validation MSE on healthy windows
+- Budget: pop=20, gen=10 = 200 evals, 5 epochs each
+- Discrete decoding: 0,1 → candidate list index
+Threshold & Decision
+- Two strategies, selected via profile config:
+  - Group: PDC/IDC/VDC groups, mean normalized error > 1.0 → flagged. Groups linked by AND or OR (configurable). irr/pvt excluded from decision.
+  - All-feature: every feature exceeds its per-feature threshold → anomaly
+- Threshold percentiles: 90, 95, 99
+- Normalization: per-feature error / per-feature threshold → normalized error → mean per group
+- Primary metric: F1. Secondary: PR-AUC, precision, recall. Per-class: TP/FP/TN/FN.
+- Anomaly score (continuous): max(feature_errors / feature_thresholds)
+Window Creation
+- Label-pure only: window kept if ALL timesteps have the same label
+- Split before windowing to prevent leakage
+- Window-level F1 evaluation
+Profile Config (data_config.yaml)
+profiles:
+  gtbad_experiment:
+    feature_mode: "original" | "plus_physics"  # original = raw sensors, no add_physics_features()
+    enable_hygiene_pruning: false
+    enable_mrmr_selection: false
+    decision_logic: "group" | "all_features"
+    group_logic: "and" | "or"
+    threshold_percentiles: [90, 95, 99]
+    feature_groups:
+      vdc: [vdc1, vdc2, dV_dt, voltage_imbalance]
+      idc: [idc1, idc2, dI_dt, current_imbalance]
+      pdc: [pdc1, pdc2, dP_dt, power_imbalance, temp_loss_pmax, pdc_temp_corrected, pdc_temp_corrected_norm_irr]
+    enable_dP_dt: true  # etc. (only when plus_physics)
+MLflow Logging
+- One parent run per seed (seed=42 only)
+- Params: all config, GVSAO settings, candidate lists
+- Metrics: F1 (primary), precision, recall, PR-AUC, per-class TP/FP/TN/FN per threshold per strategy
+- Artifacts: checkpoint .pt, thresholds JSON, results JSON, GVSAO best combination
+Outputs
+- 2 checkpoints per run (original + plus-physics, best model from GVSAO)
+- gtbad_v2_thresholds_[original|plus_physics].json
+- gtbad_v2_results_[original|plus_physics].json
+Model Config (model_config.yaml)
+- Single entry gtbad_v2 under anomaly_detection.dl.models

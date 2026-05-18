@@ -207,6 +207,22 @@ anomaly_detection:
             aug_feature_dropout:  {type: float, low: 0.0,  high: 0.2}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
 
+      gtbad_v2:
+        profile: "gtbad_experiment"   # references data_config.yaml profiles section
+        epochs: 50
+        patience: 15
+        dropout: 0.1
+        train_frac: 0.80
+        seed: 42
+        # GVSAO budget
+        gvsao:
+          enabled: true
+          population_size: 20
+          max_generations: 10
+          gvsao_epochs: 5
+          lr_bounds: [1.0e-5, 1.0e-1]
+          batch_bounds: [16, 128]
+
   primary_metric: f1
   threshold_calibration: validation_pr_curve_f1
 

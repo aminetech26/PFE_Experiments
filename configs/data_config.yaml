@@ -459,3 +459,58 @@ feature_engineering:
       rolling_windows:            [10, 30]
       rolling_stats:              [mean, std]
       tsfresh_mode:               "off"
+
+    gtbad_experiment:
+      # --- Experiment mode ---
+      feature_mode: "original"       # "original" | "plus_physics"
+      decision_logic: "group"        # "group" | "all_features"
+      group_logic: "and"             # "and" | "or"  (only when decision_logic=group)
+      threshold_percentiles: [90, 95, 99]
+
+      # --- GVSAO candidate lists ---
+      gvsao_candidates:
+        window_size: [3, 5, 10, 20, 30, 60, 90]
+        d_model_nhead_pairs:
+          - [32, 1]
+          - [32, 2]
+          - [64, 2]
+          - [64, 4]
+          - [128, 4]
+          - [128, 8]
+        num_encoder_layers: [1, 2, 3, 4]
+        lstm_hidden: [16, 32, 64, 128]
+
+      # --- Feature groups for group-threshold decision logic ---
+      # Features not in any group (irr, pvt, pdc) are excluded from group decisions.
+      feature_groups:
+        vdc: ["vdc1", "vdc2", "dV_dt", "voltage_imbalance"]
+        idc: ["idc1", "idc2", "dI_dt", "current_imbalance"]
+        pdc: ["pdc1", "pdc2", "dP_dt", "power_imbalance",
+              "temp_loss_pmax", "pdc_temp_corrected", "pdc_temp_corrected_norm_irr"]
+
+      # --- Physics feature flags (only active when feature_mode=plus_physics) ---
+      enable_dP_dt: true
+      enable_dV_dt: true
+      enable_dI_dt: true
+      enable_power_imbalance: true
+      enable_current_imbalance: true
+      enable_voltage_imbalance: true
+      enable_temp_power_correction: true
+      temp_ref_c: 25.0
+      gamma_pmax_pct_per_c: -0.40
+      temp_power_eps: 1e-8
+      irr_norm_floor: 1.0
+
+      # --- Feature selection (disabled: no dropping, no MRMR) ---
+      enable_hygiene_pruning: false
+      enable_mrmr_selection: false
+      enable_hour_cyclic: false
+      enable_delta_temp: false
+      enable_Vg_normalized: false
+      enable_string_share: false
+      enable_corr_pruning: false
+      enable_vif_pruning: false
+      enable_wavelet: false
+      enable_differential_signal: false
+      enable_rolling_stats: false
+      tsfresh_mode: "off"

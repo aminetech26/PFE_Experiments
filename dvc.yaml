@@ -200,3 +200,23 @@ stages:
           cache: false
     outs:
       - experiments/checkpoints/gtbad_plus_physics/gtbad_pp_best.pt
+
+  # Stage 13: GTBAD v2 — Extended HPO (7D GVSAO) + per-feature/group thresholds
+  train_gtbad_v2:
+    cmd: uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2
+    deps:
+      - src/modeling/anomaly_detection/dl/train_gtbad_v2.py
+      - src/modeling/anomaly_detection/dl/gtbad_model.py
+      - src/modeling/anomaly_detection/dl/gvsao_v2.py
+      - src/data/features.py
+      - configs/data_config.yaml
+      - configs/model_config.yaml
+      - data/interim/ingestion/costa/costa_merged.parquet
+    metrics:
+      - experiments/metrics/gtbad_v2_results_original.json:
+          cache: false
+      - experiments/metrics/gtbad_v2_results_plus_physics.json:
+          cache: false
+    outs:
+      - experiments/checkpoints/gtbad_v2/gtbad_v2_original.pt
+      - experiments/checkpoints/gtbad_v2/gtbad_v2_plus_physics.pt
