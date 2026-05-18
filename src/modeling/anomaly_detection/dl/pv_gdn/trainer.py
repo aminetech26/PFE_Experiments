@@ -145,6 +145,21 @@ def _compute_group_scores(residuals: np.ndarray, groups: dict[str, list[int]]) -
     return group_scores
 
 
+def _fit_group_scale(group_scores: dict[str, np.ndarray], quantile: float = 0.95) -> dict[str, float]:
+    """Return per-group scale = q-th percentile of train scores.
+
+    Dividing each group by its scale normalises all groups to [0, ~1] for normal data
+    so the max_group reduction isn't dominated by a group with a wider absolute range.
+    """
+    return {k: max(float(np.percentile(v, quantile)), 1e-6) for k, v in group_scores.items()}
+
+
+def _apply_group_scale(
+    group_scores: dict[str, np.ndarray], group_scale: dict[str, float]
+) -> dict[str, np.ndarray]:
+    return {k: v / group_scale.get(k, 1.0) for k, v in group_scores.items()}
+
+
 def _reduce_scores(group_scores: dict[str, np.ndarray], mode: str) -> np.ndarray:
     if not group_scores:
         return np.array([])
@@ -554,6 +569,14 @@ def run_pv_gdn(config: dict | None = None) -> None:
     val_group_scores["context"] = val_context_dev_scaled.mean(axis=1)
     test_group_scores["context"] = test_context_dev_scaled.mean(axis=1)
 
+    # Per-group normalisation: divide by train 95th-percentile so max_group isn't dominated
+    # by groups with wider absolute score ranges (e.g. global can otherwise drown out voltage).
+    # After scaling, normal-data scores are ≈ [0, 1] for every group → max is fair.
+    train_group_scale = _fit_group_scale(train_group_scores)
+    train_group_scores = _apply_group_scale(train_group_scores, train_group_scale)
+    val_group_scores = _apply_group_scale(val_group_scores, train_group_scale)
+    test_group_scores = _apply_group_scale(test_group_scores, train_group_scale)
+
     val_scores = _reduce_scores(val_group_scores, score_reduction)
     test_scores = _reduce_scores(test_group_scores, score_reduction)
 
@@ -644,6 +667,7 @@ def run_pv_gdn(config: dict | None = None) -> None:
             "epsilon_floor": 1e-6,
             "residual_scale": {f: float(s) for f, s in zip(features, residual_scale, strict=False)},
             "context_dev_scale": {f: float(s) for f, s in zip(features, context_dev_scale, strict=False)},
+            "group_scale_q95": train_group_scale,
         },
     )
     write_json(
@@ -717,6 +741,7 @@ def run_pv_gdn(config: dict | None = None) -> None:
             "score_reduction": score_reduction,
             "target_position": "last",
             "context_window_size": win_size - 1,
+            "train_group_scale_q95": train_group_scale,
             "train_group_score_median": {
                 g: float(np.median(s)) for g, s in train_group_scores.items()
             },
@@ -820,6 +845,9 @@ def run_pv_gdn(config: dict | None = None) -> None:
             }
             for g_name in test_group_scores:
                 comparison_record[f"test_pr_auc_group_{g_name}"] = metrics.get(f"test_pr_auc_group_{g_name}")
+                comparison_record[f"test_class1_pr_auc_group_{g_name}"] = metrics.get(
+                    f"test_class1_pr_auc_group_{g_name}"
+                )
                 comparison_record[f"test_class2_pr_auc_group_{g_name}"] = metrics.get(
                     f"test_class2_pr_auc_group_{g_name}"
                 )
