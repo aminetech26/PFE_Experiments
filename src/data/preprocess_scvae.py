@@ -32,14 +32,32 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "processed" / "preprocessed" / "costa_scvae"
 
-# Conditional features (environmental measurements)
-CONDITIONAL_FEATURES = ["pvt", "irr"]
 # Target features (PV power output to reconstruct)
 TARGET_FEATURES = ["pdc1", "pdc2"]
-# All features
-ALL_FEATURES = CONDITIONAL_FEATURES + TARGET_FEATURES
+# Non-feature columns to exclude from the feature set
+NON_FEATURE_COLS = {"timestamp", "label", "_mad_score", "pdc"}
+# Conditional features — determined dynamically after loading data
+CONDITIONAL_FEATURES: list[str] = []
+# All features — updated dynamically
+ALL_FEATURES: list[str] = []
 # Peak power for normalization
 PEAK_POWER_W = 2500.0
+
+
+def _resolve_feature_columns(columns: list[str]) -> None:
+    """Set CONDITIONAL_FEATURES and ALL_FEATURES from available columns.
+
+    Conditional features = all columns except targets and non-feature metadata.
+    """
+    global CONDITIONAL_FEATURES, ALL_FEATURES
+    CONDITIONAL_FEATURES = [
+        c for c in columns
+        if c not in NON_FEATURE_COLS and c not in TARGET_FEATURES
+    ]
+    ALL_FEATURES = CONDITIONAL_FEATURES + TARGET_FEATURES
+    logger.info(f"Conditional features (x): {CONDITIONAL_FEATURES}")
+    logger.info(f"Target features (y):      {TARGET_FEATURES}")
+    logger.info(f"All features:             {ALL_FEATURES}")
 
 
 def load_costa_data(parquet_path: Path) -> pd.DataFrame:
@@ -332,6 +350,7 @@ def main():
     logger.info("=" * 60)
 
     df = load_costa_data(Path(args.input))
+    _resolve_feature_columns(list(df.columns))
 
     normal_df = df[df["label"] == 0].copy().reset_index(drop=True)
     faulty_df = df[df["label"] > 0].copy().reset_index(drop=True)
