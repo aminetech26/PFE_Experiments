@@ -144,14 +144,14 @@ anomaly_detection:
         kl_warmup_epochs: 5
         free_bits: 0.05
 
-        lambda_phys: 0.1
+        lambda_phys: 0
         physics_components:
-          string_power: true
-          imbalance: true
+          string_power: false
+          imbalance: false
           temperature_correction: false   # disabled until base is stable
 
         # Conditional VAE — on by default for DLSSM-FDD (voltage_anomaly_head requires it)
-        cvae: true
+        cvae: false
         conditioning:
           features: [irr, pvt]
           recon_skip_features: [irr, pvt, pdc_temp_corrected, pdc_temp_corrected_norm_irr]
@@ -163,10 +163,10 @@ anomaly_detection:
           slow_stride: 60              # 1 sample/min from 1Hz data
           slow_hidden_dim: 32
           se_reduction_ratio: 4
-          expected_power_enabled: true
+          expected_power_enabled: false
           expected_power_features: [vdc1, vdc2]  # vdc is the direct signature of resistive degradation (class 2); on datasets without per-string measurements use [vdc]
           lambda_expected: 0.5         # training weight for expected-voltage head pinball loss
-          lambda_pr_score: 0.1         # scoring weight for voltage-drop gap
+          lambda_pr_score: 0         # scoring weight for voltage-drop gap
 
         # Numerical stability guards for scoring
         # NB: all values must be valid YAML float literals — PyYAML safe_load
@@ -182,8 +182,8 @@ anomaly_detection:
 
         alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
         lambda_kl_score: 0.1
-        lambda_phys_score: 0.15       # fixed (not HPO-tunable) — P=V×I violation is always an anomaly signal
-        lambda_pred_score: 0.1
+        lambda_phys_score: 0       # fixed (not HPO-tunable) — P=V×I violation is always an anomaly signal
+        lambda_pred_score: 0
         score_reduction: max
 
         batch_size: 1024
