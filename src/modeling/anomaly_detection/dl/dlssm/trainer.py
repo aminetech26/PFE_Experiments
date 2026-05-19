@@ -636,7 +636,7 @@ class DLSSMLightningModule(pl.LightningModule):
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
             self.log("val_pr_auc", 0.0, prog_bar=True)
             self.log("val_macro_per_class_pr_auc", 0.0, prog_bar=True)
-            self.log("val_worst_class_pr_auc", 0.0)
+            self.log("val_worst_class_pr_auc", 0.0, prog_bar=True)
             return
 
         val_pr_auc = float(average_precision_score(all_labels, all_scores))
