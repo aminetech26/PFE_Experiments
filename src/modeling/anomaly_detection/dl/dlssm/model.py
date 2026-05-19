@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class _ResidualMLP(nn.Module):
@@ -27,6 +26,59 @@ class _ResidualMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x) + self.proj(x)
+
+
+class FeatureAttentionBlock(nn.Module):
+    """Multi-head self-attention over the feature dimension at each timestep.
+
+    Treats each of the F features as a token with embedding dim `feat_embed_dim`,
+    runs self-attention over F tokens, then projects to `out_dim`. Lets the encoder
+    capture cross-feature interactions (e.g. pdc1 vs pdc2 ratio anomalies) that a
+    plain linear projection cannot. Designed for small F (≤ ~30) as used with the
+    plus_physics feature profile on A100 GPU.
+
+    Input: [B, W, F]; Output: [B, W, out_dim].
+    """
+
+    def __init__(
+        self, n_features: int, out_dim: int, n_heads: int = 4, dropout: float = 0.1
+    ) -> None:
+        super().__init__()
+        # feat_embed_dim: embedding size per feature token, divisible by n_heads
+        feat_embed_dim = max(n_heads, (out_dim + n_features - 1) // max(n_features, 1))
+        feat_embed_dim = feat_embed_dim + (n_heads - feat_embed_dim % n_heads) % n_heads
+        self._n_features = n_features
+        self._feat_embed_dim = feat_embed_dim
+        self.feat_embed = nn.Linear(1, feat_embed_dim)  # each feature scalar → vector
+        self.attn = nn.MultiheadAttention(feat_embed_dim, n_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(feat_embed_dim)
+        self.proj = nn.Linear(n_features * feat_embed_dim, out_dim)
+        self.out_norm = nn.LayerNorm(out_dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, W, Fv = x.shape
+        x_flat = x.reshape(B * W, Fv, 1)                          # [B*W, F, 1]
+        tokens = self.feat_embed(x_flat)                           # [B*W, F, feat_embed_dim]
+        attended, _ = self.attn(tokens, tokens, tokens)            # [B*W, F, feat_embed_dim]
+        tokens = self.norm(tokens + attended)                      # residual + norm
+        flat = tokens.reshape(B * W, Fv * self._feat_embed_dim)    # [B*W, F*feat_embed_dim]
+        out = self.out_norm(self.act(self.proj(flat)))             # [B*W, out_dim]
+        return self.drop(out.reshape(B, W, -1))                    # [B, W, out_dim]
+
+
+def _build_mamba_slow_encoder(d_model: int, n_layers: int = 1) -> nn.Module:
+    """Build a Mamba SSM block for the slow-context branch (lazy import for CPU dev)."""
+    try:
+        from mamba_ssm import Mamba
+    except ImportError as exc:
+        raise ImportError(
+            "mamba_ssm is required for the slow-context branch. "
+            "Install with: pip install mamba-ssm (requires CUDA)"
+        ) from exc
+    blocks = [Mamba(d_model=d_model, d_state=16, d_conv=4, expand=2) for _ in range(n_layers)]
+    return blocks[0] if n_layers == 1 else nn.Sequential(*blocks)
 
 
 class DeepLatentStateSpaceModel(nn.Module):
@@ -59,19 +111,21 @@ class DeepLatentStateSpaceModel(nn.Module):
         n_gru_layers: int = 1,
         dropout: float = 0.1,
         condition_dim: int = 0,
+        # DLSSM-FDD additions
+        n_attention_heads: int = 4,
+        slow_hidden_dim: int = 64,
+        expected_power_indices: list[int] | None = None,
     ) -> None:
         super().__init__()
         self.win_size = win_size
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.condition_dim = condition_dim
+        self.expected_power_indices: list[int] = list(expected_power_indices or [])
         c = condition_dim  # inputs widen by c when CVAE is on (c=0 → no-op)
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(n_features, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        )
+        # Feature attention encoder (replaces plain input_proj)
+        self.feature_attn = FeatureAttentionBlock(n_features, hidden_dim, n_attention_heads, dropout)
         self.drop = nn.Dropout(dropout)
         self.gru = nn.GRU(
             input_size=hidden_dim,
@@ -105,6 +159,26 @@ class DeepLatentStateSpaceModel(nn.Module):
             nn.Linear(decoder_dim, n_features),
         )
 
+        # Slow-context branch: Mamba/GRU SSM on a low-rate preceding window
+        # x_slow: [B, T_slow, F] → slow_input_proj → [B, T_slow, slow_hidden_dim]
+        # → slow_encoder → slow_proj → [B, hidden_dim] bias added to h_prev
+        self.slow_input_proj: nn.Module | None = None
+        self.slow_encoder: nn.Module | None = None
+        self.slow_proj: nn.Module | None = None
+        if slow_hidden_dim > 0:
+            self.slow_input_proj = nn.Linear(n_features, slow_hidden_dim)
+            self.slow_encoder = _build_mamba_slow_encoder(slow_hidden_dim, n_layers=1)
+            self.slow_proj = nn.Linear(slow_hidden_dim, hidden_dim)
+
+        # Expected-power head: c_t → P_expected for [pdc1, pdc2]
+        # Gives an IEC-61724 Performance Ratio signal for class-2 (degradation) scoring
+        self.expected_power_head: nn.Module | None = None
+        if self.expected_power_indices and condition_dim > 0:
+            self.expected_power_head = nn.Sequential(
+                _ResidualMLP(condition_dim, decoder_dim, dropout),
+                nn.Linear(decoder_dim, len(self.expected_power_indices)),
+            )
+
     def _split_params(
         self, params: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -112,15 +186,35 @@ class DeepLatentStateSpaceModel(nn.Module):
         mu, logvar = params.chunk(2, dim=-1)
         return mu, logvar.clamp(-10.0, 10.0)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-        # x: [B, W, F]    c (optional): [B, W, C]
-        x_proj = self.drop(self.input_proj(x))     # [B, W, H]
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor | None = None,
+        x_slow: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        # x:      [B, W, F]        fast window (standardized features)
+        # c:      [B, W, C] opt    CVAE conditioning slice (irr, pvt, ...)
+        # x_slow: [B, T_slow, slow_hidden_dim] opt   slow-rate context (already projected)
+        x_proj = self.feature_attn(x)              # [B, W, H]  (FeatureAttentionBlock)
         h_seq, _ = self.gru(x_proj)                # [B, W, H]  — h_seq[:, t] = h_t
 
         # Build causal context: h_prev[:, t] = h_{t-1}
         # h_prev[:, 0] = 0 (no prior hidden state at the start of the window)
         h_prev = torch.zeros_like(h_seq)
         h_prev[:, 1:] = h_seq[:, :-1]             # [B, W, H]
+
+        # Slow-context branch: inject a slow summary as an additive bias on h_prev
+        if (
+            x_slow is not None
+            and self.slow_input_proj is not None
+            and self.slow_encoder is not None
+            and self.slow_proj is not None
+        ):
+            s_in = self.slow_input_proj(x_slow)     # [B, T_slow, slow_hidden_dim]
+            s = self.slow_encoder(s_in)              # [B, T_slow, slow_hidden_dim]
+            s_summary = s[:, -1, :]                  # [B, slow_hidden_dim] — most recent context
+            s_proj = self.slow_proj(s_summary)       # [B, hidden_dim]
+            h_prev = h_prev + s_proj.unsqueeze(1)    # broadcast across W
 
         # Validate conditioning expectations
         if self.condition_dim > 0:
@@ -155,6 +249,11 @@ class DeepLatentStateSpaceModel(nn.Module):
         # Final reconstruction: state prediction + latent residual
         x_hat = x_pred + residual                              # [B, W, F]
 
+        # Expected-power head: c_t → P_expected_t (IEC 61724 Performance Ratio signal)
+        p_expected: torch.Tensor | None = None
+        if self.expected_power_head is not None and c is not None:
+            p_expected = self.expected_power_head(c)           # [B, W, n_power]
+
         return {
             "x_hat": x_hat,
             "x_pred": x_pred,
@@ -165,4 +264,5 @@ class DeepLatentStateSpaceModel(nn.Module):
             "z": z,
             "h": h_seq,
             "h_prev": h_prev,
+            "p_expected": p_expected,
         }

@@ -150,22 +150,34 @@ anomaly_detection:
           imbalance: true
           temperature_correction: false   # disabled until base is stable
 
-        # Semi-supervised paradigms — override via --one-class / --consistency CLI flags
-        one_class: false                  # Deep SVDD-style latent compactness
+        # Semi-supervised paradigms — all on by default for DLSSM-FDD
+        one_class: true                   # Deep SVDD-style latent compactness
         lambda_oc: 0.1                    # training loss weight
         lambda_oc_score: 0.1              # scoring weight
         oc_warmup_epochs: 3               # train pure ELBO first; then init c
 
-        consistency: false                # consistency regularization on q_mu
+        consistency: true                 # consistency regularization on q_mu
         lambda_cons: 0.1
         aug_noise_std: 0.05
         aug_feature_dropout: 0.1
 
-        # Conditional VAE — overridden by --cvae CLI flag
-        cvae: false
+        # Conditional VAE — on by default for DLSSM-FDD (expected_power_head requires it)
+        cvae: true
         conditioning:
           features: [irr, pvt]
           recon_skip_features: [irr, pvt, pdc_temp_corrected, pdc_temp_corrected_norm_irr]
+
+        # DLSSM-FDD stacked components
+        fdd:
+          slow_context_enabled: true
+          slow_context_seconds: 3600    # 1h of preceding context at slow_stride resolution
+          slow_stride: 60              # 1 sample/min from 1Hz data
+          slow_hidden_dim: 64
+          n_attention_heads: 4
+          expected_power_enabled: true
+          expected_power_features: [pdc1, pdc2]
+          lambda_expected: 0.5         # training weight for expected-power head MSE
+          lambda_pr_score: 0.1         # scoring weight for performance-ratio gap
 
         alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
         lambda_kl_score: 0.1
@@ -206,6 +218,9 @@ anomaly_detection:
             aug_noise_std:        {type: float, low: 0.02, high: 0.15}
             aug_feature_dropout:  {type: float, low: 0.0,  high: 0.2}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
+            # DLSSM-FDD HPO extensions (lambda_expected/pr_score tuned; slow/attn dims fixed)
+            lambda_expected:      {type: float, low: 0.1, high: 2.0, log: true}
+            lambda_pr_score:      {type: float, low: 0.05, high: 1.0, log: true}
 
       pv_gdn:
         win_size: 30

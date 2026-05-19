@@ -155,6 +155,47 @@ def physics_consistency_loss(
     return loss  # [B]
 
 
+def expected_power_loss(
+    p_expected: torch.Tensor,
+    x: torch.Tensor,
+    expected_power_indices: list[int],
+) -> torch.Tensor:
+    """MSE between expected power head output and observed (standardized) power signals.
+
+    p_expected: [B, W, n_power] — head predictions for [pdc1, pdc2]
+    x:          [B, W, F]       — standardized observations
+    Returns [B] window-mean MSE. Silently returns zeros if indices missing.
+    """
+    if not expected_power_indices or p_expected is None:
+        return torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+    x_power = x[:, :, expected_power_indices]  # [B, W, n_power]
+    se = (p_expected - x_power) ** 2           # [B, W, n_power]
+    return se.mean(dim=-1).mean(dim=1)         # [B]
+
+
+def performance_gap_score(
+    p_expected: torch.Tensor,
+    x: torch.Tensor,
+    expected_power_indices: list[int],
+    score_reduction: str = "mean",
+) -> torch.Tensor:
+    """Asymmetric performance-ratio score: ReLU(P_expected − P_observed).
+
+    Penalises under-performance only — the signature of slow degradation (class 2).
+    p_expected: [B, W, n_power]; x: [B, W, F]. Returns [B].
+    """
+    if not expected_power_indices or p_expected is None:
+        return torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+    x_power = x[:, :, expected_power_indices]  # [B, W, n_power]
+    gap = F.relu(p_expected - x_power)         # [B, W, n_power] — only under-performance
+    gap_t = gap.mean(dim=-1)                   # [B, W]
+    if score_reduction == "max":
+        return gap_t.max(dim=1).values
+    if score_reduction == "center":
+        return gap_t[:, gap_t.size(1) // 2]
+    return gap_t.mean(dim=1)                   # default: mean
+
+
 def one_class_loss(q_mu: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     """Deep SVDD-style compactness: pulls normal latent means toward center c.
 
@@ -226,6 +267,9 @@ def compute_anomaly_scores(
     c: torch.Tensor | None = None,
     lambda_oc_score: float = 0.0,
     recon_mask: torch.Tensor | None = None,
+    p_expected: torch.Tensor | None = None,
+    lambda_pr_score: float = 0.0,
+    expected_power_indices: list[int] | None = None,
 ) -> torch.Tensor:
     """Per-window anomaly score combining three complementary signals.
 
@@ -270,5 +314,9 @@ def compute_anomaly_scores(
             enable_imbalance=enable_imbalance,
         )
         base = base + lambda_phys_score * phys_s  # phys_s is already [B] window-mean
+
+    if lambda_pr_score > 0.0 and p_expected is not None and expected_power_indices:
+        pr_s = performance_gap_score(p_expected, x, expected_power_indices, score_reduction)
+        base = base + lambda_pr_score * pr_s
 
     return base

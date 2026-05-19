@@ -35,6 +35,9 @@ class TimeSeriesDataset(Dataset):
         return_original_label: bool = False,
         return_group_id: bool = False,
         target_position: str = "center",
+        return_slow_context: bool = False,
+        slow_context_samples: int = 3600,
+        slow_stride: int = 60,
     ) -> None:
         super().__init__()
         self.win_size = win_size
@@ -44,6 +47,9 @@ class TimeSeriesDataset(Dataset):
         if target_position not in {"center", "last"}:
             raise ValueError(f"Unsupported target_position: {target_position}")
         self.target_position = target_position
+        self.return_slow_context = return_slow_context
+        self.slow_context_samples = slow_context_samples
+        self.slow_stride = max(1, slow_stride)
 
         if normal_only:
             n_before = len(df)
@@ -70,6 +76,7 @@ class TimeSeriesDataset(Dataset):
 
         # Build (start_idx, end_idx) window indices that don't cross group boundaries
         self._windows: list[tuple[int, int]] = []
+        self._window_seg_starts: list[int] = []  # segment start for each window (slow context)
         if group_col is not None:
             group_values = df[group_col].to_numpy()
             # Find contiguous same-group segments
@@ -88,20 +95,47 @@ class TimeSeriesDataset(Dataset):
                 continue
             for start in range(0, seg_len - win_size + 1, stride):
                 self._windows.append((int(seg_start + start), int(seg_start + start + win_size)))
+                self._window_seg_starts.append(int(seg_start))
 
     def __len__(self) -> int:
         return len(self._windows)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_slow_context(self, idx: int, start: int) -> torch.Tensor:
+        """Extract preceding slow-rate context for the window starting at `start`.
+
+        Uses rows strictly before `start` (i.e. ctx_start:start) so the slow context
+        never includes any timestep in the fast window being scored — preserving causal
+        prior/prediction semantics. Downsampled by `slow_stride`. When history is shorter
+        than target_len (including the segment-start case where no history exists at all),
+        pads the front with zeros in standardized space (zero == per-feature mean, neutral
+        placeholder with no connection to the current observation).
+        """
+        seg_start = self._window_seg_starts[idx]
+        ctx_start = max(seg_start, start - self.slow_context_samples)
+        raw = self._features[ctx_start:start:self.slow_stride]  # [T_raw, F]
+        target_len = max(1, self.slow_context_samples // self.slow_stride)
+        n_features = self._features.shape[1]
+        if len(raw) < target_len:
+            # Zero-pad in standardized space (zero == per-feature mean, neutral placeholder).
+            # Never use seg_start row: when start == seg_start that row is inside the fast
+            # window being scored, which would leak the current observation into the prior.
+            pad = np.zeros((target_len - len(raw), n_features), dtype=raw.dtype if len(raw) > 0 else self._features.dtype)
+            raw = np.concatenate([pad, raw], axis=0) if len(raw) > 0 else pad
+        return torch.from_numpy(raw[-target_len:])  # [target_len, F]
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         start, end = self._windows[idx]
         x = torch.from_numpy(self._features[start:end])  # [W, F]
         target_idx = end - 1 if self.target_position == "last" else start + (end - start) // 2
         label = torch.tensor(self._labels[target_idx], dtype=torch.long)
-        if self.return_original_label and self.return_group_id:
-            original_label = torch.tensor(self._original_labels[target_idx], dtype=torch.float64)
-            group_id = self._group_ids[target_idx] if self._group_ids is not None else "row"
-            return x, label, original_label, group_id
+
+        extras: list[torch.Tensor | str] = []
         if self.return_original_label:
-            original_label = torch.tensor(self._original_labels[target_idx], dtype=torch.float64)
-            return x, label, original_label
-        return x, label
+            extras.append(torch.tensor(self._original_labels[target_idx], dtype=torch.float64))
+        if self.return_group_id:
+            extras.append(self._group_ids[target_idx] if self._group_ids is not None else "row")
+
+        if self.return_slow_context:
+            x_slow = self._get_slow_context(idx, start)
+            return (x, x_slow, label, *extras)
+        return (x, label, *extras)

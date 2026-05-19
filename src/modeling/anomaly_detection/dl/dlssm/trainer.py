@@ -10,11 +10,12 @@ import joblib
 import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
+import optuna
 import pytorch_lightning as pl
 import torch
 import yaml
 from loguru import logger
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -27,26 +28,13 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
-import optuna
-from pytorch_lightning.callbacks import Callback
-
 from src.mlflow_setup import init_tracking
-from src.modeling.common.artifact_contract import (
-    build_deployment_manifest,
-    build_run_manifest,
-    compute_anomaly_per_class_metrics,
-    write_json,
-)
-from src.modeling.common.dl_training_utils import (
-    _build_warmup_cosine_scheduler,
-    _resolve_loader_runtime,
-    _trainer_runtime_kwargs,
-)
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
     apply_pv_safe_augmentation,
     compute_anomaly_scores,
     consistency_loss,
+    expected_power_loss,
     kl_divergence,
     one_class_loss,
     physics_consistency_loss,
@@ -54,6 +42,21 @@ from src.modeling.anomaly_detection.dl.dlssm.losses import (
     reconstruction_loss,
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
+from src.modeling.common.artifact_contract import (
+    build_candidate_per_true_class_thresholds,
+    build_deployment_manifest,
+    build_run_manifest,
+    build_score_calibration_payload,
+    compute_anomaly_per_class_metrics,
+    compute_macro_per_class_pr_auc,
+    write_json,
+)
+from src.modeling.common.dl_training_utils import (
+    _build_warmup_cosine_scheduler,
+    _resolve_loader_runtime,
+    _trainer_runtime_kwargs,
+)
+from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
     _build_pruner,
@@ -105,22 +108,20 @@ def _load_config() -> dict:
 def _calibrate_threshold(
     scores: np.ndarray, labels: np.ndarray
 ) -> tuple[float, float, float, float]:
-    """Return (threshold, best_f1, precision, recall) by maximising F1 on PR curve.
+    """Return (threshold, f1, precision, recall) using q95 of normal-class scores.
 
-    NOTE: DLSSM intentionally uses PR-curve F1 threshold pending methodology alignment.
-    Once aligned, switch to q95_normal_val_threshold from artifact_contract (Phase 9 contract).
+    Deploy-realistic: calibrated from the 95th-percentile of the score distribution
+    over normal-class (label==0) windows — no fault-label leakage at calibration
+    time. F1/precision/recall are reported AT this threshold for monitoring only,
+    not for model selection (selection uses val_macro_per_class_pr_auc).
     """
-    prec, rec, thresholds = precision_recall_curve(labels, scores)
-    denom = prec[:-1] + rec[:-1]
-    safe_denom = np.where(denom > 0, denom, 1.0)
-    f1_vals = np.where(denom > 0, 2 * prec[:-1] * rec[:-1] / safe_denom, 0.0)
-    best_idx = int(np.argmax(f1_vals))
-    return (
-        float(thresholds[best_idx]),
-        float(f1_vals[best_idx]),
-        float(prec[best_idx]),
-        float(rec[best_idx]),
-    )
+    normal_scores = scores[labels == 0]
+    threshold = float(np.percentile(normal_scores if len(normal_scores) > 0 else scores, 95))
+    preds = (scores >= threshold).astype(int)
+    f1 = float(f1_score(labels, preds, zero_division=0))
+    prec = float(precision_score(labels, preds, zero_division=0))
+    rec = float(recall_score(labels, preds, zero_division=0))
+    return threshold, f1, prec, rec
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,7 +132,7 @@ class _OptunaPruningCallback(Callback):
     """Minimal ASHA pruning callback — no optuna-integration dependency."""
 
     def __init__(
-        self, trial: optuna.Trial, monitor: str = "val_pr_auc", warmup_epochs: int = 3
+        self, trial: optuna.Trial, monitor: str = "val_macro_per_class_pr_auc", warmup_epochs: int = 3
     ) -> None:
         self._trial = trial
         self._monitor = monitor
@@ -154,8 +155,8 @@ def _run_hpo(
     base_cfg: dict,
     hpo_cfg: dict,
     training_cfg: dict,
-    train_dl: "DataLoader",
-    val_dl: "DataLoader",
+    train_dl: DataLoader,
+    val_dl: DataLoader,
     scaler_mean_t: torch.Tensor,
     scaler_scale_t: torch.Tensor,
     feature_idx: dict,
@@ -169,6 +170,14 @@ def _run_hpo(
     condition_idx: list[int] | None = None,
     condition_dim: int = 0,
     recon_mask: torch.Tensor | None = None,
+    # DLSSM-FDD params
+    slow_context_enabled: bool = False,
+    slow_hidden_dim: int = 0,
+    n_attention_heads: int = 4,
+    expected_power_enabled: bool = False,
+    expected_power_indices: list[int] | None = None,
+    lambda_expected: float = 0.5,
+    lambda_pr_score: float = 0.1,
 ) -> dict:
     """Run Optuna TPE + ASHA sweep. Returns best params dict."""
     search_space = hpo_cfg.get("search_space", {})
@@ -199,6 +208,9 @@ def _run_hpo(
             n_gru_layers=int(cfg.get("n_gru_layers", 1)),
             dropout=float(suggested.get("dropout", cfg.get("dropout", 0.1))),
             condition_dim=condition_dim,
+            n_attention_heads=n_attention_heads,
+            slow_hidden_dim=slow_hidden_dim if slow_context_enabled else 0,
+            expected_power_indices=expected_power_indices if expected_power_enabled else None,
         )
         physics_components = cfg.get("physics_components", {})
         hpo_lit = DLSSMLightningModule(
@@ -237,14 +249,19 @@ def _run_hpo(
             cvae_enabled=cvae_enabled,
             condition_idx=condition_idx or [],
             recon_mask=recon_mask,
+            slow_context_enabled=slow_context_enabled,
+            expected_power_enabled=expected_power_enabled,
+            expected_power_indices=expected_power_indices,
+            lambda_expected=float(suggested.get("lambda_expected", cfg.get("lambda_expected", lambda_expected))),
+            lambda_pr_score=float(suggested.get("lambda_pr_score", cfg.get("lambda_pr_score", lambda_pr_score))),
         )
 
         hpo_trainer = pl.Trainer(
             max_epochs=hpo_epochs,
             callbacks=[
-                EarlyStopping(monitor="val_pr_auc", patience=hpo_patience, mode="max", verbose=False),
+                EarlyStopping(monitor="val_macro_per_class_pr_auc", patience=hpo_patience, mode="max", verbose=False),
                 _OptunaPruningCallback(
-                    trial, monitor="val_pr_auc", warmup_epochs=pruning_warmup_epochs
+                    trial, monitor="val_macro_per_class_pr_auc", warmup_epochs=pruning_warmup_epochs
                 ),
             ],
             enable_progress_bar=False,
@@ -270,7 +287,7 @@ def _run_hpo(
     best = study.best_trial
     n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     logger.info(
-        "HPO done: best val_pr_auc={:.4f} | completed={} total={} | params={}",
+        "HPO done: best val_macro_per_class_pr_auc={:.4f} | completed={} total={} | params={}",
         best.value, n_completed, len(study.trials), best.params,
     )
     return best.params, n_completed
@@ -324,6 +341,12 @@ class DLSSMLightningModule(pl.LightningModule):
         cvae_enabled: bool = False,
         condition_idx: list[int] | None = None,
         recon_mask: torch.Tensor | None = None,
+        # DLSSM-FDD additions
+        slow_context_enabled: bool = False,
+        expected_power_enabled: bool = False,
+        expected_power_indices: list[int] | None = None,
+        lambda_expected: float = 0.5,
+        lambda_pr_score: float = 0.1,
     ) -> None:
         super().__init__()
         self.model = model
@@ -374,14 +397,46 @@ class DLSSMLightningModule(pl.LightningModule):
         else:
             self.recon_mask = None
 
+        # DLSSM-FDD: slow context + expected-power head
+        self.slow_context_enabled = slow_context_enabled
+        self.expected_power_enabled = expected_power_enabled
+        self.expected_power_indices: list[int] = list(expected_power_indices or [])
+        self.lambda_expected = lambda_expected
+        self.lambda_pr_score = lambda_pr_score
+
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
         self.best_val_pr_auc: float = 0.0
         self.val_threshold: float = 0.5
         self._val_scores_np: np.ndarray | None = None
         self._val_labels_np: np.ndarray | None = None
+        self._val_original_labels_np: np.ndarray | None = None
+        self._val_group_ids_np: np.ndarray | None = None
         self._test_scores_np: np.ndarray | None = None
         self._test_labels_np: np.ndarray | None = None
+        self._test_original_labels_np: np.ndarray | None = None
+        self._test_group_ids_np: np.ndarray | None = None
+
+    def _unpack_batch(
+        self, batch: tuple
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, list | None]:
+        """Unpack batch tuple → (x, x_slow, labels, original_labels, group_ids).
+
+        Handles both slow-context and legacy batch shapes transparently.
+        """
+        if self.slow_context_enabled:
+            # (x, x_slow, label[, original_label[, group_id]])
+            x, x_slow = batch[0], batch[1]
+            labels = batch[2]
+            original_labels = batch[3] if len(batch) > 3 else labels
+            group_ids = list(batch[4]) if len(batch) > 4 else None
+        else:
+            # legacy: (x, label[, original_label[, group_id]])
+            x, x_slow = batch[0], None
+            labels = batch[1]
+            original_labels = batch[2] if len(batch) > 2 else labels
+            group_ids = list(batch[3]) if len(batch) > 3 else None
+        return x, x_slow, labels, original_labels, group_ids
 
     def _extract_condition(self, x: torch.Tensor) -> torch.Tensor | None:
         """Slice the conditioning sub-vector c_t from x. Returns None if CVAE off."""
@@ -421,9 +476,11 @@ class DLSSMLightningModule(pl.LightningModule):
         n_batches = 0
         running = torch.zeros_like(self.c)
         for batch in train_dl:
-            x = batch[0].to(self.device)
+            x, x_slow, _, _, _ = self._unpack_batch(
+                tuple(t.to(self.device) if isinstance(t, torch.Tensor) else t for t in batch)
+            )
             c = self._extract_condition(x)
-            out = self.model(x, c)
+            out = self.model(x, c, x_slow)
             running = running + out["q_mu"].mean(dim=(0, 1)).detach()
             n_batches += 1
         if n_batches == 0:
@@ -452,10 +509,10 @@ class DLSSMLightningModule(pl.LightningModule):
         ):
             self._init_one_class_center()
 
-    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        x, _ = batch  # [B, W, F]
+    def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
+        x, x_slow, _, _, _ = self._unpack_batch(batch)
         c = self._extract_condition(x)
-        out = self.model(x, c)
+        out = self.model(x, c, x_slow)
 
         # Per-window loss components [B]
         recon_w = reconstruction_loss(out["x_hat"], x, recon_mask=self.recon_mask).mean(dim=1)
@@ -488,12 +545,20 @@ class DLSSMLightningModule(pl.LightningModule):
                 protect_idx=self.condition_idx if self.cvae_enabled else None,
             )
             c_aug = self._extract_condition(x_aug)  # equals c if protected
-            out_aug = self.model(x_aug, c_aug)
+            out_aug = self.model(x_aug, c_aug, x_slow)
             cons_w = consistency_loss(out["q_mu"], out_aug["q_mu"])
             lambda_cons_eff = self.lambda_cons
         else:
             cons_w = torch.zeros_like(recon_w)
             lambda_cons_eff = 0.0
+
+        # Expected-power head loss (IEC 61724 Performance Ratio training signal)
+        if self.expected_power_enabled and out.get("p_expected") is not None:
+            exp_w = expected_power_loss(out["p_expected"], x, self.expected_power_indices)
+            lambda_exp_eff = self.lambda_expected
+        else:
+            exp_w = torch.zeros_like(recon_w)
+            lambda_exp_eff = 0.0
 
         per_window = (
             recon_w
@@ -502,6 +567,7 @@ class DLSSMLightningModule(pl.LightningModule):
             + lambda_phys * phys_w
             + lambda_oc_eff * oc_w
             + lambda_cons_eff * cons_w
+            + lambda_exp_eff * exp_w
         )
         loss = per_window.mean()
 
@@ -512,6 +578,7 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("train_phys", phys_w.mean(), on_step=False, on_epoch=True)
         self.log("train_oc", oc_w.mean(), on_step=False, on_epoch=True)
         self.log("train_cons", cons_w.mean(), on_step=False, on_epoch=True)
+        self.log("train_expected", exp_w.mean(), on_step=False, on_epoch=True)
         self.log("train_c_norm", self.c.norm(), on_step=False, on_epoch=True)
         self.log("train_beta_kl", beta, on_step=False, on_epoch=True)
         return loss
@@ -533,24 +600,43 @@ class DLSSMLightningModule(pl.LightningModule):
             c=self.c if (self.oc_enabled and bool(self.c_initialized)) else None,
             lambda_oc_score=self.lambda_oc_score,
             recon_mask=self.recon_mask,
+            p_expected=out.get("p_expected"),
+            lambda_pr_score=self.lambda_pr_score if self.expected_power_enabled else 0.0,
+            expected_power_indices=self.expected_power_indices if self.expected_power_enabled else None,
         )
 
-    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        x, labels = batch
+    def validation_step(self, batch: tuple, batch_idx: int) -> None:
+        x, x_slow, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
-            out = self.model(x, self._extract_condition(x))
+            out = self.model(x, self._extract_condition(x), x_slow)
         scores = self._score_batch(x, out).cpu()
-        self._val_outputs.append({"scores": scores, "labels": labels.cpu()})
+        self._val_outputs.append(
+            {
+                "scores": scores,
+                "labels": labels.cpu(),
+                "original_labels": original_labels.cpu(),
+                "group_ids": group_ids,
+            }
+        )
 
     def on_validation_epoch_end(self) -> None:
         if not self._val_outputs:
             return
         all_scores = torch.cat([o["scores"] for o in self._val_outputs]).numpy()
         all_labels = torch.cat([o["labels"] for o in self._val_outputs]).numpy()
+        all_original_labels = torch.cat([o["original_labels"] for o in self._val_outputs]).numpy()
+        all_group_ids = None
+        if self._val_outputs[0].get("group_ids") is not None:
+            all_group_ids = np.array(
+                [gid for o in self._val_outputs for gid in (o.get("group_ids") or [])],
+                dtype=object,
+            )
         self._val_outputs.clear()
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
             self.log("val_pr_auc", 0.0, prog_bar=True)
+            self.log("val_macro_per_class_pr_auc", 0.0, prog_bar=True)
+            self.log("val_worst_class_pr_auc", 0.0)
             return
 
         val_pr_auc = float(average_precision_score(all_labels, all_scores))
@@ -559,12 +645,22 @@ class DLSSMLightningModule(pl.LightningModule):
         val_preds = (all_scores >= threshold).astype(int)
         val_acc = float(accuracy_score(all_labels, val_preds))
 
-        self.best_val_pr_auc = max(self.best_val_pr_auc, val_pr_auc)
+        per_class_pr = compute_macro_per_class_pr_auc(
+            labels=all_original_labels, scores=all_scores
+        )
+        val_macro_pc_pr_auc = per_class_pr.get("macro_per_class_pr_auc") or 0.0
+        val_worst_pc_pr_auc = per_class_pr.get("worst_class_pr_auc") or 0.0
+
+        self.best_val_pr_auc = max(self.best_val_pr_auc, float(val_macro_pc_pr_auc))
         self.val_threshold = threshold
         self._val_scores_np = all_scores
         self._val_labels_np = all_labels
+        self._val_original_labels_np = all_original_labels
+        self._val_group_ids_np = all_group_ids
 
-        self.log("val_pr_auc", val_pr_auc, prog_bar=True)
+        self.log("val_macro_per_class_pr_auc", float(val_macro_pc_pr_auc), prog_bar=True)
+        self.log("val_worst_class_pr_auc", float(val_worst_pc_pr_auc), prog_bar=True)
+        self.log("val_pr_auc", val_pr_auc)
         self.log("val_roc_auc", val_roc_auc)
         self.log("val_f1_at_threshold", val_f1)
         self.log("val_precision_at_threshold", val_prec)
@@ -572,21 +668,37 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("val_accuracy_at_threshold", val_acc)
         self.log("val_threshold", threshold)
 
-    def test_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> None:
-        x, labels = batch
+    def test_step(self, batch: tuple, batch_idx: int) -> None:
+        x, x_slow, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
-            out = self.model(x, self._extract_condition(x))
+            out = self.model(x, self._extract_condition(x), x_slow)
         scores = self._score_batch(x, out).cpu()
-        self._test_outputs.append({"scores": scores, "labels": labels.cpu()})
+        self._test_outputs.append(
+            {
+                "scores": scores,
+                "labels": labels.cpu(),
+                "original_labels": original_labels.cpu(),
+                "group_ids": group_ids,
+            }
+        )
 
     def on_test_epoch_end(self) -> None:
         if not self._test_outputs:
             return
         all_scores = torch.cat([o["scores"] for o in self._test_outputs]).numpy()
         all_labels = torch.cat([o["labels"] for o in self._test_outputs]).numpy()
+        all_original_labels = torch.cat([o["original_labels"] for o in self._test_outputs]).numpy()
+        all_group_ids = None
+        if self._test_outputs[0].get("group_ids") is not None:
+            all_group_ids = np.array(
+                [gid for o in self._test_outputs for gid in (o.get("group_ids") or [])],
+                dtype=object,
+            )
         self._test_outputs.clear()
         self._test_scores_np = all_scores
         self._test_labels_np = all_labels
+        self._test_original_labels_np = all_original_labels
+        self._test_group_ids_np = all_group_ids
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
             self.log("test_pr_auc", 0.0)
@@ -608,9 +720,9 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("test_recall_at_threshold", test_rec)
 
     @torch.no_grad()
-    def score_windows(self, x: torch.Tensor) -> torch.Tensor:
+    def score_windows(self, x: torch.Tensor, x_slow: torch.Tensor | None = None) -> torch.Tensor:
         """Score a batch of windows [B, W, F] → anomaly scores [B]."""
-        out = self.model(x, self._extract_condition(x))
+        out = self.model(x, self._extract_condition(x), x_slow)
         return self._score_batch(x, out)
 
     def configure_optimizers(self):
@@ -693,7 +805,7 @@ def _save_score_timeline(
 
 
 def _save_prediction_residual_plot(
-    lit: "DLSSMLightningModule",
+    lit: DLSSMLightningModule,
     test_dl: DataLoader,
     features: list[str],
     test_scores: np.ndarray,
@@ -717,11 +829,16 @@ def _save_prediction_residual_plot(
 
     # Iterate test_dl (no shuffle) to find the matching window
     target_window: torch.Tensor | None = None
+    target_x_slow: torch.Tensor | None = None
     counter = 0
-    for x_batch, _ in test_dl:
+    for batch in test_dl:
+        x_batch = batch[0]
         bs = x_batch.size(0)
         if counter + bs > target_idx:
-            target_window = x_batch[target_idx - counter : target_idx - counter + 1]
+            i = target_idx - counter
+            target_window = x_batch[i : i + 1]
+            if lit.slow_context_enabled and len(batch) >= 2 and isinstance(batch[1], torch.Tensor):
+                target_x_slow = batch[1][i : i + 1]
             break
         counter += bs
     if target_window is None:
@@ -730,10 +847,11 @@ def _save_prediction_residual_plot(
 
     device = next(lit.model.parameters()).device
     target_window = target_window.to(device)
+    target_x_slow = target_x_slow.to(device) if target_x_slow is not None else None
     lit.model.eval()
     with torch.no_grad():
         c_target = lit._extract_condition(target_window)
-        out = lit.model(target_window, c_target)
+        out = lit.model(target_window, c_target, target_x_slow)
     x_np = target_window[0].cpu().numpy()
     x_pred_np = out["x_pred"][0].cpu().numpy()
     x_hat_np = out["x_hat"][0].cpu().numpy()
@@ -804,7 +922,7 @@ def run_dlssm(config: dict | None = None) -> None:
 
     run_type = "smoke" if is_smoke else args.run_type
 
-    # Derive a human-readable variant name for logging
+    # Derive a human-readable variant name for logging (may be overridden to DLSSM-FDD below)
     parts: list[str] = []
     if cvae_enabled:
         parts.append("C")
@@ -882,10 +1000,56 @@ def run_dlssm(config: dict | None = None) -> None:
         loader_runtime["prefetch_factor"],
     )
 
+    # Slow-context config (needed before _make_dataloaders; no CVAE dependency)
+    fdd_cfg = dlssm_cfg.get("fdd", {}) or {}
+    slow_context_enabled: bool = bool(fdd_cfg.get("slow_context_enabled", True))
+    slow_context_seconds: int = int(fdd_cfg.get("slow_context_seconds", 3600))
+    slow_stride: int = int(fdd_cfg.get("slow_stride", 60))
+    slow_hidden_dim: int = int(fdd_cfg.get("slow_hidden_dim", 64))
+    n_attention_heads: int = int(fdd_cfg.get("n_attention_heads", 4))
+
+    if slow_context_enabled:
+        try:
+            from mamba_ssm import Mamba as _Mamba  # noqa: F401
+        except ImportError:
+            logger.warning(
+                "mamba_ssm not available — slow-context branch disabled. "
+                "Run on Colab A100 with `pip install mamba-ssm` for full DLSSM-FDD."
+            )
+            slow_context_enabled = False
+            slow_hidden_dim = 0
+
     def _make_dataloaders(stride_train: int, stride_eval: int, bs: int):
-        ds_train = TimeSeriesDataset(train_df, features, label_col, win_size, stride_train, normal_only=True)
-        ds_val = TimeSeriesDataset(val_df, features, label_col, win_size, stride_eval, normal_only=False)
-        ds_test = TimeSeriesDataset(test_df, features, label_col, win_size, stride_eval, normal_only=False)
+        slow_kw = dict(
+            return_slow_context=slow_context_enabled,
+            slow_context_samples=slow_context_seconds,
+            slow_stride=slow_stride,
+        )
+        ds_train = TimeSeriesDataset(
+            train_df, features, label_col, win_size, stride_train, normal_only=True, **slow_kw
+        )
+        ds_val = TimeSeriesDataset(
+            val_df,
+            features,
+            label_col,
+            win_size,
+            stride_eval,
+            normal_only=False,
+            return_original_label=True,
+            return_group_id=True,
+            **slow_kw,
+        )
+        ds_test = TimeSeriesDataset(
+            test_df,
+            features,
+            label_col,
+            win_size,
+            stride_eval,
+            normal_only=False,
+            return_original_label=True,
+            return_group_id=True,
+            **slow_kw,
+        )
         kw = {
             "drop_last": False,
             "num_workers": loader_runtime["num_workers"],
@@ -932,6 +1096,31 @@ def run_dlssm(config: dict | None = None) -> None:
         if cvae_enabled:
             logger.info("CVAE: condition_features={} (no recon mask)", cond_feats)
 
+    # DLSSM-FDD: expected-power configuration (needs condition_dim from CVAE block above)
+    expected_power_enabled: bool = bool(fdd_cfg.get("expected_power_enabled", True))
+    expected_power_features: list[str] = fdd_cfg.get("expected_power_features", ["pdc1", "pdc2"])
+    expected_power_indices: list[int] = [
+        feature_idx[f] for f in expected_power_features if f in feature_idx
+    ]
+    if expected_power_enabled and not expected_power_indices:
+        logger.warning(
+            "DLSSM-FDD: expected_power_enabled=True but none of {} found in features — disabling",
+            expected_power_features,
+        )
+        expected_power_enabled = False
+    if expected_power_enabled and condition_dim == 0:
+        logger.warning(
+            "DLSSM-FDD: expected_power_enabled=True requires CVAE (condition_dim>0) — disabling"
+        )
+        expected_power_enabled = False
+
+    lambda_expected: float = float(fdd_cfg.get("lambda_expected", 0.5))
+    lambda_pr_score: float = float(fdd_cfg.get("lambda_pr_score", 0.1))
+
+    # Override variant to DLSSM-FDD when all stacked components are active
+    if slow_context_enabled and expected_power_enabled and cvae_enabled:
+        variant = "DLSSM-FDD"
+
     # Apply best params from --best-params JSON or from HPO sweep
     hpo_params: dict = {}
     _hpo_n_completed: int | None = None
@@ -960,6 +1149,13 @@ def run_dlssm(config: dict | None = None) -> None:
             consistency_enabled=consistency_enabled,
             seed=seed,
             n_trials_override=args.n_trials,
+            slow_context_enabled=slow_context_enabled,
+            slow_hidden_dim=slow_hidden_dim,
+            n_attention_heads=n_attention_heads,
+            expected_power_enabled=expected_power_enabled,
+            expected_power_indices=expected_power_indices,
+            lambda_expected=lambda_expected,
+            lambda_pr_score=lambda_pr_score,
         )
         logger.info("HPO best params: {}", json.dumps(hpo_params, default=str))
 
@@ -981,6 +1177,9 @@ def run_dlssm(config: dict | None = None) -> None:
         n_gru_layers=int(dlssm_cfg.get("n_gru_layers", 1)),
         dropout=float(dlssm_cfg.get("dropout", 0.1)),
         condition_dim=condition_dim,
+        n_attention_heads=n_attention_heads,
+        slow_hidden_dim=slow_hidden_dim if slow_context_enabled else 0,
+        expected_power_indices=expected_power_indices if expected_power_enabled else None,
     )
 
     lit = DLSSMLightningModule(
@@ -1019,6 +1218,11 @@ def run_dlssm(config: dict | None = None) -> None:
         cvae_enabled=cvae_enabled,
         condition_idx=condition_idx,
         recon_mask=recon_mask,
+        slow_context_enabled=slow_context_enabled,
+        expected_power_enabled=expected_power_enabled,
+        expected_power_indices=expected_power_indices,
+        lambda_expected=lambda_expected,
+        lambda_pr_score=lambda_pr_score,
     )
 
     # Artifact dir
@@ -1033,11 +1237,11 @@ def run_dlssm(config: dict | None = None) -> None:
 
     # Train
     callbacks = [
-        EarlyStopping(monitor="val_pr_auc", patience=patience, mode="max", verbose=False),
+        EarlyStopping(monitor="val_macro_per_class_pr_auc", patience=patience, mode="max", verbose=False),
         ModelCheckpoint(
             dirpath=str(ckpt_dir),
             filename="best",
-            monitor="val_pr_auc",
+            monitor="val_macro_per_class_pr_auc",
             mode="max",
             save_top_k=1,
             save_last=True,
@@ -1086,8 +1290,12 @@ def run_dlssm(config: dict | None = None) -> None:
 
     val_scores = lit._val_scores_np
     val_labels = lit._val_labels_np
+    val_original_labels = lit._val_original_labels_np
+    val_group_ids = lit._val_group_ids_np
     test_scores = lit._test_scores_np
     test_labels = lit._test_labels_np
+    test_original_labels = lit._test_original_labels_np
+    test_group_ids = lit._test_group_ids_np
 
     if val_scores is None or test_scores is None:
         logger.error("Score arrays not populated — aborting artifact save.")
@@ -1107,19 +1315,43 @@ def run_dlssm(config: dict | None = None) -> None:
     test_acc = float(accuracy_score(test_labels, test_preds))
     test_prec = float(precision_score(test_labels, test_preds, zero_division=0))
     test_rec = float(recall_score(test_labels, test_preds, zero_division=0))
+    val_episode_macro_f1 = episode_macro_f1_binary(val_labels, val_preds, val_group_ids)
+    test_episode_macro_f1 = episode_macro_f1_binary(test_labels, test_preds, test_group_ids)
+
+    val_per_class_source = val_original_labels if val_original_labels is not None else val_labels
+    test_per_class_source = test_original_labels if test_original_labels is not None else test_labels
+    val_macro = compute_macro_per_class_pr_auc(labels=val_per_class_source, scores=val_scores)
+    test_macro = compute_macro_per_class_pr_auc(labels=test_per_class_source, scores=test_scores)
 
     logger.info(
         "Test — PR-AUC={:.4f}  ROC-AUC={:.4f}  F1={:.4f}  Prec={:.4f}  Rec={:.4f}",
         test_pr_auc, test_roc_auc, test_f1, test_prec, test_rec,
     )
 
+    score_components = ["reconstruction", "kl", "prediction"]
+    if physics_enabled:
+        score_components.append("physics")
+    if oc_enabled:
+        score_components.append("one_class")
+    if expected_power_enabled:
+        score_components.append("expected_power_pr")
+
     metrics: dict = {
+        "score_name": "dlssm_anomaly_score",
+        "score_components": score_components,
+        "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
+        "threshold_policy": "q95_normal_val",
+        "selection_metric": "val_macro_per_class_pr_auc",
         "val_pr_auc": val_pr_auc,
         "val_roc_auc": val_roc_auc,
         "val_f1_at_threshold": val_f1,
         "val_accuracy_at_threshold": val_acc,
         "val_precision_at_threshold": val_prec,
         "val_recall_at_threshold": val_rec,
+        "val_episode_macro_f1": float(val_episode_macro_f1),
+        "val_macro_per_class_pr_auc": val_macro.get("macro_per_class_pr_auc"),
+        "val_worst_class_pr_auc": val_macro.get("worst_class_pr_auc"),
+        "val_selection_score": val_macro.get("macro_per_class_pr_auc"),
         "threshold": threshold,
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
@@ -1127,6 +1359,13 @@ def run_dlssm(config: dict | None = None) -> None:
         "test_accuracy_at_threshold": test_acc,
         "test_precision_at_threshold": test_prec,
         "test_recall_at_threshold": test_rec,
+        "test_episode_macro_f1": float(test_episode_macro_f1),
+        "test_macro_per_class_pr_auc": test_macro.get("macro_per_class_pr_auc"),
+        "test_worst_class_pr_auc": test_macro.get("worst_class_pr_auc"),
+        "test_class1_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("1"),
+        "test_class2_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("2"),
+        "test_class3_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("3"),
+        "test_class4_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("4"),
         "n_train_windows": len(train_dl.dataset),
         "n_features": n_features,
         "fit_time_s": round(fit_time, 2),
@@ -1157,6 +1396,7 @@ def run_dlssm(config: dict | None = None) -> None:
     hpo_params_path = artifacts_dir / "hpo_best_params.json"
     scaler_path = artifacts_dir / "scaler.joblib"
     manifest_path = artifacts_dir / "features_manifest.json"
+    calibration_path = artifacts_dir / "score_calibration.json"
     pr_curve_path = artifacts_dir / "pr_curve.png"
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
@@ -1170,9 +1410,31 @@ def run_dlssm(config: dict | None = None) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     joblib.dump(scaler, scaler_path)
     per_class_metrics = compute_anomaly_per_class_metrics(
-        labels=test_labels,
+        labels=test_per_class_source,
         scores=test_scores,
         threshold=threshold,
+        val_labels=val_per_class_source,
+        val_scores=val_scores,
+    )
+    candidate_thresholds = build_candidate_per_true_class_thresholds(per_class_metrics, normal_label=0)
+    write_json(
+        calibration_path,
+        build_score_calibration_payload(
+            threshold=threshold,
+            threshold_policy="q95_normal_val",
+            threshold_quantile=0.95,
+            candidate_per_true_class_thresholds=candidate_thresholds,
+            score_stats={
+                "score_name": "dlssm_anomaly_score",
+                "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
+                "lambda_kl_score": float(dlssm_cfg.get("lambda_kl_score", 0.1)),
+                "lambda_pred_score": float(dlssm_cfg.get("lambda_pred_score", 0.0)),
+                "lambda_phys_score": float(dlssm_cfg.get("lambda_phys_score", 0.0)),
+                "lambda_oc_score": float(dlssm_cfg.get("lambda_oc_score", 0.0)),
+                "lambda_pr_score": lambda_pr_score,
+                "score_components": score_components,
+            },
+        ),
     )
     run_manifest = build_run_manifest(
         task=args.task,
@@ -1198,8 +1460,16 @@ def run_dlssm(config: dict | None = None) -> None:
         threshold=threshold,
         window_size=win_size,
         score_direction="higher_is_more_anomalous",
-        classes=["0", "1"],
-        extras={"checkpoint_available": bool(best_ckpt_path)},
+        classes=[str(c) for c in sorted(np.unique(test_per_class_source).tolist())],
+        extras={
+            "checkpoint_available": bool(best_ckpt_path),
+            "threshold_policy": "q95_normal_val",
+            "selection_metric": "val_macro_per_class_pr_auc",
+            "score_name": "dlssm_anomaly_score",
+            "score_components": score_components,
+            "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
+            "score_calibration_artifact": calibration_path.name,
+        },
     )
     write_json(per_class_metrics_path, per_class_metrics)
     write_json(run_manifest_path, run_manifest)
@@ -1239,7 +1509,16 @@ def run_dlssm(config: dict | None = None) -> None:
                 k: v for k, v in run_params.items()
                 if not isinstance(v, (dict, list))
             })
-            mlflow.log_metrics(metrics)
+            mlflow.log_metrics(
+                {
+                    k: float(v)
+                    for k, v in metrics.items()
+                    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                }
+            )
+            for cls_str, m in per_class_metrics.items():
+                if m.get("pr_auc_vs_normal") is not None:
+                    mlflow.log_metric(f"test_pr_auc_class{cls_str}_vs_normal", m["pr_auc_vs_normal"])
             for p in (
                 global_metrics_path,
                 per_class_metrics_path,
@@ -1249,6 +1528,7 @@ def run_dlssm(config: dict | None = None) -> None:
                 hpo_params_path,
                 scaler_path,
                 manifest_path,
+                calibration_path,
                 pr_curve_path,
                 histogram_path,
                 timeline_path,
@@ -1287,16 +1567,32 @@ def run_dlssm(config: dict | None = None) -> None:
                 "latent_dim": int(dlssm_cfg.get("latent_dim", 16)),
                 "lambda_phys": float(dlssm_cfg.get("lambda_phys", 0.05)),
                 "threshold": threshold,
+                "threshold_policy": "q95_normal_val",
+                "selection_metric": "val_macro_per_class_pr_auc",
+                "val_selection_score": val_macro.get("macro_per_class_pr_auc"),
+                "score_name": "dlssm_anomaly_score",
+                "score_components": score_components,
+                "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
                 "val_pr_auc": val_pr_auc,
                 "val_roc_auc": val_roc_auc,
                 "val_f1_at_threshold": val_f1,
                 "val_accuracy_at_threshold": val_acc,
+                "val_episode_macro_f1": float(val_episode_macro_f1),
+                "val_macro_per_class_pr_auc": val_macro.get("macro_per_class_pr_auc"),
+                "val_worst_class_pr_auc": val_macro.get("worst_class_pr_auc"),
                 "test_pr_auc": test_pr_auc,
                 "test_roc_auc": test_roc_auc,
                 "test_f1_at_threshold": test_f1,
                 "test_accuracy_at_threshold": test_acc,
                 "test_precision_at_threshold": test_prec,
                 "test_recall_at_threshold": test_rec,
+                "test_episode_macro_f1": float(test_episode_macro_f1),
+                "test_macro_per_class_pr_auc": test_macro.get("macro_per_class_pr_auc"),
+                "test_worst_class_pr_auc": test_macro.get("worst_class_pr_auc"),
+                "test_class1_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("1"),
+                "test_class2_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("2"),
+                "test_class3_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("3"),
+                "test_class4_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("4"),
                 "fit_time_s": round(fit_time, 2),
                 "hpo_enabled": bool(getattr(args, "hpo", False)),
                 "best_params_injected": bool(args.best_params),
