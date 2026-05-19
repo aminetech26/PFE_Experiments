@@ -204,6 +204,7 @@ anomaly_detection:
         weight_decay: 1.0e-5
         gradient_clip_val: 1.0
         accelerator: auto
+        precision: 32-true
         scaling: standard
 
         hpo:
