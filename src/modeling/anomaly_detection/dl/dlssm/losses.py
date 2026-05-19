@@ -63,6 +63,27 @@ def latent_distance_score(
     return _sanitize_score_component(score, max_abs)
 
 
+def radial_deviation_score(
+    q_mu: torch.Tensor,
+    center: torch.Tensor,
+    radius_center: torch.Tensor,
+    radius_scale: torch.Tensor,
+    score_reduction: str = "mean",
+    max_abs: float | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Two-sided latent anomaly score from normalized radial deviation. Returns [B]."""
+    radial = latent_distance_score(
+        q_mu=q_mu,
+        center=center,
+        score_reduction=score_reduction,
+        max_abs=None,
+    )
+    scale = radius_scale.clamp(min=eps)
+    score = (radial - radius_center).abs() / scale
+    return _sanitize_score_component(score, max_abs)
+
+
 def compute_anomaly_scores(
     x: torch.Tensor,
     x_hat: torch.Tensor,

@@ -33,8 +33,8 @@ from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
     compute_anomaly_scores,
     kl_divergence,
-    latent_distance_score,
     one_class_loss,
+    radial_deviation_score,
     reconstruction_loss,
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
@@ -378,6 +378,8 @@ class DLSSMLightningModule(pl.LightningModule):
         # SVDD center — registered as buffer (persisted in checkpoint, moved to device automatically)
         self.register_buffer("oc_center", torch.zeros(latent_dim))
         self.register_buffer("oc_center_initialized", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("oc_radius_center", torch.tensor(0.0))
+        self.register_buffer("oc_radius_scale", torch.tensor(1.0))
         # Keep python mirror for readability; source of truth is the buffer.
         self.c_initialized: bool = bool(self.oc_center_initialized.item())
 
@@ -488,7 +490,7 @@ class DLSSMLightningModule(pl.LightningModule):
             self._init_center_from_loader()
 
     def _init_center_from_loader(self) -> None:
-        """One-pass sample-and-timestep-weighted mean of q_mu to initialize SVDD center."""
+        """Initialize SVDD center and normal radial distance statistics."""
         self.model.eval()
         with torch.no_grad():
             acc = torch.zeros_like(self.oc_center)
@@ -500,9 +502,35 @@ class DLSSMLightningModule(pl.LightningModule):
                 n += out["q_mu"].shape[0] * out["q_mu"].shape[1]  # total (sample, timestep) pairs
             if n > 0:
                 self.oc_center.copy_(acc / n)
+
+            radial_parts: list[torch.Tensor] = []
+            for batch in self.trainer.train_dataloader:
+                x = batch[0].to(self.device)
+                out = self.model(x)
+                diff = out["q_mu"] - self.oc_center.unsqueeze(0).unsqueeze(0)
+                radial_t = (diff ** 2).mean(dim=-1)
+                if self.score_reduction == "mean":
+                    radial_parts.append(radial_t.mean(dim=1).detach())
+                elif self.score_reduction == "max":
+                    radial_parts.append(radial_t.max(dim=1).values.detach())
+                else:
+                    radial_parts.append(radial_t[:, radial_t.size(1) // 2].detach())
+
+            if radial_parts:
+                radial = torch.cat(radial_parts, dim=0)
+                self.oc_radius_center.copy_(radial.mean())
+                self.oc_radius_scale.copy_(radial.std(unbiased=False).clamp(min=1e-6))
+            else:
+                self.oc_radius_center.fill_(0.0)
+                self.oc_radius_scale.fill_(1.0)
         self.model.train()
         self._set_center_initialized(True)
-        logger.info("SVDD center initialized: norm={:.4f}", self.oc_center.norm().item())
+        logger.info(
+            "SVDD initialized: center_norm={:.4f} radius_mu={:.6f} radius_sigma={:.6f}",
+            self.oc_center.norm().item(),
+            float(self.oc_radius_center.item()),
+            float(self.oc_radius_scale.item()),
+        )
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         x, _, _, _ = self._unpack_batch(batch)
@@ -547,9 +575,11 @@ class DLSSMLightningModule(pl.LightningModule):
 
     def _score_batch(self, x: torch.Tensor, out: dict) -> torch.Tensor:
         if self._svdd_scoring_active():
-            return latent_distance_score(
+            return radial_deviation_score(
                 out["q_mu"],
                 self.oc_center,
+                self.oc_radius_center,
+                self.oc_radius_scale,
                 score_reduction=self.score_reduction,
                 max_abs=self.max_abs_oc_score_term,
             )
@@ -691,6 +721,8 @@ class DLSSMLightningModule(pl.LightningModule):
         # SVDD collapse monitoring — log latent statistics for diagnosing posterior collapse
         if self.lambda_oc > 0.0:
             self.log("oc_center_norm", self.oc_center.norm())
+            self.log("oc_radius_center", self.oc_radius_center)
+            self.log("oc_radius_scale", self.oc_radius_scale)
 
         # Per-class PR-AUC breakdown for visibility during training
         pc_parts = "  ".join(
@@ -1240,7 +1272,7 @@ def run_dlssm(config: dict | None = None) -> None:
         test_pr_auc, test_roc_auc, test_f1, test_prec, test_rec,
     )
 
-    score_components = ["latent_distance"] if lit._svdd_scoring_active() else ["reconstruction", "kl"]
+    score_components = ["two_sided_latent_radial_deviation"] if lit._svdd_scoring_active() else ["reconstruction", "kl"]
 
     metrics: dict = {
         "score_name": "dlssm_score",

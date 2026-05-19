@@ -90,6 +90,10 @@ def _load_dlssm_ckpt(model_path: Path, root: Path, deployment_manifest: dict[str
     state_dict = ckpt.get("state_dict", ckpt)
     if "oc_center_initialized" not in state_dict:
         state_dict["oc_center_initialized"] = torch.tensor(bool(lit.lambda_oc > 0.0), dtype=torch.bool)
+    if "oc_radius_center" not in state_dict:
+        state_dict["oc_radius_center"] = torch.tensor(0.0)
+    if "oc_radius_scale" not in state_dict:
+        state_dict["oc_radius_scale"] = torch.tensor(1.0)
     lit.load_state_dict(state_dict, strict=True)
     lit.c_initialized = bool(lit.oc_center_initialized.item())
     return lit
