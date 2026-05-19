@@ -32,7 +32,8 @@ from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
     apply_pv_safe_augmentation,
-    compute_anomaly_scores,
+    combine_anomaly_score_components,
+    compute_anomaly_score_components,
     consistency_loss,
     expected_power_loss,
     kl_divergence,
@@ -178,6 +179,15 @@ def _run_hpo(
     expected_power_indices: list[int] | None = None,
     lambda_expected: float = 0.5,
     lambda_pr_score: float = 0.1,
+    oc_center_max_norm: float = 50.0,
+    score_instability_p95: float = 1e6,
+    score_instability_max: float = 1e7,
+    non_finite_warn_limit_per_epoch: int = 5,
+    max_abs_oc_score_term: float | None = 1e5,
+    max_abs_phys_score_term: float | None = 1e5,
+    max_abs_pr_score_term: float | None = 1e5,
+    max_abs_base_score_term: float | None = 1e5,
+    max_abs_pred_score_term: float | None = 1e5,
 ) -> dict:
     """Run Optuna TPE + ASHA sweep. Returns best params dict."""
     search_space = hpo_cfg.get("search_space", {})
@@ -254,6 +264,16 @@ def _run_hpo(
             expected_power_indices=expected_power_indices,
             lambda_expected=float(suggested.get("lambda_expected", cfg.get("lambda_expected", lambda_expected))),
             lambda_pr_score=float(suggested.get("lambda_pr_score", cfg.get("lambda_pr_score", lambda_pr_score))),
+            oc_center_max_norm=oc_center_max_norm,
+            score_instability_p95=score_instability_p95,
+            score_instability_max=score_instability_max,
+            non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
+            max_abs_oc_score_term=max_abs_oc_score_term,
+            max_abs_phys_score_term=max_abs_phys_score_term,
+            max_abs_pr_score_term=max_abs_pr_score_term,
+            max_abs_base_score_term=max_abs_base_score_term,
+            max_abs_pred_score_term=max_abs_pred_score_term,
+            hpo_mode=True,
         )
 
         hpo_trainer = pl.Trainer(
@@ -285,10 +305,12 @@ def _run_hpo(
             raise
 
         if hpo_lit.non_finite_events > 0:
-            logger.warning(
-                "Pruning unstable HPO trial: detected {} non-finite score events",
-                hpo_lit.non_finite_events,
-            )
+            reason = hpo_lit.stability_reason or f"{hpo_lit.non_finite_events} non-finite events"
+            logger.warning("Pruning unstable HPO trial: {}", reason)
+            raise optuna.exceptions.TrialPruned()
+        if hpo_lit.stability_unstable:
+            reason = hpo_lit.stability_reason or "score/center instability"
+            logger.warning("Pruning unstable HPO trial: {}", reason)
             raise optuna.exceptions.TrialPruned()
         return float(hpo_lit.best_val_pr_auc)
 
@@ -298,8 +320,13 @@ def _run_hpo(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
 
-    best = study.best_trial
     n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    if n_completed == 0:
+        raise RuntimeError(
+            "HPO finished with zero completed trials (all trials pruned/failed). "
+            "Relax stability constraints or narrow search space around known-stable params."
+        )
+    best = study.best_trial
     logger.info(
         "HPO done: best val_macro_per_class_pr_auc={:.4f} | completed={} total={} | params={}",
         best.value, n_completed, len(study.trials), best.params,
@@ -361,6 +388,17 @@ class DLSSMLightningModule(pl.LightningModule):
         expected_power_indices: list[int] | None = None,
         lambda_expected: float = 0.5,
         lambda_pr_score: float = 0.1,
+        # Stability controls
+        oc_center_max_norm: float = 50.0,
+        score_instability_p95: float = 1e6,
+        score_instability_max: float = 1e7,
+        non_finite_warn_limit_per_epoch: int = 5,
+        max_abs_oc_score_term: float | None = 1e5,
+        max_abs_phys_score_term: float | None = 1e5,
+        max_abs_pr_score_term: float | None = 1e5,
+        max_abs_base_score_term: float | None = 1e5,
+        max_abs_pred_score_term: float | None = 1e5,
+        hpo_mode: bool = False,
     ) -> None:
         super().__init__()
         self.model = model
@@ -417,12 +455,27 @@ class DLSSMLightningModule(pl.LightningModule):
         self.expected_power_indices: list[int] = list(expected_power_indices or [])
         self.lambda_expected = lambda_expected
         self.lambda_pr_score = lambda_pr_score
+        self.oc_center_max_norm = float(oc_center_max_norm)
+        self.score_instability_p95 = float(score_instability_p95)
+        self.score_instability_max = float(score_instability_max)
+        self.non_finite_warn_limit_per_epoch = int(non_finite_warn_limit_per_epoch)
+        self.max_abs_oc_score_term = max_abs_oc_score_term
+        self.max_abs_phys_score_term = max_abs_phys_score_term
+        self.max_abs_pr_score_term = max_abs_pr_score_term
+        self.max_abs_base_score_term = max_abs_base_score_term
+        self.max_abs_pred_score_term = max_abs_pred_score_term
+        self.hpo_mode = hpo_mode
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
         self.best_val_pr_auc: float = 0.0
         self.val_threshold: float = 0.5
         self.non_finite_events: int = 0
+        self.stability_unstable: bool = False
+        self.stability_reason: str = ""
+        self._non_finite_warned_batches: int = 0
+        self._non_finite_windows_epoch: int = 0
+        self._component_warned_batches: int = 0
         self._val_scores_np: np.ndarray | None = None
         self._val_labels_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
@@ -471,6 +524,115 @@ class DLSSMLightningModule(pl.LightningModule):
             enable_imbalance=self.enable_imbalance,
         )
 
+    def _in_sanity_check(self) -> bool:
+        return bool(getattr(self.trainer, "sanity_checking", False))
+
+    def _reset_stability_state(self) -> None:
+        """Clear transient stability flags before re-evaluating a checkpoint."""
+        self.non_finite_events = 0
+        self.stability_unstable = False
+        self.stability_reason = ""
+        self._non_finite_warned_batches = 0
+        self._non_finite_windows_epoch = 0
+        self._component_warned_batches = 0
+
+    def _record_non_finite_event(self, message: str, *args) -> None:
+        """Record a real instability event while ignoring Lightning sanity checks."""
+        logger.warning(message, *args)
+        if not self._in_sanity_check():
+            self.non_finite_events += 1
+            self.stability_unstable = True
+            self.stability_reason = message.format(*args) if args else message
+
+    def _check_model_outputs_finite(self, out: dict, stage: str, batch_idx: int) -> None:
+        """Detect non-finite model outputs before score sanitization can hide them."""
+        names = ("x_hat", "x_pred", "q_mu", "q_logvar", "p_mu", "p_logvar", "p_expected")
+        bad_parts: list[str] = []
+        for name in names:
+            value = out.get(name)
+            if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all()):
+                bad_parts.append(name)
+        if bad_parts:
+            self._record_non_finite_event(
+                "{} batch {} has non-finite model outputs: {}",
+                stage,
+                batch_idx,
+                ",".join(bad_parts),
+            )
+
+    def _check_raw_score_components(
+        self, components: dict[str, torch.Tensor], stage: str, batch_idx: int
+    ) -> None:
+        """Use raw pre-clamp score components for instability decisions."""
+        score_guard_active = bool(self.c_initialized) or (self.current_epoch >= self.oc_warmup_epochs)
+        bad_parts: list[str] = []
+        for name, value in components.items():
+            detached = value.detach()
+            finite = torch.isfinite(detached)
+            has_non_finite = not bool(finite.all())
+            abs_value = detached.abs()
+            finite_abs = abs_value[finite]
+            if finite_abs.numel() > 0:
+                comp_p95 = float(torch.quantile(finite_abs.float(), 0.95).item())
+                comp_max = float(finite_abs.max().item())
+            else:
+                comp_p95 = float("inf")
+                comp_max = float("inf")
+            too_large = score_guard_active and (
+                comp_p95 >= self.score_instability_p95 or comp_max >= self.score_instability_max
+            )
+            if has_non_finite or too_large:
+                bad_parts.append(
+                    f"{name}(nonfinite={has_non_finite},p95={comp_p95:.4g},max={comp_max:.4g})"
+                )
+
+        if not bad_parts:
+            return
+
+        if not self._in_sanity_check():
+            self.stability_unstable = True
+            self.stability_reason = f"raw_score_components: {'; '.join(bad_parts)}"
+            if any("nonfinite=True" in part for part in bad_parts):
+                self.non_finite_events += 1
+            if self.hpo_mode:
+                self.trainer.should_stop = True
+
+        if self._component_warned_batches < self.non_finite_warn_limit_per_epoch:
+            logger.warning(
+                "{} batch {} raw score component instability: {}",
+                stage,
+                batch_idx,
+                "; ".join(bad_parts),
+            )
+            self._component_warned_batches += 1
+
+    def _check_training_loss_finite(
+        self,
+        components: dict[str, torch.Tensor],
+        loss: torch.Tensor,
+        batch_idx: int,
+    ) -> torch.Tensor | None:
+        """Check training loss components for non-finite values before the optimizer step.
+
+        Returns a safe dummy loss if any component is non-finite, None otherwise.
+        """
+        bad_parts: list[str] = []
+        for name, value in components.items():
+            if not bool(torch.isfinite(value).all()):
+                bad_parts.append(name)
+        if not bool(torch.isfinite(loss).all()):
+            bad_parts.append("final_loss")
+        if not bad_parts:
+            return None
+        self._record_non_finite_event(
+            "Training batch {} non-finite loss components: {}",
+            batch_idx,
+            ",".join(bad_parts),
+        )
+        if self.hpo_mode and not self._in_sanity_check():
+            self.trainer.should_stop = True
+        return torch.tensor(1.0, device=loss.device, dtype=loss.dtype)
+
     @torch.no_grad()
     def _init_one_class_center(self) -> None:
         """Set self.c to mean(q_mu) over the train loader after warmup.
@@ -488,22 +650,53 @@ class DLSSMLightningModule(pl.LightningModule):
 
         was_training = self.training
         self.eval()
-        n_batches = 0
+        n_seen = 0
         running = torch.zeros_like(self.c)
+        n_good = 0
         for batch in train_dl:
+            n_seen += 1
             x, x_slow, _, _, _ = self._unpack_batch(
                 tuple(t.to(self.device) if isinstance(t, torch.Tensor) else t for t in batch)
             )
             c = self._extract_condition(x)
             out = self.model(x, c, x_slow)
-            running = running + out["q_mu"].mean(dim=(0, 1)).detach()
-            n_batches += 1
-        if n_batches == 0:
-            logger.warning("OC center init: zero batches seen — skipping")
+            q_mean = out["q_mu"].mean(dim=(0, 1)).detach()
+            if not bool(torch.isfinite(q_mean).all()):
+                continue
+            running = running + q_mean
+            n_good += 1
+        if n_seen == 0 or n_good == 0:
+            logger.warning(
+                "OC center init: no valid batches (seen={}, valid={}) — skipping",
+                n_seen,
+                n_good,
+            )
+            if n_seen > 0 and not bool(getattr(self.trainer, "sanity_checking", False)):
+                self.stability_unstable = True
+                self.stability_reason = "oc_center_init: no valid batches"
             if was_training:
                 self.train()
             return
-        c_new = running / n_batches
+        c_new = running / n_good
+
+        if not bool(torch.isfinite(c_new).all()):
+            logger.warning("OC center init produced non-finite center — skipping this epoch")
+            if not self._in_sanity_check():
+                self.stability_unstable = True
+                self.stability_reason = "oc_center_init: non-finite center"
+            if was_training:
+                self.train()
+            return
+
+        c_norm = float(c_new.norm().item())
+        if c_norm > self.oc_center_max_norm:
+            scale = self.oc_center_max_norm / max(c_norm, 1e-12)
+            c_new = c_new * scale
+            logger.warning(
+                "OC center norm {:.4f} exceeded max {:.4f}; clipping",
+                c_norm,
+                self.oc_center_max_norm,
+            )
 
         # Anti-collapse floor
         small = c_new.abs() < 1e-3
@@ -586,6 +779,20 @@ class DLSSMLightningModule(pl.LightningModule):
         )
         loss = per_window.mean()
 
+        # Non-finite guard: check all loss components before optimizer consumes them
+        loss_components = {
+            "recon": recon_w,
+            "pred": pred_w,
+            "kl": kl_w,
+            "phys": phys_w,
+            "oc": oc_w,
+            "cons": cons_w,
+            "exp": exp_w,
+        }
+        dummy = self._check_training_loss_finite(loss_components, loss, batch_idx)
+        if dummy is not None:
+            return dummy
+
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_recon", recon_w.mean(), on_step=False, on_epoch=True)
         self.log("train_pred", pred_w.mean(), on_step=False, on_epoch=True)
@@ -599,9 +806,19 @@ class DLSSMLightningModule(pl.LightningModule):
         return loss
 
     def _score_batch(self, x: torch.Tensor, out: dict) -> torch.Tensor:
-        return compute_anomaly_scores(
-            x, out["x_hat"], out["q_mu"], out["q_logvar"],
-            out["p_mu"], out["p_logvar"],
+        scores, _ = self._score_batch_with_components(x, out)
+        return scores
+
+    def _score_batch_with_components(
+        self, x: torch.Tensor, out: dict
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        components = compute_anomaly_score_components(
+            x=x,
+            x_hat=out["x_hat"],
+            q_mu=out["q_mu"],
+            q_logvar=out["q_logvar"],
+            p_mu=out["p_mu"],
+            p_logvar=out["p_logvar"],
             lambda_kl_score=self.lambda_kl_score,
             score_reduction=self.score_reduction,
             lambda_phys_score=self.lambda_phys_score,
@@ -619,21 +836,42 @@ class DLSSMLightningModule(pl.LightningModule):
             lambda_pr_score=self.lambda_pr_score if self.expected_power_enabled else 0.0,
             expected_power_indices=self.expected_power_indices if self.expected_power_enabled else None,
         )
+        scores = combine_anomaly_score_components(
+            components,
+            lambda_pred_score=self.lambda_pred_score,
+            lambda_oc_score=self.lambda_oc_score,
+            lambda_phys_score=self.lambda_phys_score,
+            lambda_pr_score=self.lambda_pr_score if self.expected_power_enabled else 0.0,
+            max_abs_base_score_term=self.max_abs_base_score_term,
+            max_abs_pred_score_term=self.max_abs_pred_score_term,
+            max_abs_oc_score_term=self.max_abs_oc_score_term,
+            max_abs_phys_score_term=self.max_abs_phys_score_term,
+            max_abs_pr_score_term=self.max_abs_pr_score_term,
+        )
+        return scores, components
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
         x, x_slow, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
             out = self.model(x, self._extract_condition(x), x_slow)
-        scores = self._score_batch(x, out).cpu()
+        self._check_model_outputs_finite(out, "Validation", batch_idx)
+        scores, components = self._score_batch_with_components(x, out)
+        self._check_raw_score_components(components, "Validation", batch_idx)
+        scores = scores.cpu()
         non_finite = ~torch.isfinite(scores)
         if bool(non_finite.any()):
             n_bad = int(non_finite.sum().item())
-            self.non_finite_events += 1
-            logger.warning(
-                "Validation batch {} contains {} non-finite scores; sanitizing with nan_to_num",
-                batch_idx,
-                n_bad,
-            )
+            if not self._in_sanity_check():
+                self.non_finite_events += 1
+                self.stability_unstable = True
+            self._non_finite_windows_epoch += n_bad
+            if self._non_finite_warned_batches < self.non_finite_warn_limit_per_epoch:
+                logger.warning(
+                    "Validation batch {} contains {} non-finite scores; sanitizing with nan_to_num",
+                    batch_idx,
+                    n_bad,
+                )
+                self._non_finite_warned_batches += 1
             scores = torch.nan_to_num(scores, nan=1e6, posinf=1e6, neginf=-1e6)
         self._val_outputs.append(
             {
@@ -658,10 +896,30 @@ class DLSSMLightningModule(pl.LightningModule):
             )
         self._val_outputs.clear()
 
+        if self._non_finite_windows_epoch > 0 and self._non_finite_warned_batches >= self.non_finite_warn_limit_per_epoch:
+            logger.warning(
+                "Validation epoch {} had {} non-finite windows across many batches (log capped at {})",
+                self.current_epoch,
+                self._non_finite_windows_epoch,
+                self.non_finite_warn_limit_per_epoch,
+            )
+        if self._component_warned_batches > 0:
+            logger.warning(
+                "Validation epoch {}: raw score component instability detected in {} batches "
+                "(component-level warnings capped per batch)",
+                self.current_epoch,
+                self._component_warned_batches,
+            )
+        self._non_finite_warned_batches = 0
+        self._non_finite_windows_epoch = 0
+        self._component_warned_batches = 0
+
         finite_mask = np.isfinite(all_scores)
         n_non_finite = int((~finite_mask).sum())
         if n_non_finite > 0:
-            self.non_finite_events += 1
+            if not self._in_sanity_check():
+                self.non_finite_events += 1
+                self.stability_unstable = True
             logger.warning(
                 "Validation epoch {} has {} non-finite aggregated scores; sanitizing",
                 self.current_epoch,
@@ -728,11 +986,51 @@ class DLSSMLightningModule(pl.LightningModule):
             pc_parts,
         )
 
+        score_p95 = float(np.percentile(all_scores, 95))
+        score_max = float(np.max(all_scores))
+        c_norm = float(self.c.norm()) if bool(self.c_initialized) else 0.0
+        c_bad = bool(self.c_initialized) and (not np.isfinite(c_norm) or c_norm > self.oc_center_max_norm)
+        score_guard_active = bool(self.c_initialized) or (self.current_epoch >= self.oc_warmup_epochs)
+        score_bad = score_guard_active and (
+            (not np.isfinite(score_p95))
+            or (not np.isfinite(score_max))
+            or (score_p95 >= self.score_instability_p95)
+            or (score_max >= self.score_instability_max)
+        )
+        if c_bad or score_bad:
+            self.stability_unstable = True
+            parts = []
+            if c_bad:
+                parts.append(f"c_norm={c_norm:.4g}")
+            if score_bad:
+                parts.append(f"score_p95={score_p95:.4g}")
+                parts.append(f"score_max={score_max:.4g}")
+            self.stability_reason = "|".join(parts)
+            logger.warning(
+                "Instability detected epoch {}: {}",
+                self.current_epoch,
+                "; ".join(parts),
+            )
+            if self.hpo_mode and getattr(self.trainer, "sanity_checking", False) is False:
+                self.trainer.should_stop = True
+
     def test_step(self, batch: tuple, batch_idx: int) -> None:
         x, x_slow, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
             out = self.model(x, self._extract_condition(x), x_slow)
-        scores = self._score_batch(x, out).cpu()
+        self._check_model_outputs_finite(out, "Test", batch_idx)
+        scores, components = self._score_batch_with_components(x, out)
+        self._check_raw_score_components(components, "Test", batch_idx)
+        scores = scores.cpu()
+        non_finite = ~torch.isfinite(scores)
+        if bool(non_finite.any()):
+            n_bad = int(non_finite.sum().item())
+            self._record_non_finite_event(
+                "Test batch {} contains {} non-finite scores; sanitizing with nan_to_num",
+                batch_idx,
+                n_bad,
+            )
+            scores = torch.nan_to_num(scores, nan=1e6, posinf=1e6, neginf=-1e6)
         self._test_outputs.append(
             {
                 "scores": scores,
@@ -780,10 +1078,23 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("test_recall_at_threshold", test_rec)
 
     @torch.no_grad()
-    def score_windows(self, x: torch.Tensor, x_slow: torch.Tensor | None = None) -> torch.Tensor:
-        """Score a batch of windows [B, W, F] → anomaly scores [B]."""
+    def score_windows(
+        self,
+        x: torch.Tensor,
+        x_slow: torch.Tensor | None = None,
+        return_diagnostics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Score a batch of windows [B, W, F] → anomaly scores [B].
+
+        When *return_diagnostics=True* returns ``(scores, raw_components)``
+        where raw_components contains pre-sanitization score terms for each
+        component (reconstruction, kl, physics, oc, prediction, pr).
+        """
         out = self.model(x, self._extract_condition(x), x_slow)
-        return self._score_batch(x, out)
+        if not return_diagnostics:
+            return self._score_batch(x, out)
+        scores, components = self._score_batch_with_components(x, out)
+        return scores, components
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
@@ -1177,6 +1488,19 @@ def run_dlssm(config: dict | None = None) -> None:
     lambda_expected: float = float(fdd_cfg.get("lambda_expected", 0.5))
     lambda_pr_score: float = float(fdd_cfg.get("lambda_pr_score", 0.1))
 
+    stability_cfg = dlssm_cfg.get("stability", {}) or {}
+    oc_center_max_norm: float = float(stability_cfg.get("oc_center_max_norm", 50.0))
+    score_instability_p95: float = float(stability_cfg.get("score_instability_p95", 1e6))
+    score_instability_max: float = float(stability_cfg.get("score_instability_max", 1e7))
+    non_finite_warn_limit_per_epoch: int = int(
+        stability_cfg.get("non_finite_warn_limit_per_epoch", 5)
+    )
+    max_abs_oc_score_term: float | None = stability_cfg.get("max_abs_oc_score_term", 1e5)
+    max_abs_phys_score_term: float | None = stability_cfg.get("max_abs_phys_score_term", 1e5)
+    max_abs_pr_score_term: float | None = stability_cfg.get("max_abs_pr_score_term", 1e5)
+    max_abs_base_score_term: float | None = stability_cfg.get("max_abs_base_score_term", 1e5)
+    max_abs_pred_score_term: float | None = stability_cfg.get("max_abs_pred_score_term", 1e5)
+
     # Override variant to DLSSM-FDD when all stacked components are active
     if slow_context_enabled and expected_power_enabled and cvae_enabled:
         variant = "DLSSM-FDD"
@@ -1216,6 +1540,15 @@ def run_dlssm(config: dict | None = None) -> None:
             expected_power_indices=expected_power_indices,
             lambda_expected=lambda_expected,
             lambda_pr_score=lambda_pr_score,
+            oc_center_max_norm=oc_center_max_norm,
+            score_instability_p95=score_instability_p95,
+            score_instability_max=score_instability_max,
+            non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
+            max_abs_oc_score_term=max_abs_oc_score_term,
+            max_abs_phys_score_term=max_abs_phys_score_term,
+            max_abs_pr_score_term=max_abs_pr_score_term,
+            max_abs_base_score_term=max_abs_base_score_term,
+            max_abs_pred_score_term=max_abs_pred_score_term,
         )
         logger.info("HPO best params: {}", json.dumps(hpo_params, default=str))
 
@@ -1283,6 +1616,16 @@ def run_dlssm(config: dict | None = None) -> None:
         expected_power_indices=expected_power_indices,
         lambda_expected=lambda_expected,
         lambda_pr_score=lambda_pr_score,
+        oc_center_max_norm=oc_center_max_norm,
+        score_instability_p95=score_instability_p95,
+        score_instability_max=score_instability_max,
+        non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
+        max_abs_oc_score_term=max_abs_oc_score_term,
+        max_abs_phys_score_term=max_abs_phys_score_term,
+        max_abs_pr_score_term=max_abs_pr_score_term,
+        max_abs_base_score_term=max_abs_base_score_term,
+        max_abs_pred_score_term=max_abs_pred_score_term,
+        hpo_mode=False,
     )
 
     # Artifact dir
@@ -1334,12 +1677,34 @@ def run_dlssm(config: dict | None = None) -> None:
     ckpt_cb = next((c for c in callbacks if isinstance(c, ModelCheckpoint)), None)
     best_ckpt_path: str | None = ckpt_cb.best_model_path if (ckpt_cb and ckpt_cb.best_model_path) else None
 
+    if lit.stability_unstable or lit.non_finite_events > 0:
+        reason = lit.stability_reason or "unknown"
+        if not best_ckpt_path:
+            raise RuntimeError(
+                "Training aborted due to numerical instability and no best checkpoint available. "
+                f"Reason: {reason} "
+                f"(stability_unstable={lit.stability_unstable}, non_finite_events={lit.non_finite_events})."
+            )
+        logger.warning(
+            "Numerical instability detected (reason={}, stability_unstable={}, non_finite_events={}) — "
+            "validating best checkpoint before continuing",
+            reason, lit.stability_unstable, lit.non_finite_events,
+        )
+        lit._reset_stability_state()
+
     # Re-validate with best checkpoint
     if best_ckpt_path:
         logger.info("Re-validating with best checkpoint: {}", best_ckpt_path)
         pl.Trainer(enable_progress_bar=False, enable_model_summary=False, logger=False).validate(
             lit, dataloaders=val_dl, ckpt_path=best_ckpt_path
         )
+        if lit.stability_unstable or lit.non_finite_events > 0:
+            reason = lit.stability_reason or "unknown"
+            raise RuntimeError(
+                "Best checkpoint failed stability validation. "
+                f"Reason: {reason} "
+                f"(stability_unstable={lit.stability_unstable}, non_finite_events={lit.non_finite_events})."
+            )
     else:
         logger.warning("No checkpoint found — val scores from last epoch.")
 
@@ -1347,6 +1712,13 @@ def run_dlssm(config: dict | None = None) -> None:
     pl.Trainer(enable_progress_bar=False, enable_model_summary=False, logger=False).test(
         lit, dataloaders=test_dl, ckpt_path=best_ckpt_path
     )
+    if lit.stability_unstable or lit.non_finite_events > 0:
+        reason = lit.stability_reason or "unknown"
+        raise RuntimeError(
+            "Best checkpoint failed stability test. "
+            f"Reason: {reason} "
+            f"(stability_unstable={lit.stability_unstable}, non_finite_events={lit.non_finite_events})."
+        )
 
     val_scores = lit._val_scores_np
     val_labels = lit._val_labels_np

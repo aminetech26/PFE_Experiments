@@ -179,9 +179,21 @@ anomaly_detection:
           lambda_expected: 0.5         # training weight for expected-power head MSE
           lambda_pr_score: 0.1         # scoring weight for performance-ratio gap
 
+        # Numerical stability guards for scoring / OC center
+        stability:
+          oc_center_max_norm: 50.0
+          score_instability_p95: 1.0e6
+          score_instability_max: 1.0e7
+          non_finite_warn_limit_per_epoch: 5
+          max_abs_oc_score_term: 1.0e5
+          max_abs_phys_score_term: 1.0e5
+          max_abs_pr_score_term: 1.0e5
+          max_abs_base_score_term: 1.0e5
+          max_abs_pred_score_term: 1.0e5
+
         alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
         lambda_kl_score: 0.1
-        lambda_phys_score: 0.05
+        lambda_phys_score: 0.03
         lambda_pred_score: 0.1
         score_reduction: max
 
@@ -204,23 +216,23 @@ anomaly_detection:
           min_hpo_patience: 5
           pruning_warmup_epochs: 3
           search_space:
-            learning_rate:        {type: float, low: 1.0e-4, high: 1.5e-3, log: true}
+            learning_rate:        {type: float, low: 1.0e-4, high: 7.0e-4, log: true}
             weight_decay:         {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
             dropout:              {type: float, low: 0.0,    high: 0.3}
-            free_bits:            {type: categorical, choices: [0.0, 0.05, 0.1]}
+            free_bits:            {type: categorical, choices: [0.0, 0.05]}
             lambda_phys:          {type: float, low: 0.02, high: 0.3, log: true}
             lambda_oc:            {type: float, low: 0.02, high: 0.3, log: true}
             lambda_cons:          {type: float, low: 0.02, high: 0.3, log: true}
             lambda_kl_score:      {type: float, low: 0.05, high: 0.3, log: true}
             lambda_pred_score:    {type: float, low: 0.0,  high: 0.3}
-            lambda_oc_score:      {type: float, low: 0.0,  high: 0.15}
-            lambda_phys_score:    {type: float, low: 0.0,  high: 0.1}
-            aug_noise_std:        {type: float, low: 0.02, high: 0.15}
+            lambda_oc_score:      {type: float, low: 0.0,  high: 0.05}
+            lambda_phys_score:    {type: float, low: 0.0,  high: 0.03}
+            aug_noise_std:        {type: float, low: 0.02, high: 0.08}
             aug_feature_dropout:  {type: float, low: 0.0,  high: 0.2}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
             # DLSSM-FDD HPO extensions (lambda_expected/pr_score tuned; slow/attn dims fixed)
-            lambda_expected:      {type: float, low: 0.1, high: 2.0, log: true}
-            lambda_pr_score:      {type: float, low: 0.05, high: 1.0, log: true}
+            lambda_expected:      {type: float, low: 0.1, high: 1.0, log: true}
+            lambda_pr_score:      {type: float, low: 0.05, high: 0.2, log: true}
 
       pv_gdn:
         win_size: 30

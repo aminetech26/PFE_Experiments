@@ -247,6 +247,119 @@ def apply_pv_safe_augmentation(
     return out
 
 
+def _reduce_score_window(t: torch.Tensor, score_reduction: str) -> torch.Tensor:
+    if score_reduction == "mean":
+        return t.mean(dim=1)
+    if score_reduction == "max":
+        return t.max(dim=1).values
+    return t[:, t.size(1) // 2]
+
+
+def _sanitize_score_component(component: torch.Tensor, max_abs: float | None) -> torch.Tensor:
+    out = torch.nan_to_num(component, nan=1e6, posinf=1e6, neginf=-1e6)
+    if max_abs is not None and max_abs > 0.0:
+        out = out.clamp(min=-max_abs, max=max_abs)
+    return out
+
+
+def compute_anomaly_score_components(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    q_mu: torch.Tensor,
+    q_logvar: torch.Tensor,
+    p_mu: torch.Tensor,
+    p_logvar: torch.Tensor,
+    lambda_kl_score: float = 0.1,
+    score_reduction: str = "center",
+    lambda_phys_score: float = 0.0,
+    scaler_mean: torch.Tensor | None = None,
+    scaler_scale: torch.Tensor | None = None,
+    feature_idx: dict[str, int] | None = None,
+    enable_string_power: bool = True,
+    enable_imbalance: bool = True,
+    x_pred: torch.Tensor | None = None,
+    lambda_pred_score: float = 0.0,
+    c: torch.Tensor | None = None,
+    lambda_oc_score: float = 0.0,
+    recon_mask: torch.Tensor | None = None,
+    p_expected: torch.Tensor | None = None,
+    lambda_pr_score: float = 0.0,
+    expected_power_indices: list[int] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Return raw, pre-sanitization score components for diagnostics and scoring.
+
+    Values are unweighted except ``base``, which already includes ``lambda_kl_score``
+    because reconstruction and KL form the core anomaly score.
+    """
+    components: dict[str, torch.Tensor] = {}
+    recon_t = reconstruction_loss(x_hat, x, recon_mask=recon_mask)
+    kl_t = kl_divergence(q_mu, q_logvar, p_mu, p_logvar)
+    components["base"] = _reduce_score_window(recon_t + lambda_kl_score * kl_t, score_reduction)
+
+    if lambda_pred_score > 0.0 and x_pred is not None:
+        pred_t = prediction_loss(x_pred, x, recon_mask=recon_mask)
+        components["pred"] = _reduce_score_window(pred_t, score_reduction)
+
+    if lambda_oc_score > 0.0 and c is not None:
+        oc_t = ((q_mu - c) ** 2).sum(dim=-1)
+        components["oc"] = _reduce_score_window(oc_t, score_reduction)
+
+    if (
+        lambda_phys_score > 0.0
+        and scaler_mean is not None
+        and scaler_scale is not None
+        and feature_idx is not None
+    ):
+        components["phys"] = physics_consistency_loss(
+            x_hat,
+            scaler_mean,
+            scaler_scale,
+            feature_idx,
+            enable_string_power=enable_string_power,
+            enable_imbalance=enable_imbalance,
+        )
+
+    if lambda_pr_score > 0.0 and p_expected is not None and expected_power_indices:
+        components["pr"] = performance_gap_score(
+            p_expected, x, expected_power_indices, score_reduction
+        )
+
+    return components
+
+
+def combine_anomaly_score_components(
+    components: dict[str, torch.Tensor],
+    lambda_pred_score: float = 0.0,
+    lambda_oc_score: float = 0.0,
+    lambda_phys_score: float = 0.0,
+    lambda_pr_score: float = 0.0,
+    max_abs_base_score_term: float | None = None,
+    max_abs_pred_score_term: float | None = None,
+    max_abs_oc_score_term: float | None = None,
+    max_abs_phys_score_term: float | None = None,
+    max_abs_pr_score_term: float | None = None,
+) -> torch.Tensor:
+    """Combine raw components into a finite score for metric computation."""
+    base = _sanitize_score_component(components["base"], max_abs_base_score_term)
+    if "pred" in components:
+        base = base + lambda_pred_score * _sanitize_score_component(
+            components["pred"], max_abs_pred_score_term
+        )
+    if "oc" in components:
+        base = base + lambda_oc_score * _sanitize_score_component(
+            components["oc"], max_abs_oc_score_term
+        )
+    if "phys" in components:
+        base = base + lambda_phys_score * _sanitize_score_component(
+            components["phys"], max_abs_phys_score_term
+        )
+    if "pr" in components:
+        base = base + lambda_pr_score * _sanitize_score_component(
+            components["pr"], max_abs_pr_score_term
+        )
+    return base
+
+
 def compute_anomaly_scores(
     x: torch.Tensor,
     x_hat: torch.Tensor,
@@ -270,6 +383,11 @@ def compute_anomaly_scores(
     p_expected: torch.Tensor | None = None,
     lambda_pr_score: float = 0.0,
     expected_power_indices: list[int] | None = None,
+    max_abs_base_score_term: float | None = None,
+    max_abs_pred_score_term: float | None = None,
+    max_abs_oc_score_term: float | None = None,
+    max_abs_phys_score_term: float | None = None,
+    max_abs_pr_score_term: float | None = None,
 ) -> torch.Tensor:
     """Per-window anomaly score combining three complementary signals.
 
@@ -283,40 +401,39 @@ def compute_anomaly_scores(
     Physics and pred terms use window-level aggregation regardless of score_reduction.
     """
 
-    def _reduce(t: torch.Tensor) -> torch.Tensor:
-        if score_reduction == "mean":
-            return t.mean(dim=1)
-        if score_reduction == "max":
-            return t.max(dim=1).values
-        return t[:, t.size(1) // 2]  # center timestep
-
-    recon_t = reconstruction_loss(x_hat, x, recon_mask=recon_mask)        # [B, W]
-    kl_t = kl_divergence(q_mu, q_logvar, p_mu, p_logvar)                 # [B, W]
-    base = _reduce(recon_t + lambda_kl_score * kl_t)                     # [B]
-
-    if lambda_pred_score > 0.0 and x_pred is not None:
-        base = base + lambda_pred_score * _reduce(prediction_loss(x_pred, x, recon_mask=recon_mask))
-
-    if lambda_oc_score > 0.0 and c is not None:
-        # Deep SVDD distance: how far q_mu lies from the normal latent center
-        oc_t = ((q_mu - c) ** 2).sum(dim=-1)  # [B, W]
-        base = base + lambda_oc_score * _reduce(oc_t)
-
-    if (
-        lambda_phys_score > 0.0
-        and scaler_mean is not None
-        and scaler_scale is not None
-        and feature_idx is not None
-    ):
-        phys_s = physics_consistency_loss(
-            x_hat, scaler_mean, scaler_scale, feature_idx,
-            enable_string_power=enable_string_power,
-            enable_imbalance=enable_imbalance,
-        )
-        base = base + lambda_phys_score * phys_s  # phys_s is already [B] window-mean
-
-    if lambda_pr_score > 0.0 and p_expected is not None and expected_power_indices:
-        pr_s = performance_gap_score(p_expected, x, expected_power_indices, score_reduction)
-        base = base + lambda_pr_score * pr_s
-
-    return base
+    components = compute_anomaly_score_components(
+        x=x,
+        x_hat=x_hat,
+        q_mu=q_mu,
+        q_logvar=q_logvar,
+        p_mu=p_mu,
+        p_logvar=p_logvar,
+        lambda_kl_score=lambda_kl_score,
+        score_reduction=score_reduction,
+        lambda_phys_score=lambda_phys_score,
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
+        feature_idx=feature_idx,
+        enable_string_power=enable_string_power,
+        enable_imbalance=enable_imbalance,
+        x_pred=x_pred,
+        lambda_pred_score=lambda_pred_score,
+        c=c,
+        lambda_oc_score=lambda_oc_score,
+        recon_mask=recon_mask,
+        p_expected=p_expected,
+        lambda_pr_score=lambda_pr_score,
+        expected_power_indices=expected_power_indices,
+    )
+    return combine_anomaly_score_components(
+        components,
+        lambda_pred_score=lambda_pred_score,
+        lambda_oc_score=lambda_oc_score,
+        lambda_phys_score=lambda_phys_score,
+        lambda_pr_score=lambda_pr_score,
+        max_abs_base_score_term=max_abs_base_score_term,
+        max_abs_pred_score_term=max_abs_pred_score_term,
+        max_abs_oc_score_term=max_abs_oc_score_term,
+        max_abs_phys_score_term=max_abs_phys_score_term,
+        max_abs_pr_score_term=max_abs_pr_score_term,
+    )
