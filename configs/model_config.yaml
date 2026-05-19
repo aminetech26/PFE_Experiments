@@ -235,7 +235,7 @@ anomaly_detection:
             score_reduction:      {type: categorical, choices: [center, mean, max]}
             # DLSSM-FDD HPO extensions (lambda_expected/pr_score tuned; slow/attn dims fixed)
             lambda_expected:      {type: float, low: 0.1, high: 1.0, log: true}
-            lambda_pr_score:      {type: float, low: 0.05, high: 0.2, log: true}
+            lambda_pr_score:      {type: float, low: 0.1, high: 3.0, log: true}
 
       pv_gdn:
         win_size: 30

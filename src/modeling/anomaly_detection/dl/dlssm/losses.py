@@ -177,11 +177,13 @@ def performance_gap_score(
     p_expected: torch.Tensor,
     x: torch.Tensor,
     expected_power_indices: list[int],
-    score_reduction: str = "mean",
+    score_reduction: str = "mean",  # kept for API compat; always uses mean (degradation is sustained)
 ) -> torch.Tensor:
     """Asymmetric performance-ratio score: ReLU(P_expected − P_observed).
 
     Penalises under-performance only — the signature of slow degradation (class 2).
+    Always uses mean reduction: degradation is a persistent drift across the full window,
+    so mean accumulates the signal correctly regardless of the global score_reduction setting.
     p_expected: [B, W, n_power]; x: [B, W, F]. Returns [B].
     """
     if not expected_power_indices or p_expected is None:
@@ -189,11 +191,7 @@ def performance_gap_score(
     x_power = x[:, :, expected_power_indices]  # [B, W, n_power]
     gap = F.relu(p_expected - x_power)         # [B, W, n_power] — only under-performance
     gap_t = gap.mean(dim=-1)                   # [B, W]
-    if score_reduction == "max":
-        return gap_t.max(dim=1).values
-    if score_reduction == "center":
-        return gap_t[:, gap_t.size(1) // 2]
-    return gap_t.mean(dim=1)                   # default: mean
+    return gap_t.mean(dim=1)                   # always mean — sustained drift, not peak event
 
 
 def one_class_loss(q_mu: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
