@@ -33,6 +33,8 @@ from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
     compute_anomaly_scores,
     kl_divergence,
+    latent_distance_score,
+    one_class_loss,
     reconstruction_loss,
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
@@ -158,6 +160,9 @@ def _run_hpo(
     score_instability_max: float = 1e7,
     non_finite_warn_limit_per_epoch: int = 5,
     max_abs_base_score_term: float | None = 1e5,
+    lambda_oc: float = 0.0,
+    oc_warmup_epochs: int = 5,
+    max_abs_oc_score_term: float | None = 1e5,
 ) -> dict:
     """Run Optuna TPE + ASHA sweep. Returns best params dict."""
     search_space = hpo_cfg.get("search_space", {})
@@ -211,15 +216,18 @@ def _run_hpo(
             score_instability_max=score_instability_max,
             non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
             max_abs_base_score_term=max_abs_base_score_term,
+            lambda_oc=float(suggested.get("lambda_oc", lambda_oc)),
+            oc_warmup_epochs=oc_warmup_epochs,
+            max_abs_oc_score_term=max_abs_oc_score_term,
             hpo_mode=True,
         )
 
         hpo_trainer = pl.Trainer(
             max_epochs=hpo_epochs,
             callbacks=[
-                EarlyStopping(monitor="val_macro_per_class_pr_auc", patience=hpo_patience, mode="max", verbose=False),
+                EarlyStopping(monitor="val_macro_per_class_pr_auc_monitor", patience=hpo_patience, mode="max", verbose=False),
                 _OptunaPruningCallback(
-                    trial, monitor="val_macro_per_class_pr_auc", warmup_epochs=pruning_warmup_epochs
+                    trial, monitor="val_macro_per_class_pr_auc_monitor", warmup_epochs=pruning_warmup_epochs
                 ),
             ],
             enable_progress_bar=False,
@@ -334,6 +342,10 @@ class DLSSMLightningModule(pl.LightningModule):
         score_instability_max: float = 1e7,
         non_finite_warn_limit_per_epoch: int = 5,
         max_abs_base_score_term: float | None = 1e5,
+        # Deep SVDD
+        lambda_oc: float = 0.0,
+        oc_warmup_epochs: int = 5,
+        max_abs_oc_score_term: float | None = 1e5,
         hpo_mode: bool = False,
     ) -> None:
         super().__init__()
@@ -358,7 +370,16 @@ class DLSSMLightningModule(pl.LightningModule):
         self.score_instability_max = float(score_instability_max)
         self.non_finite_warn_limit_per_epoch = int(non_finite_warn_limit_per_epoch)
         self.max_abs_base_score_term = float(max_abs_base_score_term) if max_abs_base_score_term is not None else None
+        self.lambda_oc = float(lambda_oc)
+        self.oc_warmup_epochs = int(oc_warmup_epochs)
+        self.max_abs_oc_score_term = float(max_abs_oc_score_term) if max_abs_oc_score_term is not None else None
         self.hpo_mode = hpo_mode
+
+        # SVDD center — registered as buffer (persisted in checkpoint, moved to device automatically)
+        self.register_buffer("oc_center", torch.zeros(latent_dim))
+        self.register_buffer("oc_center_initialized", torch.tensor(False, dtype=torch.bool))
+        # Keep python mirror for readability; source of truth is the buffer.
+        self.c_initialized: bool = bool(self.oc_center_initialized.item())
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -378,6 +399,15 @@ class DLSSMLightningModule(pl.LightningModule):
         self._test_labels_np: np.ndarray | None = None
         self._test_original_labels_np: np.ndarray | None = None
         self._test_group_ids_np: np.ndarray | None = None
+
+    def _svdd_scoring_active(self) -> bool:
+        if self.lambda_oc <= 0.0:
+            return False
+        return bool(self.oc_center_initialized.item())
+
+    def _set_center_initialized(self, value: bool) -> None:
+        self.oc_center_initialized.fill_(bool(value))
+        self.c_initialized = bool(value)
 
     def _unpack_batch(self, batch: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list | None]:
         x = batch[0]
@@ -448,6 +478,27 @@ class DLSSMLightningModule(pl.LightningModule):
             self.trainer.should_stop = True
         return torch.tensor(1.0, device=loss.device, dtype=loss.dtype)
 
+    def on_train_epoch_start(self) -> None:
+        if self.lambda_oc > 0.0 and self.current_epoch == self.oc_warmup_epochs and not self._svdd_scoring_active():
+            self._init_center_from_loader()
+
+    def _init_center_from_loader(self) -> None:
+        """One-pass sample-and-timestep-weighted mean of q_mu to initialize SVDD center."""
+        self.model.eval()
+        with torch.no_grad():
+            acc = torch.zeros_like(self.oc_center)
+            n = 0
+            for batch in self.trainer.train_dataloader:
+                x = batch[0].to(self.device)
+                out = self.model(x)
+                acc += out["q_mu"].sum(dim=(0, 1))              # sum over B and W → [D]
+                n += out["q_mu"].shape[0] * out["q_mu"].shape[1]  # total (sample, timestep) pairs
+            if n > 0:
+                self.oc_center.copy_(acc / n)
+        self.model.train()
+        self._set_center_initialized(True)
+        logger.info("SVDD center initialized: norm={:.4f}", self.oc_center.norm().item())
+
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         x, _, _, _ = self._unpack_batch(batch)
         out = self.model(x)
@@ -463,13 +514,17 @@ class DLSSMLightningModule(pl.LightningModule):
         beta = self.beta_kl * min(1.0, (self.current_epoch + 1) / max(self.kl_warmup_epochs, 1))
 
         per_window = recon_w + beta * kl_w
+
+        # SVDD: add latent distance loss after center is initialized
+        loss_components: dict[str, torch.Tensor] = {"recon": recon_w, "kl": kl_w}
+        if self._svdd_scoring_active():
+            oc_w = one_class_loss(out["q_mu"], self.oc_center)
+            per_window = per_window + self.lambda_oc * oc_w
+            loss_components["oc"] = oc_w
+
         loss = per_window.mean()
 
         # Non-finite guard: check all loss components before optimizer consumes them
-        loss_components = {
-            "recon": recon_w,
-            "kl": kl_w,
-        }
         dummy = self._check_training_loss_finite(loss_components, loss, batch_idx)
         if dummy is not None:
             return dummy
@@ -478,9 +533,22 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("train_recon", recon_w.mean(), on_step=False, on_epoch=True)
         self.log("train_kl", kl_w.mean(), on_step=False, on_epoch=True)
         self.log("train_beta_kl", beta, on_step=False, on_epoch=True)
+        if "oc" in loss_components:
+            self.log("train_oc", loss_components["oc"].mean(), on_step=False, on_epoch=True)
+        if self.lambda_oc > 0.0:
+            self.log("latent_q_mu_std", out["q_mu"].std(dim=(0, 1)).mean(), on_step=False, on_epoch=True)
+            self.log("latent_q_mu_abs", out["q_mu"].abs().mean(), on_step=False, on_epoch=True)
         return loss
 
     def _score_batch(self, x: torch.Tensor, out: dict) -> torch.Tensor:
+        if self._svdd_scoring_active():
+            return latent_distance_score(
+                out["q_mu"],
+                self.oc_center,
+                score_reduction=self.score_reduction,
+                max_abs=self.max_abs_oc_score_term,
+            )
+        # Fallback before center is initialized (warmup epochs / SVDD disabled)
         return compute_anomaly_scores(
             x=x,
             x_hat=out["x_hat"],
@@ -564,6 +632,7 @@ class DLSSMLightningModule(pl.LightningModule):
             # Degenerate batch (sanity check or all-normal segment): log zeros with
             # identical kwargs to the normal path so Lightning doesn't reject a kwarg mismatch.
             self.log("val_macro_per_class_pr_auc", 0.0, prog_bar=True)
+            self.log("val_macro_per_class_pr_auc_monitor", -1.0 if self.lambda_oc > 0.0 else 0.0, prog_bar=False)
             self.log("val_worst_class_pr_auc", 0.0, prog_bar=True)
             self.log("val_pr_auc", 0.0)
             self.log("val_roc_auc", 0.0)
@@ -587,7 +656,15 @@ class DLSSMLightningModule(pl.LightningModule):
         val_worst_pc_pr_auc = float(per_class_pr.get("worst_class_pr_auc") or 0.0)
         per_class_detail: dict = per_class_pr.get("per_class_pr_auc_vs_normal", {})
 
-        self.best_val_pr_auc = max(self.best_val_pr_auc, val_macro_pc_pr_auc)
+        monitor_score = val_macro_pc_pr_auc
+        if self.lambda_oc > 0.0 and not self._svdd_scoring_active():
+            monitor_score = -1.0
+            logger.info(
+                "Epoch {:3d} | SVDD warmup active (center not initialized), monitor metric held at -1.0",
+                self.current_epoch,
+            )
+
+        self.best_val_pr_auc = max(self.best_val_pr_auc, monitor_score)
         self.best_val_worst_pr_auc = max(self.best_val_worst_pr_auc, val_worst_pc_pr_auc)
         self.val_threshold = threshold
         self._val_scores_np = all_scores
@@ -604,6 +681,11 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("val_recall_at_threshold", val_rec)
         self.log("val_accuracy_at_threshold", val_acc)
         self.log("val_threshold", threshold)
+        self.log("val_macro_per_class_pr_auc_monitor", monitor_score, prog_bar=False)
+
+        # SVDD collapse monitoring — log latent statistics for diagnosing posterior collapse
+        if self.lambda_oc > 0.0:
+            self.log("oc_center_norm", self.oc_center.norm())
 
         # Per-class PR-AUC breakdown for visibility during training
         pc_parts = "  ".join(
@@ -937,6 +1019,11 @@ def run_dlssm(config: dict | None = None) -> None:
     )
     _raw_base = stability_cfg.get("max_abs_base_score_term")
     max_abs_base_score_term: float | None = float(_raw_base) if _raw_base is not None else 1e5
+    _raw_oc = stability_cfg.get("max_abs_oc_score_term")
+    max_abs_oc_score_term: float | None = float(_raw_oc) if _raw_oc is not None else 1e5
+
+    lambda_oc: float = float(dlssm_cfg.get("lambda_oc", 0.0))
+    oc_warmup_epochs: int = int(dlssm_cfg.get("oc_warmup_epochs", 5))
 
     # Apply best params from --best-params JSON or from HPO sweep
     hpo_params: dict = {}
@@ -964,12 +1051,17 @@ def run_dlssm(config: dict | None = None) -> None:
             score_instability_max=score_instability_max,
             non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
             max_abs_base_score_term=max_abs_base_score_term,
+            lambda_oc=lambda_oc,
+            oc_warmup_epochs=oc_warmup_epochs,
+            max_abs_oc_score_term=max_abs_oc_score_term,
         )
         logger.info("HPO best params: {}", json.dumps(hpo_params, default=str))
 
     # Merge hpo_params into dlssm_cfg (non-destructive — only affects this run)
     if hpo_params:
         dlssm_cfg = {**dlssm_cfg, **hpo_params}
+        lambda_oc = float(dlssm_cfg.get("lambda_oc", lambda_oc))
+        oc_warmup_epochs = int(dlssm_cfg.get("oc_warmup_epochs", oc_warmup_epochs))
 
     # Build model and Lightning module
     pl.seed_everything(seed, workers=True)
@@ -1008,6 +1100,9 @@ def run_dlssm(config: dict | None = None) -> None:
         score_instability_max=score_instability_max,
         non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
         max_abs_base_score_term=max_abs_base_score_term,
+        lambda_oc=lambda_oc,
+        oc_warmup_epochs=oc_warmup_epochs,
+        max_abs_oc_score_term=max_abs_oc_score_term,
         hpo_mode=False,
     )
 
@@ -1023,11 +1118,11 @@ def run_dlssm(config: dict | None = None) -> None:
 
     # Train
     callbacks = [
-        EarlyStopping(monitor="val_macro_per_class_pr_auc", patience=patience, mode="max", verbose=False),
+        EarlyStopping(monitor="val_macro_per_class_pr_auc_monitor", patience=patience, mode="max", verbose=False),
         ModelCheckpoint(
             dirpath=str(ckpt_dir),
             filename="best",
-            monitor="val_macro_per_class_pr_auc",
+            monitor="val_macro_per_class_pr_auc_monitor",
             mode="max",
             save_top_k=1,
             save_last=True,
@@ -1140,14 +1235,14 @@ def run_dlssm(config: dict | None = None) -> None:
         test_pr_auc, test_roc_auc, test_f1, test_prec, test_rec,
     )
 
-    score_components = ["reconstruction", "kl"]
+    score_components = ["latent_distance"] if lit._svdd_scoring_active() else ["reconstruction", "kl"]
 
     metrics: dict = {
         "score_name": "dlssm_score",
         "score_components": score_components,
         "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
         "threshold_policy": "q95_normal_val",
-        "selection_metric": "val_macro_per_class_pr_auc",
+        "selection_metric": "val_macro_per_class_pr_auc_monitor",
         "val_pr_auc": val_pr_auc,
         "val_roc_auc": val_roc_auc,
         "val_f1_at_threshold": val_f1,
@@ -1258,7 +1353,7 @@ def run_dlssm(config: dict | None = None) -> None:
         extras={
             "checkpoint_available": bool(best_ckpt_path),
             "threshold_policy": "q95_normal_val",
-            "selection_metric": "val_macro_per_class_pr_auc",
+            "selection_metric": "val_macro_per_class_pr_auc_monitor",
             "score_name": "dlssm_score",
             "score_components": score_components,
             "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
@@ -1340,7 +1435,7 @@ def run_dlssm(config: dict | None = None) -> None:
                 "latent_dim": int(dlssm_cfg.get("latent_dim", 16)),
                 "threshold": threshold,
                 "threshold_policy": "q95_normal_val",
-                "selection_metric": "val_macro_per_class_pr_auc",
+                "selection_metric": "val_macro_per_class_pr_auc_monitor",
                 "val_selection_score": val_macro.get("macro_per_class_pr_auc"),
                 "score_name": "dlssm_score",
                 "score_components": score_components,

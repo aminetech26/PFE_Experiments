@@ -80,12 +80,18 @@ def _load_dlssm_ckpt(model_path: Path, root: Path, deployment_manifest: dict[str
         score_instability_max=1e7,
         non_finite_warn_limit_per_epoch=5,
         max_abs_base_score_term=1e5,
+        lambda_oc=float(run_params.get("lambda_oc", 0.0)),
+        oc_warmup_epochs=int(run_params.get("oc_warmup_epochs", 5)),
+        max_abs_oc_score_term=1e5,
         hpo_mode=False,
     )
 
     ckpt = torch.load(model_path, map_location="cpu")
     state_dict = ckpt.get("state_dict", ckpt)
+    if "oc_center_initialized" not in state_dict:
+        state_dict["oc_center_initialized"] = torch.tensor(bool(lit.lambda_oc > 0.0), dtype=torch.bool)
     lit.load_state_dict(state_dict, strict=True)
+    lit.c_initialized = bool(lit.oc_center_initialized.item())
     return lit
 
 

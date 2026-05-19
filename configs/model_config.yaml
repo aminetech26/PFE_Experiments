@@ -148,11 +148,19 @@ anomaly_detection:
         # Numerical stability guards for scoring
         # NB: all values must be valid YAML float literals — PyYAML safe_load
         # does NOT parse "1.0e5" or "1e5" as numbers (they become strings).
+        # Deep SVDD
+        lambda_oc: 0.1
+        oc_warmup_epochs: 5
+
+        # Numerical stability guards for scoring
+        # NB: all values must be valid YAML float literals — PyYAML safe_load
+        # does NOT parse "1.0e5" or "1e5" as numbers (they become strings).
         stability:
           score_instability_p95: 1000000.0
           score_instability_max: 10000000.0
           non_finite_warn_limit_per_epoch: 5
           max_abs_base_score_term: 100000.0
+          max_abs_oc_score_term: 100000.0
 
         lambda_kl_score: 0.1
         score_reduction: mean
@@ -175,7 +183,7 @@ anomaly_detection:
           min_hpo_epochs: 10
           patience_fraction: 0.33
           min_hpo_patience: 5
-          pruning_warmup_epochs: 3
+          pruning_warmup_epochs: 7    # must be > oc_warmup_epochs (5) to avoid pruning on fallback recon score
           search_space:
             learning_rate:        {type: float, low: 1.0e-4, high: 7.0e-4, log: true}
             weight_decay:         {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
@@ -183,6 +191,7 @@ anomaly_detection:
             free_bits:            {type: categorical, choices: [0.0, 0.05]}
             lambda_kl_score:      {type: float, low: 0.05, high: 0.3, log: true}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
+            lambda_oc:            {type: float, low: 0.01, high: 0.5, log: true}
 
       pv_gdn:
         win_size: 30

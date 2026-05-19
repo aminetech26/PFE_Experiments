@@ -44,6 +44,25 @@ def _sanitize_score_component(component: torch.Tensor, max_abs: float | None) ->
     return out
 
 
+def one_class_loss(q_mu: torch.Tensor, center: torch.Tensor) -> torch.Tensor:
+    """SVDD: per-window mean squared distance of posterior mean from center. Returns [B]."""
+    diff = q_mu - center.unsqueeze(0).unsqueeze(0)  # [B, W, D]
+    return (diff ** 2).mean(dim=-1).mean(dim=1)      # [B]
+
+
+def latent_distance_score(
+    q_mu: torch.Tensor,
+    center: torch.Tensor,
+    score_reduction: str = "mean",
+    max_abs: float | None = None,
+) -> torch.Tensor:
+    """Score = ‖q_mu - c‖² per timestep, reduced over W. Returns [B]."""
+    diff = q_mu - center.unsqueeze(0).unsqueeze(0)  # [B, W, D]
+    dist_t = (diff ** 2).mean(dim=-1)               # [B, W]
+    score = _reduce_score_window(dist_t, score_reduction)
+    return _sanitize_score_component(score, max_abs)
+
+
 def compute_anomaly_scores(
     x: torch.Tensor,
     x_hat: torch.Tensor,
