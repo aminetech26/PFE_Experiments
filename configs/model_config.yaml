@@ -151,9 +151,9 @@ anomaly_detection:
           temperature_correction: false   # disabled until base is stable
 
         # Semi-supervised paradigms — all on by default for DLSSM-FDD
-        one_class: true                   # Deep SVDD-style latent compactness
-        lambda_oc: 0.1                    # training loss weight
-        lambda_oc_score: 0.1              # scoring weight
+        one_class: false                  # Deep SVDD-style latent compactness (disabled)
+        lambda_oc: 0.0                    # training loss weight
+        lambda_oc_score: 0.0              # scoring weight
         oc_warmup_epochs: 3               # train pure ELBO first; then init c
 
         consistency: true                 # consistency regularization on q_mu
