@@ -279,9 +279,9 @@ def _run_hpo(
         hpo_trainer = pl.Trainer(
             max_epochs=hpo_epochs,
             callbacks=[
-                EarlyStopping(monitor="val_worst_class_pr_auc", patience=hpo_patience, mode="max", verbose=False),
+                EarlyStopping(monitor="val_macro_per_class_pr_auc", patience=hpo_patience, mode="max", verbose=False),
                 _OptunaPruningCallback(
-                    trial, monitor="val_worst_class_pr_auc", warmup_epochs=pruning_warmup_epochs
+                    trial, monitor="val_macro_per_class_pr_auc", warmup_epochs=pruning_warmup_epochs
                 ),
             ],
             enable_progress_bar=False,
@@ -312,7 +312,7 @@ def _run_hpo(
             reason = hpo_lit.stability_reason or "score/center instability"
             logger.warning("Pruning unstable HPO trial: {}", reason)
             raise optuna.exceptions.TrialPruned()
-        return float(hpo_lit.best_val_worst_pr_auc)
+        return float(hpo_lit.best_val_pr_auc)
 
     sampler = _build_sampler(str(hpo_cfg.get("sampler", "tpe")), seed=seed)
     pruner = _build_pruner(str(hpo_cfg.get("pruner", "asha")))
@@ -1681,11 +1681,11 @@ def run_dlssm(config: dict | None = None) -> None:
 
     # Train
     callbacks = [
-        EarlyStopping(monitor="val_worst_class_pr_auc", patience=patience, mode="max", verbose=False),
+        EarlyStopping(monitor="val_macro_per_class_pr_auc", patience=patience, mode="max", verbose=False),
         ModelCheckpoint(
             dirpath=str(ckpt_dir),
             filename="best",
-            monitor="val_worst_class_pr_auc",
+            monitor="val_macro_per_class_pr_auc",
             mode="max",
             save_top_k=1,
             save_last=True,

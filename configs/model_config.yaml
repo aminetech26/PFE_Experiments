@@ -175,7 +175,7 @@ anomaly_detection:
           slow_hidden_dim: 64
           n_attention_heads: 4
           expected_power_enabled: true
-          expected_power_features: [pdc1, pdc2]
+          expected_power_features: [pdc_temp_corrected_norm_irr]
           lambda_expected: 0.5         # training weight for expected-power head MSE
           lambda_pr_score: 0.1         # scoring weight for performance-ratio gap
 
