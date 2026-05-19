@@ -318,7 +318,34 @@ def _run_hpo(
     pruner = _build_pruner(str(hpo_cfg.get("pruner", "asha")))
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study.optimize(objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
+
+    # Progress tracker for remaining-trials indicator
+    _hpo_start = time.time()
+    _hpo_done = 0
+
+    def _objective_with_progress(trial: optuna.Trial) -> float:
+        nonlocal _hpo_done
+        try:
+            return objective(trial)
+        finally:
+            _hpo_done += 1
+            elapsed = time.time() - _hpo_start
+            rate = _hpo_done / elapsed if elapsed > 0 else 0
+            if n_trials:
+                remaining = n_trials - _hpo_done
+                eta_s = remaining / rate if rate > 0 else 0
+                logger.info(
+                    "HPO trial {}/{} ({:.1f}s/trial) | ETA {:.0f}s ({:.1f}m)",
+                    _hpo_done, n_trials, 1.0 / rate if rate > 0 else 0,
+                    eta_s, eta_s / 60,
+                )
+            else:
+                logger.info(
+                    "HPO trial {} ({:.1f}s/trial) | no limit",
+                    _hpo_done, 1.0 / rate if rate > 0 else 0,
+                )
+
+    study.optimize(_objective_with_progress, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
 
     n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     if n_completed == 0:
