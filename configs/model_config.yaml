@@ -145,9 +145,6 @@ anomaly_detection:
         kl_warmup_epochs: 5
         free_bits: 0.05
 
-        # Numerical stability guards for scoring
-        # NB: all values must be valid YAML float literals — PyYAML safe_load
-        # does NOT parse "1.0e5" or "1e5" as numbers (they become strings).
         # Deep SVDD
         lambda_oc: 0.1
         oc_warmup_epochs: 5

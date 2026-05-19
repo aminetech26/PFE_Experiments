@@ -409,6 +409,11 @@ class DLSSMLightningModule(pl.LightningModule):
         self.oc_center_initialized.fill_(bool(value))
         self.c_initialized = bool(value)
 
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        # Sync Python mirror after PyTorch Lightning restores buffers via load_state_dict.
+        if "oc_center_initialized" in checkpoint.get("state_dict", {}):
+            self.c_initialized = bool(checkpoint["state_dict"]["oc_center_initialized"].item())
+
     def _unpack_batch(self, batch: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list | None]:
         x = batch[0]
         labels = batch[1]
