@@ -156,8 +156,8 @@ anomaly_detection:
         lambda_oc_score: 0.0              # scoring weight
         oc_warmup_epochs: 3               # train pure ELBO first; then init c
 
-        consistency: true                 # consistency regularization on q_mu
-        lambda_cons: 0.1
+        consistency: false                # disabled — half-implemented (no EMA teacher, no predictor head); KL + free-bits already regularize the latent
+        lambda_cons: 0.0
         aug_noise_std: 0.05
         aug_feature_dropout: 0.1
 
@@ -224,14 +224,9 @@ anomaly_detection:
             dropout:              {type: float, low: 0.0,    high: 0.3}
             free_bits:            {type: categorical, choices: [0.0, 0.05]}
             lambda_phys:          {type: float, low: 0.02, high: 0.3, log: true}
-            lambda_oc:            {type: float, low: 0.02, high: 0.3, log: true}
-            lambda_cons:          {type: float, low: 0.02, high: 0.3, log: true}
             lambda_kl_score:      {type: float, low: 0.05, high: 0.3, log: true}
             lambda_pred_score:    {type: float, low: 0.0,  high: 0.3}
-            lambda_oc_score:      {type: float, low: 0.0,  high: 0.05}
             lambda_phys_score:    {type: float, low: 0.0,  high: 0.03}
-            aug_noise_std:        {type: float, low: 0.02, high: 0.08}
-            aug_feature_dropout:  {type: float, low: 0.0,  high: 0.2}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
             # DLSSM-FDD HPO extensions (lambda_expected/pr_score tuned; slow/attn dims fixed)
             lambda_expected:      {type: float, low: 0.1, high: 1.0, log: true}
