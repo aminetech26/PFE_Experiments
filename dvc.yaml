@@ -220,3 +220,40 @@ stages:
     outs:
       - experiments/checkpoints/gtbad_v2/gtbad_v2_original.pt
       - experiments/checkpoints/gtbad_v2/gtbad_v2_plus_physics.pt
+
+
+  train_gtbad_v2_original:
+      cmd: uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2 --feature-mode original
+      deps:
+        - src/modeling/anomaly_detection/dl/train_gtbad_v2.py
+        - src/modeling/anomaly_detection/dl/gtbad_model.py
+        - src/modeling/anomaly_detection/dl/gvsao_v2.py
+        - src/data/features.py
+        - configs/data_config.yaml
+        - configs/model_config.yaml
+        - data/interim/ingestion/costa/costa_merged.parquet
+      metrics:
+        - experiments/metrics/gtbad_v2_results_original.json:
+            cache: false
+        - experiments/metrics/gtbad_v2_results_plus_physics.json:
+            cache: false
+      outs:
+        - experiments/checkpoints/gtbad_v2/gtbad_v2_original.pt
+
+  train_gtbad_light:
+      cmd: uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2 --mini --feature-mode original --no-mlflow
+      deps:
+        - src/modeling/anomaly_detection/dl/train_gtbad_v2.py
+        - src/modeling/anomaly_detection/dl/gtbad_model.py
+        - src/modeling/anomaly_detection/dl/gvsao_v2.py
+        - src/data/features.py
+        - configs/data_config.yaml
+        - configs/model_config.yaml
+        - data/interim/ingestion/costa/costa_merged.parquet
+      metrics:
+        - experiments/metrics/gtbad_v2_results_original.json:
+            cache: false
+        - experiments/metrics/gtbad_v2_results_plus_physics.json:
+            cache: false
+      outs:
+        - experiments/checkpoints/gtbad_v2/gtbad_v2_original.pt
