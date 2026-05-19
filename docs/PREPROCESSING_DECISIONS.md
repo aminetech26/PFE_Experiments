@@ -100,13 +100,13 @@ Current Costa implementation note:
 - These extremes are **fault signatures**, not sensor errors
 - Outliers in normal data are likely sensor errors or transient anomalies
 
-### 2.2 Decision: Scope-Limited Outlier Clipping
+### 2.2 Decision: Scope-Limited Outlier Dropping
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
 | **Method** | IQR × 3 (far outliers) | Conservative; only catches truly extreme values |
 | **Scope** | Normal data only | Fault data outliers are expected signatures |
-| **Action** | Clip/winsorize to bounds | Preserves row; caps extreme sensor errors |
+| **Action** | Drop outlier rows | Removes extreme sensor-error rows while preserving fault signatures |
 
 **Why IQR × 3 (not 1.5)?**
 
@@ -126,34 +126,33 @@ Current Costa implementation note:
 ### 2.3 Implementation Notes
 
 ```python
-def clip_outliers_iqr(df, feature_cols, label_col='Fault', multiplier=3.0):
+def drop_outliers_iqr(df, feature_cols, label_col="Fault", multiplier=3.0):
     """
-    Clip outliers using IQR method on normal data only.
-    
+    Drop outlier rows using IQR method on normal data only.
+
     Steps:
     1. Compute Q1, Q3, IQR on normal data (label == 0)
     2. Set bounds: lower = Q1 - 3*IQR, upper = Q3 + 3*IQR
-    3. Clip normal data to bounds
-    4. Leave fault data untouched
+    3. Flag normal rows that are outside bounds in any feature
+    4. Drop flagged rows; leave fault rows untouched
     """
     normal_mask = df[label_col] == 0
-    
+    rows_to_drop = pd.Series(False, index=df.index)
+
     for col in feature_cols:
-        Q1, Q3 = df.loc[normal_mask, col].quantile([0.25, 0.75])
-        IQR = Q3 - Q1
-        lower, upper = Q1 - multiplier * IQR, Q3 + multiplier * IQR
-        
-        # Clip only normal data
-        df.loc[normal_mask, col] = df.loc[normal_mask, col].clip(lower, upper)
-    
-    return df
+        q1, q3 = df.loc[normal_mask, col].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lower, upper = q1 - multiplier * iqr, q3 + multiplier * iqr
+        rows_to_drop |= normal_mask & ((df[col] < lower) | (df[col] > upper))
+
+    return df.loc[~rows_to_drop].copy()
 ```
 
 Costa invariant note:
 
-- Because `pdc1`, `pdc2`, and `pdc` are deterministic functions of primary channels at ingestion, they are not winsorized independently in preprocessing.
-- Independent clipping of derived channels can break physical identities and create redundant distortion.
-- The pipeline therefore clips primary channels only and then recomputes power channels to preserve `pdc = pdc1 + pdc2` exactly in preprocessed artifacts.
+- Because `pdc1`, `pdc2`, and `pdc` are deterministic functions of primary channels at ingestion, they are not evaluated independently for outlier dropping.
+- Independent treatment of derived channels can break physical identities and create redundant distortion.
+- The pipeline therefore evaluates primary channels and then recomputes power channels to preserve `pdc = pdc1 + pdc2` exactly in preprocessed artifacts.
 
 ---
 
@@ -297,13 +296,12 @@ data/processed/preprocessed/<dataset>/
       "missing_long_gap": 2060,
       "total": 2210
     },
-    "outliers_clipped": {
+    "outliers_dropped": {
       "Pg": 1234,
       "Ig": 567,
       ...
     },
-    "features_created": ["pdc_norm", "pdc1_norm", "pdc2_norm", "idc1_norm", "idc2_norm", "pvt_irr_residual"],
-  "irr_residual_params": {"pvt": [0.032, 15.4]}
+    "rows_dropped_total": 1801
 }
 ```
 
@@ -321,20 +319,10 @@ preprocessing:
     # > 5 min → drop
   
   outliers:
-    method: iqr
+    method: iqr_drop
     iqr_multiplier: 3.0              # 3× IQR (far outliers only)
-    action: clip                      # winsorize to bounds
+    action: drop_rows
     scope: normal_only               # don't touch fault data
-  
-  physics_normalization:
-    irradiance_normalize:
-      features: [pdc, pdc1, pdc2, idc1, idc2]   # Costa; La Réunion uses [Pg, Ig, Eg, Fg, Ia]
-      denominator: irr                            # Costa; La Réunion uses GTI
-      suffix: _norm
-    irr_residualize:
-      features: [pvt]                             # Costa; La Réunion uses [TA, TPV]
-      irr_col: irr                                # Costa; La Réunion uses GTI
-      suffix: _irr_residual
 ```
 
 ---

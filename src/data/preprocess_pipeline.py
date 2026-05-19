@@ -94,18 +94,13 @@ def resolve_preprocess_config(config: dict, dataset: str) -> dict:
     return deep_merge(base_cfg, dataset_override)
 
 
-# Note: physics_normalization / stationarity handling has been moved out of
-# preprocessing and into feature-engineering. We therefore don't perform any
-# schema promotion here; resolve_preprocess_config already returns the
-# effective preprocessing config for a dataset.
+# Preprocessing config is resolved by merge order only (global -> dataset -> path override).
 
 
 def resolve_effective_preprocess_config(config: dict, dataset: str, split_path: str) -> dict:
     """Resolve dataset and split-path aware preprocessing config.
 
-    This intentionally does not remap legacy `stationarity` keys into
-    `physics_normalization` — physics normalization is now considered
-    part of feature engineering and should be handled elsewhere.
+    This intentionally avoids any legacy key remapping.
     """
     effective = resolve_preprocess_config(config, dataset)
     dataset_cfg = config.get("paths", {}).get("datasets", {}).get(dataset, {})
@@ -391,15 +386,7 @@ def create_manifest(
     manifest = {
         "version": 1,
         "created_at": datetime.now(UTC).isoformat(),
-        # Only include explicit preprocessing config (exclude physics_normalization);
-        # physics_normalization is a feature-engineering concern now.
-        "config_used": (
-            lambda c: {
-                k: v
-                for k, v in (c.get("preprocessing") or {}).items()
-                if k != "physics_normalization"
-            }
-        )(config),
+        "config_used": (config.get("preprocessing") or {}),
         "split_path": config.get("split_path", "path_a"),
         "splits": split_stats,
         "features_created": [],

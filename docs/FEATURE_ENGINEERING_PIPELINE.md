@@ -72,7 +72,7 @@ Current layered resolution order:
 - profile overrides (`--profile`, final precedence)
 
 Costa preprocessing invariant relevant to FE:
-- Preprocessing now winsorizes primary measured channels only (`vdc1`, `vdc2`, `idc1`, `idc2`, `irr`, `pvt`).
+- Preprocessing now drops normal-class outlier rows using IQR bounds fitted on primary measured channels (`vdc1`, `vdc2`, `idc1`, `idc2`, `irr`, `pvt`).
 - `pdc1`, `pdc2`, `pdc` are restored from cleaned primaries before FE (`pdc1=vdc1*idc1`, `pdc2=vdc2*idc2`, `pdc=pdc1+pdc2`), so deterministic alias checks in hygiene are physically meaningful again.
 
 Path-level admissibility guards currently enforced for Costa-oriented workflow:

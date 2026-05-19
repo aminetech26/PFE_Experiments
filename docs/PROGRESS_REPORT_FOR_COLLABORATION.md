@@ -74,7 +74,7 @@ The preprocessing policy is explicit and justified:
 - Missing values:
   - currently disabled for Costa because the retained post-ingestion subset does not justify imputation overhead.
 - Outliers:
-  - conservative IQR (3x) winsorize strategy on normal data only,
+  - conservative IQR (3x) row-drop strategy on normal data only,
   - fault outliers preserved as potential signatures.
 - Shift-aware transforms:
   - no longer part of preprocessing for Costa,

@@ -3,10 +3,8 @@ Preprocessing module for PV Fault Detection.
 
 This module implements data preprocessing steps:
 1. Missing value handling (tiered strategy)
-2. Outlier treatment (IQR-based clipping)
-3. Physics normalization:
-   - Irradiance normalization: power/current ÷ irr ≈ efficiency/yield coefficients
-   - Irradiance-conditioned residualization: temp − (β·irr + α), OLS on normal train
+2. Outlier treatment (IQR-based row dropping)
+3. Optional feature transforms (handled outside core preprocessing pipeline)
 """
 
 from __future__ import annotations
@@ -15,7 +13,6 @@ import logging
 from dataclasses import dataclass
 from typing import Literal
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -44,19 +41,11 @@ class MissingValueStats:
 
 @dataclass
 class OutlierStats:
-    """Statistics from outlier clipping."""
+    """Statistics from outlier row dropping."""
 
-    clipped_counts: dict[str, int]  # feature -> count of clipped values
+    dropped_counts: dict[str, int]  # feature -> count of outlier rows flagged by feature
     bounds: dict[str, tuple[float, float]]  # feature -> (lower, upper)
-
-
-@dataclass
-class PhysicsNormStats:
-    """Statistics from physics normalization transforms."""
-
-    features_normalized: list[str]
-    features_residualized: list[str]
-    irr_residual_params: dict[str, tuple[float, float]]  # feat -> (beta, alpha)
+    rows_dropped_total: int
 
 
 # =============================================================================
@@ -245,44 +234,40 @@ def compute_iqr_bounds(
     return lower, upper
 
 
-def winsorize_outliers(
+def drop_outliers_iqr(
     df: pd.DataFrame,
     feature_cols: list[str],
     label_col: str = "Fault",
     iqr_multiplier: float = 3.0,
-    lower_percentile: float = 0.05,
-    upper_percentile: float = 0.95,
     scope: Literal["normal_only", "all"] = "normal_only",
     reference_bounds: dict[str, tuple[float, float]] | None = None,
 ) -> tuple[pd.DataFrame, OutlierStats]:
     """
-    Two-step outlier handling: IQR detection + percentile winsorizing.
+    IQR-based outlier handling by dropping outlier rows.
 
-    Step 1: Detect outliers using IQR bounds (Q1 - k×IQR, Q3 + k×IQR)
-    Step 2: Replace detected outliers with percentile values (5th, 95th)
-
-    This approach:
-    - Uses conservative IQR bounds to flag extreme values
-    - Replaces them with less extreme percentile values
-    - Preserves more data distribution than hard clipping
+    For each feature, outliers are detected with IQR bounds (Q1 - k×IQR, Q3 + k×IQR).
+    Any row flagged as an outlier in at least one feature is dropped.
 
     Args:
         df: Input DataFrame (will be copied)
         feature_cols: Columns to process
         label_col: Label column (0 = normal)
         iqr_multiplier: IQR multiplier for detection (3.0 = far outliers)
-        lower_percentile: Lower replacement value (e.g., 0.05 = 5th percentile)
-        upper_percentile: Upper replacement value (e.g., 0.95 = 95th percentile)
-        scope: "normal_only" processes only normal data, "all" processes everything
+        scope: only "normal_only" is supported for dropping
+        reference_bounds: Train-fit IQR bounds for val/test
 
     Returns:
         Tuple of (processed DataFrame, statistics)
     """
     df = df.copy()
 
+    if scope != "normal_only":
+        raise ValueError("IQR outlier dropping supports only scope='normal_only'")
+
     normal_mask = df[label_col] == 0
-    clipped_counts: dict[str, int] = {}
+    dropped_counts: dict[str, int] = {}
     bounds: dict[str, tuple[float, float]] = {}
+    rows_to_drop = pd.Series(False, index=df.index)
 
     for col in feature_cols:
         # Compute on normal data only
@@ -290,199 +275,44 @@ def winsorize_outliers(
         if col_data.empty and not (reference_bounds and col in reference_bounds):
             continue
 
-        # Step 1: Compute IQR bounds for outlier DETECTION
-        if col_data.empty:
-            iqr_lower, iqr_upper = -np.inf, np.inf
+        # Fit IQR bounds (train) or reuse train-fit bounds (val/test)
+        if reference_bounds and col in reference_bounds:
+            iqr_lower, iqr_upper = reference_bounds[col]
+        elif col_data.empty:
+            iqr_lower, iqr_upper = -float("inf"), float("inf")
         else:
             iqr_lower, iqr_upper = compute_iqr_bounds(col_data, iqr_multiplier)
 
-        # Step 2: Compute percentile values for REPLACEMENT or reuse train-fit values
-        if reference_bounds and col in reference_bounds:
-            percentile_lower, percentile_upper = reference_bounds[col]
-        else:
-            percentile_lower = col_data.quantile(lower_percentile)
-            percentile_upper = col_data.quantile(upper_percentile)
+        bounds[col] = (float(iqr_lower), float(iqr_upper))
 
-        bounds[col] = (float(percentile_lower), float(percentile_upper))
-
-        # Apply based on scope
-        if scope == "normal_only":
-            process_mask = normal_mask
-        else:
-            process_mask = pd.Series(True, index=df.index)
+        process_mask = normal_mask
 
         # Identify outliers using IQR bounds
         outlier_mask = process_mask & ((df[col] < iqr_lower) | (df[col] > iqr_upper))
-        clipped_counts[col] = outlier_mask.sum()
+        dropped_counts[col] = int(outlier_mask.sum())
+        rows_to_drop |= outlier_mask
 
-        # Replace outliers with percentile values
-        df.loc[process_mask & (df[col] < iqr_lower), col] = percentile_lower
-        df.loc[process_mask & (df[col] > iqr_upper), col] = percentile_upper
-
-        if clipped_counts[col] > 0:
+        if dropped_counts[col] > 0:
             logger.debug(
-                f"  {col}: detected {clipped_counts[col]} outliers (IQR bounds [{iqr_lower:.2f}, {iqr_upper:.2f}]), "
-                f"replaced with percentiles [{percentile_lower:.2f}, {percentile_upper:.2f}]"
+                f"  {col}: detected {dropped_counts[col]} normal-row outliers "
+                f"(IQR bounds [{iqr_lower:.2f}, {iqr_upper:.2f}])"
             )
 
-    total_clipped = sum(clipped_counts.values())
+    rows_dropped_total = int(rows_to_drop.sum())
+    if rows_dropped_total > 0:
+        df = df.loc[~rows_to_drop].copy()
+
     logger.info(
-        f"Outlier winsorizing: {total_clipped} values winsorized across {len(feature_cols)} features"
+        f"Outlier dropping (normal-only): dropped {rows_dropped_total} rows "
+        f"across {len(feature_cols)} features"
     )
 
-    stats = OutlierStats(clipped_counts=clipped_counts, bounds=bounds)
+    stats = OutlierStats(
+        dropped_counts=dropped_counts,
+        bounds=bounds,
+        rows_dropped_total=rows_dropped_total,
+    )
     return df, stats
-
-
-# =============================================================================
-# PHYSICS NORMALIZATION
-# =============================================================================
-
-
-def apply_irradiance_normalization(
-    df: pd.DataFrame,
-    features: list[str],
-    denominator: str = "GTI",
-    suffix: str = "_norm",
-    min_denominator: float = 5.0,
-) -> pd.DataFrame:
-    """
-    Normalize power/current features by irradiance: feature ÷ irr ≈ efficiency/yield.
-
-    Removes the irradiance-driven diurnal swing from power and current channels,
-    making the normal manifold approximately time-invariant for anomaly detectors.
-    Floors the denominator at min_denominator to avoid division by near-zero at dawn/dusk.
-    """
-    df = df.copy()
-
-    low_irr_count = (df[denominator] < min_denominator).sum()
-    if low_irr_count > 0:
-        logger.info(
-            f"Found {low_irr_count} rows with {denominator} < {min_denominator} W/m²; "
-            f"flooring denominator for safe division."
-        )
-
-    safe_irr = df[denominator].clip(lower=min_denominator)
-    for feat in features:
-        df[f"{feat}{suffix}"] = df[feat] / safe_irr
-        logger.debug(f"  {feat}{suffix} = {feat} / max({denominator}, {min_denominator})")
-
-    logger.info(f"Irradiance normalization: created {len(features)} features ({suffix})")
-    return df
-
-
-def apply_irr_conditioned_residualization(
-    df: pd.DataFrame,
-    features: list[str],
-    irr_col: str,
-    label_col: str = "Fault",
-    suffix: str = "_irr_residual",
-    reference_params: dict[str, tuple[float, float]] | None = None,
-) -> tuple[pd.DataFrame, dict[str, tuple[float, float]]]:
-    """
-    Irradiance-conditioned residualization for temperature features.
-
-    Fits feature = β·irr + α via OLS on normal-class rows, then subtracts the
-    irradiance-predicted baseline: residual = feature − (β·irr + α).
-
-    The residual is stationary where raw temperature was not: it captures thermal
-    deviation from what the irradiance level would predict, which is near-zero
-    for healthy operation and anomalous during fault-induced thermal events.
-
-    Args:
-        df: Input DataFrame (will be copied)
-        features: Temperature columns to residualize (e.g., ["pvt"])
-        irr_col: Irradiance column used as the conditioning variable
-        label_col: Label column; OLS is fit on label==0 rows only
-        suffix: Suffix for new residual columns
-        reference_params: Pre-fitted (beta, alpha) per feature for val/test splits.
-                          If None, fits from df (train mode).
-
-    Returns:
-        (DataFrame with residual columns, fitted_params dict feat->(beta, alpha))
-    """
-    df = df.copy()
-    fitted_params: dict[str, tuple[float, float]] = {}
-
-    normal_mask = df[label_col] == 0
-    irr_all = df[irr_col].values
-
-    for feat in features:
-        if reference_params and feat in reference_params:
-            beta, alpha = reference_params[feat]
-        else:
-            irr_train = irr_all[normal_mask]
-            y_train = df.loc[normal_mask, feat].values
-
-            irr_mean = irr_train.mean()
-            y_mean = y_train.mean()
-            denom = float(np.dot(irr_train - irr_mean, irr_train - irr_mean))
-            if denom == 0:
-                beta, alpha = 0.0, float(y_mean)
-            else:
-                beta = float(np.dot(irr_train - irr_mean, y_train - y_mean) / denom)
-                alpha = float(y_mean - beta * irr_mean)
-
-        fitted_params[feat] = (beta, alpha)
-        df[f"{feat}{suffix}"] = df[feat] - (beta * irr_all + alpha)
-        logger.debug(f"  {feat}{suffix} = {feat} - ({beta:.4f}·{irr_col} + {alpha:.4f})")
-
-    logger.info(
-        f"Irradiance-conditioned residualization: created {len(features)} features ({suffix})"
-    )
-    return df, fitted_params
-
-
-def apply_physics_normalization(
-    df: pd.DataFrame,
-    irradiance_config: dict | None = None,
-    irr_residualize_config: dict | None = None,
-    label_col: str = "Fault",
-    reference_irr_residual_params: dict[str, tuple[float, float]] | None = None,
-) -> tuple[pd.DataFrame, PhysicsNormStats]:
-    """
-    Apply all physics normalization transforms.
-
-    Args:
-        df: Input DataFrame
-        irradiance_config: Dict with keys: features, denominator, suffix
-        irr_residualize_config: Dict with keys: features, irr_col, suffix
-        label_col: Label column (used for OLS fit scope)
-        reference_irr_residual_params: Pre-fitted OLS params for val/test splits
-
-    Returns:
-        (processed DataFrame, PhysicsNormStats)
-    """
-    features_normalized: list[str] = []
-    features_residualized: list[str] = []
-    irr_residual_params: dict[str, tuple[float, float]] = {}
-
-    if irradiance_config:
-        features = irradiance_config.get("features", [])
-        denominator = irradiance_config.get("denominator", "GTI")
-        suffix = irradiance_config.get("suffix", "_norm")
-        df = apply_irradiance_normalization(df, features, denominator, suffix)
-        features_normalized = [f"{f}{suffix}" for f in features]
-
-    if irr_residualize_config:
-        features = irr_residualize_config.get("features", [])
-        irr_col = irr_residualize_config.get("irr_col", "irr")
-        suffix = irr_residualize_config.get("suffix", "_irr_residual")
-        df, irr_residual_params = apply_irr_conditioned_residualization(
-            df,
-            features=features,
-            irr_col=irr_col,
-            label_col=label_col,
-            suffix=suffix,
-            reference_params=reference_irr_residual_params,
-        )
-        features_residualized = [f"{f}{suffix}" for f in features]
-
-    return df, PhysicsNormStats(
-        features_normalized=features_normalized,
-        features_residualized=features_residualized,
-        irr_residual_params=irr_residual_params,
-    )
 
 
 # =============================================================================
@@ -498,7 +328,6 @@ def preprocess(
     segment_col: str = "segment_id",
     label_col: str = "Fault",
     outlier_reference_bounds: dict[str, tuple[float, float]] | None = None,
-    irr_residual_reference_params: dict[str, tuple[float, float]] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Run full preprocessing pipeline.
@@ -511,11 +340,10 @@ def preprocess(
         segment_col: Segment ID column name
         label_col: Label column name
         outlier_reference_bounds: Train-fit outlier bounds for val/test
-        irr_residual_reference_params: Train-fit OLS params for val/test (feat->(beta,alpha))
 
     Returns:
         Tuple of (preprocessed DataFrame, statistics dict)
-        Statistics include irr_residual_params for the caller to store and forward to val/test.
+        Statistics include outlier bounds for the caller to store and forward to val/test.
     """
     logger.info(f"Starting preprocessing pipeline on {len(df)} rows...")
 
@@ -544,25 +372,19 @@ def preprocess(
 
     # 2. Outlier treatment
     outlier_config = config.get("outliers", {})
-    df, outlier_stats = winsorize_outliers(
+    method = outlier_config.get("method", "iqr_drop")
+    if method != "iqr_drop":
+        raise ValueError(
+            f"Unsupported outlier method '{method}'. Supported method: 'iqr_drop'."
+        )
+
+    df, outlier_stats = drop_outliers_iqr(
         df,
         feature_cols=feature_cols,
         label_col=label_col,
         iqr_multiplier=outlier_config.get("iqr_multiplier", 3.0),
-        lower_percentile=outlier_config.get("lower_percentile", 0.05),
-        upper_percentile=outlier_config.get("upper_percentile", 0.95),
         scope=outlier_config.get("scope", "normal_only"),
         reference_bounds=outlier_reference_bounds,
-    )
-
-    # 3. Physics normalization
-    stat_config = config.get("physics_normalization") or {}
-    df, stat_stats = apply_physics_normalization(
-        df,
-        irradiance_config=stat_config.get("irradiance_normalize"),
-        irr_residualize_config=stat_config.get("irr_residualize"),
-        label_col=label_col,
-        reference_irr_residual_params=irr_residual_reference_params,
     )
 
     stats = {
@@ -575,13 +397,9 @@ def preprocess(
             "episodes_interpolated": mv_stats.episodes_interpolated,
         },
         "outliers": {
-            "clipped_counts": outlier_stats.clipped_counts,
+            "dropped_counts": outlier_stats.dropped_counts,
+            "rows_dropped_total": outlier_stats.rows_dropped_total,
             "bounds": {k: list(v) for k, v in outlier_stats.bounds.items()},
-        },
-        "physics_normalization": {
-            "features_normalized": stat_stats.features_normalized,
-            "features_residualized": stat_stats.features_residualized,
-            "irr_residual_params": {k: list(v) for k, v in stat_stats.irr_residual_params.items()},
         },
     }
 

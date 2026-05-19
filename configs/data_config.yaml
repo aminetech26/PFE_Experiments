@@ -59,20 +59,7 @@ paths:
         # Gap threshold: >5 min between consecutive rows → new segment
         segmentation_gap_seconds: 300
 
-      preprocessing:
-        stationarity:
-          # Power and current / GTI ≈ efficiency and yield coefficients (diurnal-invariant)
-          irradiance_normalize:
-            features:    [Pg, Ig, Eg, Fg, Ia]
-            denominator: GTI
-            suffix:      _norm
-          # Temperature residualization: TA/TPV - (β·GTI + α), OLS on normal train.
-          # Removes irradiance-driven thermal loading; residual captures anomalous
-          # deviations from the physics-predicted temperature baseline.
-          irr_residualize:
-            features: [TA, TPV]
-            irr_col:  GTI
-            suffix:   _irr_residual
+      preprocessing: {}
 
       feature_engineering:
         sensor_columns: [Pg, Vg, Ig, Eg, Fg, Ia, GTI, TA, TPV]
@@ -184,12 +171,7 @@ paths:
         # and fault_class==0 for normal samples (avoids pre-fault contamination).
         phase_filter_recommended: true
 
-      preprocessing:
-        stationarity:
-          # No irradiance sensor in Mendeley — skip irradiance normalization
-          irradiance_normalize: null
-          # Simulated data: no thermal drift across 14.4 s experiments
-          polynomial_detrend: null
+      preprocessing: {}
 
       feature_engineering:
         # DC-side PV: Ipv, Vpv, Vdc. AC-side: ia/ib/ic, va/vb/vc.
@@ -235,18 +217,13 @@ preprocessing:
 
   # --- Outlier Treatment ---
   # IQR 3× is conservative — only catches far outliers (sensor errors).
-  # Fault data outliers are expected fault signatures — never winsorize them.
+  # Fault data outliers are expected fault signatures — never drop them.
   outliers:
-    method:           iqr_winsorize   # IQR detection + percentile clamp
+    method:           iqr_drop        # IQR detection + row drop
     iqr_multiplier:   3.0
-    lower_percentile: 0.05
-    upper_percentile: 0.95
     scope:            normal_only
 
-  # --- Physics Normalization (global fallback — override per dataset) ---
-  stationarity:
-    irradiance_normalize: null
-    irr_residualize:      null
+  # No physics-normalization stage in preprocessing.
 
 
 # =============================================================================
