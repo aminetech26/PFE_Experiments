@@ -21,7 +21,7 @@ anomaly_detection:
       pruner: none
       study_name_prefix: anomaly_ml
       storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
-      n_trials_phase1: 50
+      n_trials_phase1: 35
       timeout_seconds: null
     models:
       isolation_forest:
@@ -139,35 +139,11 @@ anomaly_detection:
         decoder_dim: 96
         n_gru_layers: 1
         dropout: 0.1
+        se_reduction_ratio: 4
 
         beta_kl: 0.1
         kl_warmup_epochs: 5
         free_bits: 0.05
-
-        physics_enabled: false
-        lambda_phys: 0.0
-        physics_components:
-          string_power: false
-          imbalance: false
-          temperature_correction: false
-
-        # Pure DLSSM ablation: no conditioning / CVAE inputs.
-        cvae: false
-        conditioning:
-          features: []
-          recon_skip_features: []
-
-        # Pure DLSSM ablation: disable DLSSM-FDD stacked components.
-        fdd:
-          slow_context_enabled: false
-          slow_context_seconds: 3600    # 1h of preceding context at slow_stride resolution
-          slow_stride: 60              # 1 sample/min from 1Hz data
-          slow_hidden_dim: 0
-          se_reduction_ratio: 4
-          expected_power_enabled: false
-          expected_power_features: []
-          lambda_expected: 0.0
-          lambda_pr_score: 0.0
 
         # Numerical stability guards for scoring
         # NB: all values must be valid YAML float literals — PyYAML safe_load
@@ -176,15 +152,9 @@ anomaly_detection:
           score_instability_p95: 1000000.0
           score_instability_max: 10000000.0
           non_finite_warn_limit_per_epoch: 5
-          max_abs_phys_score_term: 100000.0
-          max_abs_pr_score_term: 100000.0
           max_abs_base_score_term: 100000.0
-          max_abs_pred_score_term: 100000.0
 
-        alpha_pred: 0.0            # strict pure DLSSM: reconstruction + KL only
         lambda_kl_score: 0.1
-        lambda_phys_score: 0.0
-        lambda_pred_score: 0.0
         score_reduction: mean
 
         batch_size: 1024

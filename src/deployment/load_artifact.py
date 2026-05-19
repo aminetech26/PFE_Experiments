@@ -22,6 +22,73 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_dlssm_ckpt(model_path: Path, root: Path, deployment_manifest: dict[str, Any]) -> Any:
+    """Load pure DLS-SSM checkpoint by reconstructing module explicitly.
+
+    Avoids reliance on Lightning's load_from_checkpoint constructor inference,
+    and remains stable if hyperparameters were not serialized in old checkpoints.
+    """
+    from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel  # noqa: PLC0415, I001
+    from src.modeling.anomaly_detection.dl.dlssm.trainer import DLSSMLightningModule  # noqa: PLC0415, I001
+
+    run_params_path = root / "run_params.json"
+    run_params: dict[str, Any] = load_json(run_params_path) if run_params_path.exists() else {}
+
+    feature_names = [str(x) for x in deployment_manifest.get("feature_names", [])]
+    n_features = len(feature_names)
+    if n_features <= 0:
+        raise ValueError("deployment_manifest.feature_names must be non-empty for DLSSM ckpt load")
+
+    scaler_path = root / str(deployment_manifest.get("scaler_artifact", ""))
+    if not scaler_path.exists():
+        raise FileNotFoundError(f"Missing scaler artifact required for DLSSM load: {scaler_path}")
+    scaler = joblib.load(scaler_path)
+    scaler_mean = torch.tensor(scaler.mean_, dtype=torch.float32)
+    scaler_scale = torch.tensor(scaler.scale_, dtype=torch.float32)
+    feature_idx = {name: i for i, name in enumerate(feature_names)}
+
+    model = DeepLatentStateSpaceModel(
+        n_features=n_features,
+        win_size=int(run_params.get("win_size", deployment_manifest.get("window_size", 30))),
+        hidden_dim=int(run_params.get("hidden_dim", 64)),
+        latent_dim=int(run_params.get("latent_dim", 16)),
+        encoder_dim=int(run_params.get("encoder_dim", 64)),
+        decoder_dim=int(run_params.get("decoder_dim", 64)),
+        n_gru_layers=int(run_params.get("n_gru_layers", 1)),
+        dropout=float(run_params.get("dropout", 0.1)),
+        se_reduction_ratio=int(run_params.get("se_reduction_ratio", 4)),
+    )
+    lit = DLSSMLightningModule(
+        model=model,
+        scaler_mean=scaler_mean,
+        scaler_scale=scaler_scale,
+        feature_idx=feature_idx,
+        learning_rate=float(run_params.get("learning_rate", 1e-3)),
+        weight_decay=float(run_params.get("weight_decay", 1e-5)),
+        gradient_clip_val=float(run_params.get("gradient_clip_val", 1.0)),
+        max_epochs=int(run_params.get("max_epochs_actual", 1)),
+        total_steps=1,
+        warmup_steps=0,
+        min_lr_ratio=0.01,
+        beta_kl=float(run_params.get("beta_kl", 0.1)),
+        kl_warmup_epochs=int(run_params.get("kl_warmup_epochs", 5)),
+        lambda_kl_score=float(run_params.get("lambda_kl_score", 0.1)),
+        score_reduction=str(run_params.get("score_reduction", "center")),
+        free_bits=float(run_params.get("free_bits", 0.0)),
+        latent_dim=int(run_params.get("latent_dim", 16)),
+        score_instability_p95=1e6,
+        score_instability_max=1e7,
+        non_finite_warn_limit_per_epoch=5,
+        max_abs_base_score_term=1e5,
+        hpo_mode=False,
+    )
+
+    ckpt = torch.load(model_path, map_location="cpu")
+    state_dict = ckpt.get("state_dict", ckpt)
+    lit.load_state_dict(state_dict, strict=True)
+    return lit
+
+
 def _load_ckpt(model_path: Path, model_name: str, root: Path, deployment_manifest: dict[str, Any]) -> Any:
     """Load a PyTorch Lightning checkpoint for the given DL model name."""
     if model_name == "maat":
@@ -90,8 +157,7 @@ def _load_ckpt(model_path: Path, model_name: str, root: Path, deployment_manifes
         if isinstance(ckpt, dict):
             lit.on_load_checkpoint(ckpt)
     elif model_name == "dlssm":
-        from src.modeling.anomaly_detection.dl.dlssm.trainer import DLSSMLightningModule  # noqa: PLC0415, I001
-        lit = DLSSMLightningModule.load_from_checkpoint(str(model_path), map_location="cpu")
+        lit = _load_dlssm_ckpt(model_path, root, deployment_manifest)
     else:
         raise ValueError(f"Unknown DL model '{model_name}' for .ckpt loading")
     lit.eval()

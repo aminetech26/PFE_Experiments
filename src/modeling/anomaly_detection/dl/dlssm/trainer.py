@@ -31,12 +31,8 @@ from torch.utils.data import DataLoader
 from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
-    combine_anomaly_score_components,
-    compute_anomaly_score_components,
-    expected_voltage_loss,
+    compute_anomaly_scores,
     kl_divergence,
-    physics_consistency_loss,
-    prediction_loss,
     reconstruction_loss,
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
@@ -75,7 +71,7 @@ def _default_comparison_records_path() -> Path:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="PI-DLS-SSM anomaly detection")
+    p = argparse.ArgumentParser(description="DLSSM anomaly detection")
     p.add_argument("--task", default="anomaly_semisup")
     p.add_argument("--dataset", default="costa")
     p.add_argument("--split-path", default="path_a")
@@ -87,8 +83,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--run-type", default="baseline", help="baseline | ablation | final | smoke")
     p.add_argument("--artifacts-dir", default=None)
     p.add_argument("--comparison-records-path", default=str(_default_comparison_records_path()))
-    p.add_argument("--physics", action="store_true", help="Enable physics consistency loss")
-    p.add_argument("--cvae", action="store_true", help="Conditional VAE: condition on operating-regime features (irr, pvt, ...)")
     p.add_argument("--hpo", action="store_true", help="Run Optuna HPO sweep then retrain best config")
     p.add_argument("--n-trials", type=int, default=None, help="Override number of HPO trials")
     p.add_argument("--best-params", default=None, help="JSON string of best params to apply directly (skips HPO search)")
@@ -157,28 +151,13 @@ def _run_hpo(
     scaler_scale_t: torch.Tensor,
     feature_idx: dict,
     n_features: int,
-    physics_enabled: bool,
     seed: int,
     n_trials_override: int | None,
-    cvae_enabled: bool = False,
-    condition_idx: list[int] | None = None,
-    condition_dim: int = 0,
-    recon_mask: torch.Tensor | None = None,
-    # DLSSM-FDD params
-    slow_context_enabled: bool = False,
-    slow_hidden_dim: int = 0,
     se_reduction_ratio: int = 4,
-    expected_power_enabled: bool = False,
-    expected_power_indices: list[int] | None = None,
-    lambda_expected: float = 0.5,
-    lambda_pr_score: float = 0.1,
     score_instability_p95: float = 1e6,
     score_instability_max: float = 1e7,
     non_finite_warn_limit_per_epoch: int = 5,
-    max_abs_phys_score_term: float | None = 1e5,
-    max_abs_pr_score_term: float | None = 1e5,
     max_abs_base_score_term: float | None = 1e5,
-    max_abs_pred_score_term: float | None = 1e5,
 ) -> dict:
     """Run Optuna TPE + ASHA sweep. Returns best params dict."""
     search_space = hpo_cfg.get("search_space", {})
@@ -208,12 +187,8 @@ def _run_hpo(
             decoder_dim=int(cfg.get("decoder_dim", 256)),
             n_gru_layers=int(cfg.get("n_gru_layers", 1)),
             dropout=float(suggested.get("dropout", cfg.get("dropout", 0.1))),
-            condition_dim=condition_dim,
             se_reduction_ratio=se_reduction_ratio,
-            slow_hidden_dim=slow_hidden_dim if slow_context_enabled else 0,
-            expected_power_indices=expected_power_indices if expected_power_enabled else None,
         )
-        physics_components = cfg.get("physics_components", {})
         hpo_lit = DLSSMLightningModule(
             model=hpo_model,
             scaler_mean=scaler_mean_t,
@@ -228,32 +203,14 @@ def _run_hpo(
             min_lr_ratio=float(training_cfg.get("min_lr_ratio", 0.01)),
             beta_kl=float(cfg.get("beta_kl", 0.1)),
             kl_warmup_epochs=int(cfg.get("kl_warmup_epochs", 5)),
-            lambda_phys=float(suggested.get("lambda_phys", cfg.get("lambda_phys", 0.1))),
-            enable_string_power=bool(physics_components.get("string_power", True)),
-            enable_imbalance=bool(physics_components.get("imbalance", True)),
-            physics_enabled=physics_enabled,
             lambda_kl_score=float(suggested.get("lambda_kl_score", cfg.get("lambda_kl_score", 0.1))),
-            lambda_phys_score=float(suggested.get("lambda_phys_score", cfg.get("lambda_phys_score", 0.0))),
-            alpha_pred=float(cfg.get("alpha_pred", 0.1)),
-            lambda_pred_score=float(suggested.get("lambda_pred_score", cfg.get("lambda_pred_score", 0.0))),
             score_reduction=str(cfg.get("score_reduction", "max")),
             free_bits=float(suggested.get("free_bits", cfg.get("free_bits", 0.05))),
             latent_dim=int(cfg.get("latent_dim", 32)),
-            cvae_enabled=cvae_enabled,
-            condition_idx=condition_idx or [],
-            recon_mask=recon_mask,
-            slow_context_enabled=slow_context_enabled,
-            expected_power_enabled=expected_power_enabled,
-            expected_power_indices=expected_power_indices,
-            lambda_expected=float(suggested.get("lambda_expected", cfg.get("lambda_expected", lambda_expected))),
-            lambda_pr_score=float(suggested.get("lambda_pr_score", cfg.get("lambda_pr_score", lambda_pr_score))),
             score_instability_p95=score_instability_p95,
             score_instability_max=score_instability_max,
             non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
-            max_abs_phys_score_term=max_abs_phys_score_term,
-            max_abs_pr_score_term=max_abs_pr_score_term,
             max_abs_base_score_term=max_abs_base_score_term,
-            max_abs_pred_score_term=max_abs_pred_score_term,
             hpo_mode=True,
         )
 
@@ -347,10 +304,10 @@ def _run_hpo(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DLSSMLightningModule(pl.LightningModule):
-    """PI-DLS-SSM training module.
+    """DLSSM training module.
 
-    Uses standard automatic optimization (single ELBO loss with optional
-    regularization terms) — no manual backward like MAAT.
+    Uses standard automatic optimization with a single ELBO-style objective
+    (reconstruction + KL warmup) — no manual backward like MAAT.
     """
 
     def __init__(
@@ -368,34 +325,15 @@ class DLSSMLightningModule(pl.LightningModule):
         min_lr_ratio: float = 0.01,
         beta_kl: float = 0.1,
         kl_warmup_epochs: int = 5,
-        lambda_phys: float = 0.05,
-        enable_string_power: bool = True,
-        enable_imbalance: bool = True,
-        physics_enabled: bool = True,
         lambda_kl_score: float = 0.1,
-        lambda_phys_score: float = 0.0,
-        alpha_pred: float = 0.1,
-        lambda_pred_score: float = 0.0,
         score_reduction: str = "center",
         free_bits: float = 0.0,
         latent_dim: int = 16,
-        cvae_enabled: bool = False,
-        condition_idx: list[int] | None = None,
-        recon_mask: torch.Tensor | None = None,
-        # DLSSM-FDD additions
-        slow_context_enabled: bool = False,
-        expected_power_enabled: bool = False,
-        expected_power_indices: list[int] | None = None,
-        lambda_expected: float = 0.5,
-        lambda_pr_score: float = 0.1,
         # Stability controls
         score_instability_p95: float = 1e6,
         score_instability_max: float = 1e7,
         non_finite_warn_limit_per_epoch: int = 5,
-        max_abs_phys_score_term: float | None = 1e5,
-        max_abs_pr_score_term: float | None = 1e5,
         max_abs_base_score_term: float | None = 1e5,
-        max_abs_pred_score_term: float | None = 1e5,
         hpo_mode: bool = False,
     ) -> None:
         super().__init__()
@@ -413,38 +351,13 @@ class DLSSMLightningModule(pl.LightningModule):
         self.min_lr_ratio = min_lr_ratio
         self.beta_kl = beta_kl
         self.kl_warmup_epochs = kl_warmup_epochs
-        self.lambda_phys = lambda_phys
-        self.enable_string_power = enable_string_power
-        self.enable_imbalance = enable_imbalance
-        self.physics_enabled = physics_enabled
         self.lambda_kl_score = lambda_kl_score
-        self.lambda_phys_score = lambda_phys_score
-        self.alpha_pred = alpha_pred
-        self.lambda_pred_score = lambda_pred_score
         self.score_reduction = score_reduction
         self.free_bits = free_bits
-
-        # CVAE conditioning
-        self.cvae_enabled = cvae_enabled
-        self.condition_idx = list(condition_idx) if condition_idx else []
-        if recon_mask is not None:
-            self.register_buffer("recon_mask", recon_mask.float())
-        else:
-            self.recon_mask = None
-
-        # DLSSM-FDD: slow context + expected-power head
-        self.slow_context_enabled = slow_context_enabled
-        self.expected_power_enabled = expected_power_enabled
-        self.expected_power_indices: list[int] = list(expected_power_indices or [])
-        self.lambda_expected = lambda_expected
-        self.lambda_pr_score = lambda_pr_score
         self.score_instability_p95 = float(score_instability_p95)
         self.score_instability_max = float(score_instability_max)
         self.non_finite_warn_limit_per_epoch = int(non_finite_warn_limit_per_epoch)
-        self.max_abs_phys_score_term = float(max_abs_phys_score_term) if max_abs_phys_score_term is not None else None
-        self.max_abs_pr_score_term = float(max_abs_pr_score_term) if max_abs_pr_score_term is not None else None
         self.max_abs_base_score_term = float(max_abs_base_score_term) if max_abs_base_score_term is not None else None
-        self.max_abs_pred_score_term = float(max_abs_pred_score_term) if max_abs_pred_score_term is not None else None
         self.hpo_mode = hpo_mode
 
         self._val_outputs: list[dict] = []
@@ -457,7 +370,6 @@ class DLSSMLightningModule(pl.LightningModule):
         self.stability_reason: str = ""
         self._non_finite_warned_batches: int = 0
         self._non_finite_windows_epoch: int = 0
-        self._component_warned_batches: int = 0
         self._val_scores_np: np.ndarray | None = None
         self._val_labels_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
@@ -467,44 +379,12 @@ class DLSSMLightningModule(pl.LightningModule):
         self._test_original_labels_np: np.ndarray | None = None
         self._test_group_ids_np: np.ndarray | None = None
 
-    def _unpack_batch(
-        self, batch: tuple
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, list | None]:
-        """Unpack batch tuple → (x, x_slow, labels, original_labels, group_ids).
-
-        Handles both slow-context and legacy batch shapes transparently.
-        """
-        if self.slow_context_enabled:
-            # (x, x_slow, label[, original_label[, group_id]])
-            x, x_slow = batch[0], batch[1]
-            labels = batch[2]
-            original_labels = batch[3] if len(batch) > 3 else labels
-            group_ids = list(batch[4]) if len(batch) > 4 else None
-        else:
-            # legacy: (x, label[, original_label[, group_id]])
-            x, x_slow = batch[0], None
-            labels = batch[1]
-            original_labels = batch[2] if len(batch) > 2 else labels
-            group_ids = list(batch[3]) if len(batch) > 3 else None
-        return x, x_slow, labels, original_labels, group_ids
-
-    def _extract_condition(self, x: torch.Tensor) -> torch.Tensor | None:
-        """Slice the conditioning sub-vector c_t from x. Returns None if CVAE off."""
-        if not self.cvae_enabled or not self.condition_idx:
-            return None
-        return x[:, :, self.condition_idx]
-
-    def _physics_loss(self, x_hat: torch.Tensor) -> torch.Tensor:
-        if not self.physics_enabled:
-            return torch.zeros(x_hat.size(0), device=x_hat.device, dtype=x_hat.dtype)
-        return physics_consistency_loss(
-            x_hat,
-            self.scaler_mean,
-            self.scaler_scale,
-            self.feature_idx,
-            enable_string_power=self.enable_string_power,
-            enable_imbalance=self.enable_imbalance,
-        )
+    def _unpack_batch(self, batch: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list | None]:
+        x = batch[0]
+        labels = batch[1]
+        original_labels = batch[2] if len(batch) > 2 else labels
+        group_ids = list(batch[3]) if len(batch) > 3 else None
+        return x, labels, original_labels, group_ids
 
     def _in_sanity_check(self) -> bool:
         return bool(getattr(self.trainer, "sanity_checking", False))
@@ -516,7 +396,6 @@ class DLSSMLightningModule(pl.LightningModule):
         self.stability_reason = ""
         self._non_finite_warned_batches = 0
         self._non_finite_windows_epoch = 0
-        self._component_warned_batches = 0
 
     def _record_non_finite_event(self, message: str, *args) -> None:
         """Record a real instability event while ignoring Lightning sanity checks."""
@@ -528,7 +407,7 @@ class DLSSMLightningModule(pl.LightningModule):
 
     def _check_model_outputs_finite(self, out: dict, stage: str, batch_idx: int) -> None:
         """Detect non-finite model outputs before score sanitization can hide them."""
-        names = ("x_hat", "x_pred", "q_mu", "q_logvar", "p_mu", "p_logvar", "p_expected")
+        names = ("x_hat", "q_mu", "q_logvar", "p_mu", "p_logvar")
         bad_parts: list[str] = []
         for name in names:
             value = out.get(name)
@@ -541,57 +420,6 @@ class DLSSMLightningModule(pl.LightningModule):
                 batch_idx,
                 ",".join(bad_parts),
             )
-
-    def _check_raw_score_components(
-        self, components: dict[str, torch.Tensor], stage: str, batch_idx: int
-    ) -> None:
-        """Use raw pre-clamp score components for instability decisions."""
-        score_guard_active = self.current_epoch >= 0
-        bad_parts: list[str] = []
-        for name, value in components.items():
-            detached = value.detach()
-            finite = torch.isfinite(detached)
-            has_non_finite = not bool(finite.all())
-            abs_value = detached.abs()
-            finite_abs = abs_value[finite]
-            if finite_abs.numel() > 0:
-                comp_p95 = float(torch.quantile(finite_abs.float(), 0.95).item())
-                comp_max = float(finite_abs.max().item())
-            else:
-                comp_p95 = float("inf")
-                comp_max = float("inf")
-            too_large = score_guard_active and (
-                comp_p95 >= self.score_instability_p95 or comp_max >= self.score_instability_max
-            )
-            if has_non_finite or too_large:
-                bad_parts.append(
-                    f"{name}(nonfinite={has_non_finite},p95={comp_p95:.4g},max={comp_max:.4g})"
-                )
-
-        if not bad_parts:
-            return
-
-        if not self._in_sanity_check():
-            nan_inf_parts = [p for p in bad_parts if "nonfinite=True" in p]
-            if nan_inf_parts:
-                # Only true NaN/Inf = corrupted forward pass; stop HPO trial and flag
-                self.stability_unstable = True
-                self.stability_reason = f"raw_score_nan_inf: {'; '.join(nan_inf_parts)}"
-                self.non_finite_events += 1
-                if self.hpo_mode:
-                    self.trainer.should_stop = True
-            # Large-but-finite scores are expected for extreme fault windows —
-            # combine_anomaly_score_components clamps them via max_abs_*_score_term.
-            # Log only; never abort training or HPO for finite values.
-
-        if self._component_warned_batches < self.non_finite_warn_limit_per_epoch:
-            logger.warning(
-                "{} batch {} raw score component warning: {}",
-                stage,
-                batch_idx,
-                "; ".join(bad_parts),
-            )
-            self._component_warned_batches += 1
 
     def _check_training_loss_finite(
         self,
@@ -621,48 +449,26 @@ class DLSSMLightningModule(pl.LightningModule):
         return torch.tensor(1.0, device=loss.device, dtype=loss.dtype)
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
-        x, x_slow, _, _, _ = self._unpack_batch(batch)
-        c = self._extract_condition(x)
-        out = self.model(x, c, x_slow)
+        x, _, _, _ = self._unpack_batch(batch)
+        out = self.model(x)
 
         # Per-window loss components [B]
-        recon_w = reconstruction_loss(out["x_hat"], x, recon_mask=self.recon_mask).mean(dim=1)
-        pred_w = prediction_loss(out["x_pred"], x, recon_mask=self.recon_mask).mean(dim=1)
+        recon_w = reconstruction_loss(out["x_hat"], x).mean(dim=1)
         kl_w = kl_divergence(
             out["q_mu"], out["q_logvar"], out["p_mu"], out["p_logvar"],
             free_bits=self.free_bits,
         ).mean(dim=1)
-        phys_w = self._physics_loss(out["x_hat"])
 
         # KL warmup: ramp beta_kl from 0 to beta_kl over kl_warmup_epochs
         beta = self.beta_kl * min(1.0, (self.current_epoch + 1) / max(self.kl_warmup_epochs, 1))
 
-        lambda_phys = self.lambda_phys if self.physics_enabled else 0.0
-
-        # Voltage-Anomaly Head loss (quantile-regression training signal on vdc envelope)
-        if self.expected_power_enabled and out.get("p_expected") is not None:
-            exp_w = expected_voltage_loss(out["p_expected"], x, self.expected_power_indices)
-            lambda_exp_eff = self.lambda_expected
-        else:
-            exp_w = torch.zeros_like(recon_w)
-            lambda_exp_eff = 0.0
-
-        per_window = (
-            recon_w
-            + self.alpha_pred * pred_w
-            + beta * kl_w
-            + lambda_phys * phys_w
-            + lambda_exp_eff * exp_w
-        )
+        per_window = recon_w + beta * kl_w
         loss = per_window.mean()
 
         # Non-finite guard: check all loss components before optimizer consumes them
         loss_components = {
             "recon": recon_w,
-            "pred": pred_w,
             "kl": kl_w,
-            "phys": phys_w,
-            "exp": exp_w,
         }
         dummy = self._check_training_loss_finite(loss_components, loss, batch_idx)
         if dummy is not None:
@@ -670,21 +476,12 @@ class DLSSMLightningModule(pl.LightningModule):
 
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_recon", recon_w.mean(), on_step=False, on_epoch=True)
-        self.log("train_pred", pred_w.mean(), on_step=False, on_epoch=True)
         self.log("train_kl", kl_w.mean(), on_step=False, on_epoch=True)
-        self.log("train_phys", phys_w.mean(), on_step=False, on_epoch=True)
-        self.log("train_expected", exp_w.mean(), on_step=False, on_epoch=True)
         self.log("train_beta_kl", beta, on_step=False, on_epoch=True)
         return loss
 
     def _score_batch(self, x: torch.Tensor, out: dict) -> torch.Tensor:
-        scores, _ = self._score_batch_with_components(x, out)
-        return scores
-
-    def _score_batch_with_components(
-        self, x: torch.Tensor, out: dict
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        components = compute_anomaly_score_components(
+        return compute_anomaly_scores(
             x=x,
             x_hat=out["x_hat"],
             q_mu=out["q_mu"],
@@ -693,39 +490,15 @@ class DLSSMLightningModule(pl.LightningModule):
             p_logvar=out["p_logvar"],
             lambda_kl_score=self.lambda_kl_score,
             score_reduction=self.score_reduction,
-            lambda_phys_score=self.lambda_phys_score,
-            scaler_mean=self.scaler_mean if self.lambda_phys_score > 0.0 else None,
-            scaler_scale=self.scaler_scale if self.lambda_phys_score > 0.0 else None,
-            feature_idx=self.feature_idx if self.lambda_phys_score > 0.0 else None,
-            enable_string_power=self.enable_string_power,
-            enable_imbalance=self.enable_imbalance,
-            x_pred=out["x_pred"],
-            lambda_pred_score=self.lambda_pred_score,
-            recon_mask=self.recon_mask,
-            p_expected=out.get("p_expected"),
-            lambda_pr_score=self.lambda_pr_score if self.expected_power_enabled else 0.0,
-            expected_power_indices=self.expected_power_indices if self.expected_power_enabled else None,
-        )
-        scores = combine_anomaly_score_components(
-            components,
-            lambda_pred_score=self.lambda_pred_score,
-            lambda_phys_score=self.lambda_phys_score,
-            lambda_pr_score=self.lambda_pr_score if self.expected_power_enabled else 0.0,
             max_abs_base_score_term=self.max_abs_base_score_term,
-            max_abs_pred_score_term=self.max_abs_pred_score_term,
-            max_abs_phys_score_term=self.max_abs_phys_score_term,
-            max_abs_pr_score_term=self.max_abs_pr_score_term,
         )
-        return scores, components
 
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
-        x, x_slow, labels, original_labels, group_ids = self._unpack_batch(batch)
+        x, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
-            out = self.model(x, self._extract_condition(x), x_slow)
+            out = self.model(x)
         self._check_model_outputs_finite(out, "Validation", batch_idx)
-        scores, components = self._score_batch_with_components(x, out)
-        self._check_raw_score_components(components, "Validation", batch_idx)
-        scores = scores.cpu()
+        scores = self._score_batch(x, out).cpu()
         non_finite = ~torch.isfinite(scores)
         if bool(non_finite.any()):
             n_bad = int(non_finite.sum().item())
@@ -771,16 +544,8 @@ class DLSSMLightningModule(pl.LightningModule):
                 self._non_finite_windows_epoch,
                 self.non_finite_warn_limit_per_epoch,
             )
-        if self._component_warned_batches > 0:
-            logger.warning(
-                "Validation epoch {}: raw score component warnings in {} batches "
-                "(component-level warnings capped per batch)",
-                self.current_epoch,
-                self._component_warned_batches,
-            )
         self._non_finite_warned_batches = 0
         self._non_finite_windows_epoch = 0
-        self._component_warned_batches = 0
 
         finite_mask = np.isfinite(all_scores)
         n_non_finite = int((~finite_mask).sum())
@@ -889,13 +654,11 @@ class DLSSMLightningModule(pl.LightningModule):
             )
 
     def test_step(self, batch: tuple, batch_idx: int) -> None:
-        x, x_slow, labels, original_labels, group_ids = self._unpack_batch(batch)
+        x, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
-            out = self.model(x, self._extract_condition(x), x_slow)
+            out = self.model(x)
         self._check_model_outputs_finite(out, "Test", batch_idx)
-        scores, components = self._score_batch_with_components(x, out)
-        self._check_raw_score_components(components, "Test", batch_idx)
-        scores = scores.cpu()
+        scores = self._score_batch(x, out).cpu()
         non_finite = ~torch.isfinite(scores)
         if bool(non_finite.any()):
             n_bad = int(non_finite.sum().item())
@@ -952,23 +715,10 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("test_recall_at_threshold", test_rec)
 
     @torch.no_grad()
-    def score_windows(
-        self,
-        x: torch.Tensor,
-        x_slow: torch.Tensor | None = None,
-        return_diagnostics: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Score a batch of windows [B, W, F] → anomaly scores [B].
-
-        When *return_diagnostics=True* returns ``(scores, raw_components)``
-        where raw_components contains pre-sanitization score terms for each
-        component (reconstruction, kl, physics, oc, prediction, pr).
-        """
-        out = self.model(x, self._extract_condition(x), x_slow)
-        if not return_diagnostics:
-            return self._score_batch(x, out)
-        scores, components = self._score_batch_with_components(x, out)
-        return scores, components
+    def score_windows(self, x: torch.Tensor) -> torch.Tensor:
+        """Score a batch of windows [B, W, F] → anomaly scores [B]."""
+        out = self.model(x)
+        return self._score_batch(x, out)
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
@@ -992,7 +742,7 @@ class DLSSMLightningModule(pl.LightningModule):
 def _save_pr_curve(
     val_scores: np.ndarray, val_labels: np.ndarray,
     test_scores: np.ndarray, test_labels: np.ndarray,
-    path: Path, model_name: str = "DLS-SSM",
+    path: Path, model_name: str = "DLSSM",
 ) -> None:
     fig, ax = plt.subplots(figsize=(7, 5))
     for scores, labels, split in [
@@ -1014,7 +764,7 @@ def _save_pr_curve(
 
 def _save_score_histogram(
     val_scores: np.ndarray, val_labels: np.ndarray,
-    threshold: float, path: Path, model_name: str = "DLS-SSM",
+    threshold: float, path: Path, model_name: str = "DLSSM",
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.hist(val_scores[val_labels == 0], bins=60, alpha=0.5, label="Val — normal", density=True)
@@ -1033,7 +783,7 @@ def _save_score_histogram(
 
 def _save_score_timeline(
     test_scores: np.ndarray, test_labels: np.ndarray,
-    threshold: float, path: Path, model_name: str = "DLS-SSM",
+    threshold: float, path: Path, model_name: str = "DLSSM",
 ) -> None:
     fig, ax = plt.subplots(figsize=(12, 4))
     colors = np.where(test_labels == 1, "red", "steelblue")
@@ -1046,102 +796,6 @@ def _save_score_timeline(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=100)
-    plt.close(fig)
-
-
-def _save_prediction_residual_plot(
-    lit: DLSSMLightningModule,
-    test_dl: DataLoader,
-    features: list[str],
-    test_scores: np.ndarray,
-    test_labels: np.ndarray,
-    path: Path,
-    model_name: str = "DLS-SSM",
-) -> None:
-    """Visualize x_pred vs x_hat vs x for the highest-scoring fault window.
-
-    The point: show that the GRU state predicts what *should* be happening
-    (x_pred), and the latent residual (x_hat - x_pred) carries the deviation
-    that flags the anomaly. This is the qualitative interpretability story
-    that recon-only autoencoders cannot tell.
-    """
-    fault_idx = np.where(test_labels == 1)[0]
-    if len(fault_idx) == 0:
-        logger.warning("No fault windows in test set — skipping prediction/residual plot")
-        return
-
-    target_idx = int(fault_idx[np.argmax(test_scores[fault_idx])])
-
-    # Iterate test_dl (no shuffle) to find the matching window
-    target_window: torch.Tensor | None = None
-    target_x_slow: torch.Tensor | None = None
-    counter = 0
-    for batch in test_dl:
-        x_batch = batch[0]
-        bs = x_batch.size(0)
-        if counter + bs > target_idx:
-            i = target_idx - counter
-            target_window = x_batch[i : i + 1]
-            if lit.slow_context_enabled and len(batch) >= 2 and isinstance(batch[1], torch.Tensor):
-                target_x_slow = batch[1][i : i + 1]
-            break
-        counter += bs
-    if target_window is None:
-        logger.warning("Failed to locate target fault window — skipping plot")
-        return
-
-    device = next(lit.model.parameters()).device
-    target_window = target_window.to(device)
-    target_x_slow = target_x_slow.to(device) if target_x_slow is not None else None
-    lit.model.eval()
-    with torch.no_grad():
-        c_target = lit._extract_condition(target_window)
-        out = lit.model(target_window, c_target, target_x_slow)
-    x_np = target_window[0].cpu().numpy()
-    x_pred_np = out["x_pred"][0].cpu().numpy()
-    x_hat_np = out["x_hat"][0].cpu().numpy()
-
-    # Inverse-standardize for physical interpretability
-    mean = lit.scaler_mean.cpu().numpy()
-    scale = lit.scaler_scale.cpu().numpy()
-    x_phys = x_np * scale + mean
-    x_pred_phys = x_pred_np * scale + mean
-    x_hat_phys = x_hat_np * scale + mean
-
-    # Choose key PV features if present; otherwise fall back to first 4
-    preferred = ["pdc1", "vdc1", "idc1", "power_imbalance",
-                 "pdc2", "vdc2", "idc2", "current_imbalance", "voltage_imbalance"]
-    chosen = [f for f in preferred if f in features][:4]
-    if len(chosen) < 4:
-        chosen = features[:4]
-
-    # Skip t=0 — h_prev[:, 0] = 0 makes the first prediction degenerate
-    t = np.arange(1, x_phys.shape[0])
-
-    fig, axes = plt.subplots(len(chosen), 1, figsize=(10, 2.5 * len(chosen)), sharex=True)
-    if len(chosen) == 1:
-        axes = [axes]
-
-    for ax, feat in zip(axes, chosen, strict=False):
-        idx = features.index(feat)
-        ax.plot(t, x_phys[1:, idx], color="black", linewidth=1.8, label="observed x")
-        ax.plot(t, x_pred_phys[1:, idx], color="steelblue", linestyle="--",
-                linewidth=1.5, alpha=0.9, label="x_pred (state-only)")
-        ax.plot(t, x_hat_phys[1:, idx], color="firebrick", linestyle=":",
-                linewidth=1.5, alpha=0.9, label="x_hat (state + residual)")
-        ax.set_ylabel(feat)
-        ax.grid(True, alpha=0.3)
-
-    score = float(test_scores[target_idx])
-    axes[0].set_title(
-        f"Prediction / Residual Decomposition — {model_name}\n"
-        f"Highest-scoring fault window (test_idx={target_idx}, score={score:.3f}). "
-        f"Gap between observed and x_pred is what z_t must explain."
-    )
-    axes[0].legend(loc="best", fontsize=9)
-    axes[-1].set_xlabel("Timestep within window")
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
     plt.close(fig)
 
 
@@ -1160,20 +814,8 @@ def run_dlssm(config: dict | None = None) -> None:
     seed: int = args.seed
     is_smoke: bool = args.smoke
 
-    physics_enabled: bool = args.physics or bool(
-        dlssm_cfg.get("physics_enabled", float(dlssm_cfg.get("lambda_phys", 0.0)) > 0.0)
-    )
-    cvae_enabled: bool = args.cvae or bool(dlssm_cfg.get("cvae", False))
-
     run_type = "smoke" if is_smoke else args.run_type
-
-    # Derive a human-readable variant name for logging (may be overridden to DLSSM-FDD below)
-    parts: list[str] = []
-    if cvae_enabled:
-        parts.append("C")
-    if physics_enabled:
-        parts.append("PI")
-    variant = ("-".join(parts) + "-DLS-SSM") if parts else "DLS-SSM"
+    variant = "DLSSM"
 
     logger.info(
         "Loading features | task={} dataset={} split_path={} profile={}",
@@ -1241,33 +883,11 @@ def run_dlssm(config: dict | None = None) -> None:
         loader_runtime["prefetch_factor"],
     )
 
-    # Slow-context config (needed before _make_dataloaders; no CVAE dependency)
-    fdd_cfg = dlssm_cfg.get("fdd", {}) or {}
-    slow_context_enabled: bool = bool(fdd_cfg.get("slow_context_enabled", True))
-    slow_context_seconds: int = int(fdd_cfg.get("slow_context_seconds", 3600))
-    slow_stride: int = int(fdd_cfg.get("slow_stride", 60))
-    slow_hidden_dim: int = int(fdd_cfg.get("slow_hidden_dim", 64))
-    se_reduction_ratio: int = int(fdd_cfg.get("se_reduction_ratio", 4))
-
-    if slow_context_enabled:
-        try:
-            from mamba_ssm import Mamba as _Mamba  # noqa: F401
-        except ImportError:
-            logger.warning(
-                "mamba_ssm not available — slow-context branch disabled. "
-                "Run on Colab A100 with `pip install mamba-ssm` for full DLSSM-FDD."
-            )
-            slow_context_enabled = False
-            slow_hidden_dim = 0
+    se_reduction_ratio: int = int(dlssm_cfg.get("se_reduction_ratio", 4))
 
     def _make_dataloaders(stride_train: int, stride_eval: int, bs: int):
-        slow_kw = dict(
-            return_slow_context=slow_context_enabled,
-            slow_context_samples=slow_context_seconds,
-            slow_stride=slow_stride,
-        )
         ds_train = TimeSeriesDataset(
-            train_df, features, label_col, win_size, stride_train, normal_only=True, **slow_kw
+            train_df, features, label_col, win_size, stride_train, normal_only=True
         )
         ds_val = TimeSeriesDataset(
             val_df,
@@ -1278,7 +898,6 @@ def run_dlssm(config: dict | None = None) -> None:
             normal_only=False,
             return_original_label=True,
             return_group_id=True,
-            **slow_kw,
         )
         ds_test = TimeSeriesDataset(
             test_df,
@@ -1289,7 +908,6 @@ def run_dlssm(config: dict | None = None) -> None:
             normal_only=False,
             return_original_label=True,
             return_group_id=True,
-            **slow_kw,
         )
         kw = {
             "drop_last": False,
@@ -1311,71 +929,14 @@ def run_dlssm(config: dict | None = None) -> None:
         len(train_dl.dataset), len(val_dl.dataset), len(test_dl.dataset),
     )
 
-    # CVAE conditioning: resolve indices from feature names (used by HPO + final build)
-    cond_cfg = dlssm_cfg.get("conditioning", {}) or {}
-    cond_feats = [f for f in cond_cfg.get("features", []) if f in feature_idx]
-    missing_cond = [f for f in cond_cfg.get("features", []) if f not in feature_idx]
-    if cvae_enabled and missing_cond:
-        logger.warning("CVAE: missing condition features in manifest: {}", missing_cond)
-    if cvae_enabled and not cond_feats:
-        logger.warning("CVAE requested but no condition features available — disabling CVAE")
-        cvae_enabled = False
-    condition_idx = [feature_idx[f] for f in cond_feats] if cvae_enabled else []
-    condition_dim = len(condition_idx)
-
-    skip_feats = [f for f in cond_cfg.get("recon_skip_features", []) if f in feature_idx]
-    skip_idx = [feature_idx[f] for f in skip_feats] if cvae_enabled else []
-    if cvae_enabled and skip_idx:
-        recon_mask = torch.ones(n_features, dtype=torch.float32)
-        recon_mask[skip_idx] = 0.0
-        logger.info(
-            "CVAE: condition_features={} | recon_skip_features={} ({} kept of {})",
-            cond_feats, skip_feats, n_features - len(skip_idx), n_features,
-        )
-    else:
-        recon_mask = None
-        if cvae_enabled:
-            logger.info("CVAE: condition_features={} (no recon mask)", cond_feats)
-
-    # DLSSM-FDD: expected-power configuration (needs condition_dim from CVAE block above)
-    expected_power_enabled: bool = bool(fdd_cfg.get("expected_power_enabled", True))
-    expected_power_features: list[str] = fdd_cfg.get("expected_power_features", ["vdc1", "vdc2"])
-    expected_power_indices: list[int] = [
-        feature_idx[f] for f in expected_power_features if f in feature_idx
-    ]
-    if expected_power_enabled and not expected_power_indices:
-        logger.warning(
-            "DLSSM-FDD: expected_power_enabled=True but none of {} found in features — disabling",
-            expected_power_features,
-        )
-        expected_power_enabled = False
-    if expected_power_enabled and condition_dim == 0:
-        logger.warning(
-            "DLSSM-FDD: expected_power_enabled=True requires CVAE (condition_dim>0) — disabling"
-        )
-        expected_power_enabled = False
-
-    lambda_expected: float = float(fdd_cfg.get("lambda_expected", 0.5))
-    lambda_pr_score: float = float(fdd_cfg.get("lambda_pr_score", 0.1))
-
     stability_cfg = dlssm_cfg.get("stability", {}) or {}
     score_instability_p95: float = float(stability_cfg.get("score_instability_p95", 1e6))
     score_instability_max: float = float(stability_cfg.get("score_instability_max", 1e7))
     non_finite_warn_limit_per_epoch: int = int(
         stability_cfg.get("non_finite_warn_limit_per_epoch", 5)
     )
-    _raw_phys = stability_cfg.get("max_abs_phys_score_term")
-    max_abs_phys_score_term: float | None = float(_raw_phys) if _raw_phys is not None else 1e5
-    _raw_pr = stability_cfg.get("max_abs_pr_score_term")
-    max_abs_pr_score_term: float | None = float(_raw_pr) if _raw_pr is not None else 1e5
     _raw_base = stability_cfg.get("max_abs_base_score_term")
     max_abs_base_score_term: float | None = float(_raw_base) if _raw_base is not None else 1e5
-    _raw_pred = stability_cfg.get("max_abs_pred_score_term")
-    max_abs_pred_score_term: float | None = float(_raw_pred) if _raw_pred is not None else 1e5
-
-    # Override variant to DLSSM-FDD when all stacked components are active
-    if slow_context_enabled and expected_power_enabled and cvae_enabled:
-        variant = "DLSSM-FDD"
 
     # Apply best params from --best-params JSON or from HPO sweep
     hpo_params: dict = {}
@@ -1390,33 +951,19 @@ def run_dlssm(config: dict | None = None) -> None:
             base_cfg=dlssm_cfg,
             hpo_cfg=hpo_cfg,
             training_cfg=training_cfg,
-            cvae_enabled=cvae_enabled,
-            condition_idx=condition_idx,
-            condition_dim=condition_dim,
-            recon_mask=recon_mask,
             train_dl=train_dl,
             val_dl=val_dl,
             scaler_mean_t=scaler_mean_t,
             scaler_scale_t=scaler_scale_t,
             feature_idx=feature_idx,
             n_features=n_features,
-            physics_enabled=physics_enabled,
             seed=seed,
             n_trials_override=args.n_trials,
-            slow_context_enabled=slow_context_enabled,
-            slow_hidden_dim=slow_hidden_dim,
             se_reduction_ratio=se_reduction_ratio,
-            expected_power_enabled=expected_power_enabled,
-            expected_power_indices=expected_power_indices,
-            lambda_expected=lambda_expected,
-            lambda_pr_score=lambda_pr_score,
             score_instability_p95=score_instability_p95,
             score_instability_max=score_instability_max,
             non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
-            max_abs_phys_score_term=max_abs_phys_score_term,
-            max_abs_pr_score_term=max_abs_pr_score_term,
             max_abs_base_score_term=max_abs_base_score_term,
-            max_abs_pred_score_term=max_abs_pred_score_term,
         )
         logger.info("HPO best params: {}", json.dumps(hpo_params, default=str))
 
@@ -1424,14 +971,9 @@ def run_dlssm(config: dict | None = None) -> None:
     if hpo_params:
         dlssm_cfg = {**dlssm_cfg, **hpo_params}
 
-    # Resolve scoring/training weights from merged config (includes HPO/--best-params overrides)
-    lambda_expected = float(dlssm_cfg.get("lambda_expected", lambda_expected))
-    lambda_pr_score = float(dlssm_cfg.get("lambda_pr_score", lambda_pr_score))
-
     # Build model and Lightning module
     pl.seed_everything(seed, workers=True)
 
-    physics_components = dlssm_cfg.get("physics_components", {})
     model = DeepLatentStateSpaceModel(
         n_features=n_features,
         win_size=win_size,
@@ -1441,10 +983,7 @@ def run_dlssm(config: dict | None = None) -> None:
         decoder_dim=int(dlssm_cfg.get("decoder_dim", 64)),
         n_gru_layers=int(dlssm_cfg.get("n_gru_layers", 1)),
         dropout=float(dlssm_cfg.get("dropout", 0.1)),
-        condition_dim=condition_dim,
         se_reduction_ratio=se_reduction_ratio,
-        slow_hidden_dim=slow_hidden_dim if slow_context_enabled else 0,
-        expected_power_indices=expected_power_indices if expected_power_enabled else None,
     )
 
     lit = DLSSMLightningModule(
@@ -1461,32 +1000,14 @@ def run_dlssm(config: dict | None = None) -> None:
         min_lr_ratio=float(training_cfg.get("min_lr_ratio", 0.01)),
         beta_kl=float(dlssm_cfg.get("beta_kl", 0.1)),
         kl_warmup_epochs=int(dlssm_cfg.get("kl_warmup_epochs", 5)),
-        lambda_phys=float(dlssm_cfg.get("lambda_phys", 0.05)),
-        enable_string_power=bool(physics_components.get("string_power", True)),
-        enable_imbalance=bool(physics_components.get("imbalance", True)),
-        physics_enabled=physics_enabled,
         lambda_kl_score=float(dlssm_cfg.get("lambda_kl_score", 0.1)),
-        lambda_phys_score=float(dlssm_cfg.get("lambda_phys_score", 0.0)),
-        alpha_pred=float(dlssm_cfg.get("alpha_pred", 0.1)),
-        lambda_pred_score=float(dlssm_cfg.get("lambda_pred_score", 0.0)),
         score_reduction=str(dlssm_cfg.get("score_reduction", "center")),
         free_bits=float(dlssm_cfg.get("free_bits", 0.0)),
         latent_dim=int(dlssm_cfg.get("latent_dim", 16)),
-        cvae_enabled=cvae_enabled,
-        condition_idx=condition_idx,
-        recon_mask=recon_mask,
-        slow_context_enabled=slow_context_enabled,
-        expected_power_enabled=expected_power_enabled,
-        expected_power_indices=expected_power_indices,
-        lambda_expected=lambda_expected,
-        lambda_pr_score=lambda_pr_score,
         score_instability_p95=score_instability_p95,
         score_instability_max=score_instability_max,
         non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
-        max_abs_phys_score_term=max_abs_phys_score_term,
-        max_abs_pr_score_term=max_abs_pr_score_term,
         max_abs_base_score_term=max_abs_base_score_term,
-        max_abs_pred_score_term=max_abs_pred_score_term,
         hpo_mode=False,
     )
 
@@ -1495,7 +1016,7 @@ def run_dlssm(config: dict | None = None) -> None:
     if args.artifacts_dir:
         artifacts_dir = Path(args.artifacts_dir)
     else:
-        artifacts_dir = get_experiments_root() / "anomaly" / "dlssm" / f"{variant.lower()}_{ts}"
+        artifacts_dir = get_experiments_root() / "anomaly" / "dlssm" / ts
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = artifacts_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1526,10 +1047,7 @@ def run_dlssm(config: dict | None = None) -> None:
     )
     trainer = pl.Trainer(**trainer_kwargs)
 
-    logger.info(
-        "Training {} (cvae={}, physics={})",
-        variant, cvae_enabled, physics_enabled,
-    )
+    logger.info("Training {}", variant)
     t0 = time.perf_counter()
     trainer.fit(lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
     fit_time = time.perf_counter() - t0
@@ -1622,20 +1140,10 @@ def run_dlssm(config: dict | None = None) -> None:
         test_pr_auc, test_roc_auc, test_f1, test_prec, test_rec,
     )
 
-    # Score components mirror the thesis three-head taxonomy:
-    #   dynamic-anomaly head  -> reconstruction + kl + prediction (shared latent dynamics)
-    #   symmetry-anomaly head -> physics_consistency (P=V*I + imbalance ratio constraints)
-    #   voltage-anomaly head  -> voltage_anomaly (vdc envelope drop from quantile-calibrated baseline)
-    score_components = ["reconstruction", "kl", "prediction"]
-    lambda_phys_score = float(dlssm_cfg.get("lambda_phys_score", 0.0))
-    physics_score_enabled = lambda_phys_score > 0.0
-    if lambda_phys_score > 0.0:
-        score_components.append("physics_consistency")
-    if expected_power_enabled:
-        score_components.append("voltage_anomaly")
+    score_components = ["reconstruction", "kl"]
 
     metrics: dict = {
-        "score_name": "dlssm_anomaly_score",
+        "score_name": "dlssm_score",
         "score_components": score_components,
         "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
         "threshold_policy": "q95_normal_val",
@@ -1668,16 +1176,11 @@ def run_dlssm(config: dict | None = None) -> None:
         "n_features": n_features,
         "fit_time_s": round(fit_time, 2),
     }
-    run_name = f"anomaly_dlssm_{variant.lower().replace('-', '_')}_{ts}"
+    run_name = f"dlssm_{ts}"
 
     # Save artifacts
     run_params = {
         "variant": variant,
-        "physics_enabled": physics_enabled,
-        "physics_score_enabled": physics_score_enabled,
-        "cvae_enabled": cvae_enabled,
-        "condition_features": cond_feats if cvae_enabled else [],
-        "recon_skip_features": skip_feats if cvae_enabled else [],
         **{k: v for k, v in dlssm_cfg.items() if not isinstance(v, dict)},
         "max_epochs_actual": max_epochs,
         "n_features": n_features,
@@ -1696,7 +1199,6 @@ def run_dlssm(config: dict | None = None) -> None:
     pr_curve_path = artifacts_dir / "pr_curve.png"
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
-    pred_residual_path = artifacts_dir / "prediction_residual_decomposition.png"
 
     write_json(global_metrics_path, metrics)
     params_path.write_text(json.dumps(run_params, indent=2, default=str), encoding="utf-8")
@@ -1721,12 +1223,9 @@ def run_dlssm(config: dict | None = None) -> None:
             threshold_quantile=0.95,
             candidate_per_true_class_thresholds=candidate_thresholds,
             score_stats={
-                "score_name": "dlssm_anomaly_score",
+                "score_name": "dlssm_score",
                 "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
                 "lambda_kl_score": float(dlssm_cfg.get("lambda_kl_score", 0.1)),
-                "lambda_pred_score": float(dlssm_cfg.get("lambda_pred_score", 0.0)),
-                "lambda_phys_score": lambda_phys_score,
-                "lambda_pr_score": lambda_pr_score,
                 "score_components": score_components,
             },
         ),
@@ -1760,7 +1259,7 @@ def run_dlssm(config: dict | None = None) -> None:
             "checkpoint_available": bool(best_ckpt_path),
             "threshold_policy": "q95_normal_val",
             "selection_metric": "val_macro_per_class_pr_auc",
-            "score_name": "dlssm_anomaly_score",
+            "score_name": "dlssm_score",
             "score_components": score_components,
             "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
             "score_calibration_artifact": calibration_path.name,
@@ -1773,13 +1272,6 @@ def run_dlssm(config: dict | None = None) -> None:
     _save_pr_curve(val_scores, val_labels, test_scores, test_labels, pr_curve_path, model_name=variant)
     _save_score_histogram(val_scores, val_labels, threshold, histogram_path, model_name=variant)
     _save_score_timeline(test_scores, test_labels, threshold, timeline_path, model_name=variant)
-    try:
-        _save_prediction_residual_plot(
-            lit, test_dl, features, test_scores, test_labels,
-            pred_residual_path, model_name=variant,
-        )
-    except Exception as exc:
-        logger.warning("Prediction/residual plot failed (non-fatal): {}", exc)
 
     logger.info("Artifacts saved → {}", artifacts_dir)
 
@@ -1795,9 +1287,6 @@ def run_dlssm(config: dict | None = None) -> None:
                 "model": "dlssm",
                 "model_family": "anomaly_dl",
                 "variant": variant,
-                "physics_training_enabled": str(physics_enabled),
-                "physics_score_enabled": str(physics_score_enabled),
-                "cvae": str(cvae_enabled),
             })
             mlflow.log_params({
                 k: v for k, v in run_params.items()
@@ -1826,7 +1315,6 @@ def run_dlssm(config: dict | None = None) -> None:
                 pr_curve_path,
                 histogram_path,
                 timeline_path,
-                pred_residual_path,
             ):
                 if p.exists():
                     mlflow.log_artifact(str(p))
@@ -1846,21 +1334,15 @@ def run_dlssm(config: dict | None = None) -> None:
                 "seed": seed,
                 "feature_profile": str(args.profile),
                 "feature_run_dir": str(resolved_run_dir),
-                "physics_enabled": physics_enabled,
-                "physics_score_enabled": physics_score_enabled,
-                "cvae_enabled": cvae_enabled,
-                "condition_features": ",".join(cond_feats) if cvae_enabled else "",
-                "recon_skip_features": ",".join(skip_feats) if cvae_enabled else "",
                 "n_features": n_features,
                 "win_size": win_size,
                 "hidden_dim": int(dlssm_cfg.get("hidden_dim", 64)),
                 "latent_dim": int(dlssm_cfg.get("latent_dim", 16)),
-                "lambda_phys": float(dlssm_cfg.get("lambda_phys", 0.05)),
                 "threshold": threshold,
                 "threshold_policy": "q95_normal_val",
                 "selection_metric": "val_macro_per_class_pr_auc",
                 "val_selection_score": val_macro.get("macro_per_class_pr_auc"),
-                "score_name": "dlssm_anomaly_score",
+                "score_name": "dlssm_score",
                 "score_components": score_components,
                 "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
                 "val_pr_auc": val_pr_auc,
