@@ -276,6 +276,20 @@ def _run_hpo(
             hpo_trainer.fit(hpo_lit, train_dataloaders=train_dl, val_dataloaders=val_dl)
         except optuna.exceptions.TrialPruned:
             raise
+        except ValueError as exc:
+            # Some unstable trials can emit NaN/Inf validation scores that break sklearn metrics.
+            # Mark such trials as pruned instead of aborting the whole sweep.
+            if "Input contains NaN" in str(exc) or "infinity" in str(exc).lower():
+                logger.warning("Pruning unstable HPO trial due to non-finite validation scores: {}", exc)
+                raise optuna.exceptions.TrialPruned() from exc
+            raise
+
+        if hpo_lit.non_finite_events > 0:
+            logger.warning(
+                "Pruning unstable HPO trial: detected {} non-finite score events",
+                hpo_lit.non_finite_events,
+            )
+            raise optuna.exceptions.TrialPruned()
         return float(hpo_lit.best_val_pr_auc)
 
     sampler = _build_sampler(str(hpo_cfg.get("sampler", "tpe")), seed=seed)
@@ -408,6 +422,7 @@ class DLSSMLightningModule(pl.LightningModule):
         self._test_outputs: list[dict] = []
         self.best_val_pr_auc: float = 0.0
         self.val_threshold: float = 0.5
+        self.non_finite_events: int = 0
         self._val_scores_np: np.ndarray | None = None
         self._val_labels_np: np.ndarray | None = None
         self._val_original_labels_np: np.ndarray | None = None
@@ -610,6 +625,16 @@ class DLSSMLightningModule(pl.LightningModule):
         with torch.no_grad():
             out = self.model(x, self._extract_condition(x), x_slow)
         scores = self._score_batch(x, out).cpu()
+        non_finite = ~torch.isfinite(scores)
+        if bool(non_finite.any()):
+            n_bad = int(non_finite.sum().item())
+            self.non_finite_events += 1
+            logger.warning(
+                "Validation batch {} contains {} non-finite scores; sanitizing with nan_to_num",
+                batch_idx,
+                n_bad,
+            )
+            scores = torch.nan_to_num(scores, nan=1e6, posinf=1e6, neginf=-1e6)
         self._val_outputs.append(
             {
                 "scores": scores,
@@ -632,6 +657,17 @@ class DLSSMLightningModule(pl.LightningModule):
                 dtype=object,
             )
         self._val_outputs.clear()
+
+        finite_mask = np.isfinite(all_scores)
+        n_non_finite = int((~finite_mask).sum())
+        if n_non_finite > 0:
+            self.non_finite_events += 1
+            logger.warning(
+                "Validation epoch {} has {} non-finite aggregated scores; sanitizing",
+                self.current_epoch,
+                n_non_finite,
+            )
+            all_scores = np.nan_to_num(all_scores, nan=1e6, posinf=1e6, neginf=-1e6)
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
             # Degenerate batch (sanity check or all-normal segment): log zeros with
@@ -658,7 +694,7 @@ class DLSSMLightningModule(pl.LightningModule):
         )
         val_macro_pc_pr_auc = float(per_class_pr.get("macro_per_class_pr_auc") or 0.0)
         val_worst_pc_pr_auc = float(per_class_pr.get("worst_class_pr_auc") or 0.0)
-        per_class_detail: dict = per_class_pr.get("per_class", {})
+        per_class_detail: dict = per_class_pr.get("per_class_pr_auc_vs_normal", {})
 
         self.best_val_pr_auc = max(self.best_val_pr_auc, val_macro_pc_pr_auc)
         self.val_threshold = threshold
@@ -682,9 +718,13 @@ class DLSSMLightningModule(pl.LightningModule):
             f"cls{k}={v:.3f}" for k, v in sorted(per_class_detail.items())
         ) if per_class_detail else "n/a"
         logger.info(
-            "Epoch {:3d} | macro_pc={:.4f}  worst={:.4f}  binary={:.4f}  thr={:.4f} | {}",
+            "Epoch {:3d} | macro_pc={:.4f}  worst={:.4f}  binary={:.4f}  thr={:.4f}  "
+            "score_p95={:.4f}  score_max={:.4f}  c_norm={:.4f} | {}",
             self.current_epoch,
             val_macro_pc_pr_auc, val_worst_pc_pr_auc, val_pr_auc, threshold,
+            float(np.percentile(all_scores, 95)),
+            float(np.max(all_scores)),
+            float(self.c.norm()) if bool(self.c_initialized) else 0.0,
             pc_parts,
         )
 
