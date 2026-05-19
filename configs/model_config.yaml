@@ -209,10 +209,9 @@ anomaly_detection:
 
       gtbad_v2:
         profile: "gtbad_experiment"   # references data_config.yaml profiles section
-        epochs: 50
+        epochs: 200
         patience: 15
         dropout: 0.1
-        train_frac: 0.80
         seed: 42
         # GVSAO budget
         gvsao:

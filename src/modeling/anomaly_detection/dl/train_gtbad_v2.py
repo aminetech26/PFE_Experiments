@@ -3,8 +3,8 @@
 GTBAD v2 — Extended experiment: per-feature/group thresholds, GVSAO 7D HPO.
 
 Key additions over train_gtbad.py:
-  - Optimises window_size, d_model/nhead, num_encoder_layers, lstm_hidden via GVSAO
-  - Label-pure sliding windows (no mixed-label windows)
+  - Optimises threshold_percentile, d_model/nhead, num_encoder_layers, lstm_hidden via GVSAO
+  - Point-wise reconstruction (window_size=1)
   - Per-feature threshold computation at multiple percentiles
   - Group-based (PDC/IDC/VDC AND/OR) and all-feature decision logic
   - Supports original 9-sensor and plus_physics feature profiles
@@ -15,7 +15,9 @@ All config driven by data_config.yaml (profile) and model_config.yaml.
 
 Usage:
     uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2
-    uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2 --no-gvsao
+    uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2 --mini
+    uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2 --feature-mode original
+    uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2 --no-gvsao --feature-mode plus_physics
     uv run python -m src.modeling.anomaly_detection.dl.train_gtbad_v2 --no-mlflow
 """
 
@@ -68,7 +70,7 @@ FAULT_NAMES: dict[int, str] = {
     4: "Shadowing",
 }
 
-EVALUABLE_CLASSES = [1, 2, 3, 4]
+EVALUABLE_CLASSES = [0, 1, 2, 3, 4]
 
 
 # ── Config Loading ───────────────────────────────────────────────────────────
@@ -122,26 +124,44 @@ def load_data(parquet_path: str | Path) -> pd.DataFrame:
     return df
 
 
-def split_healthy_faulty(
+def split_temporal_mixed(
     df: pd.DataFrame,
-    healthy_train_frac: float = 0.80,
+    train_frac: float = 0.60,
+    val_frac: float = 0.20,
+    gap_samples: int = 300,
 ) -> dict[str, pd.DataFrame]:
-    healthy = df[df["label"] == 0].copy()
-    faulty = df[df["label"] > 0].copy()
-    n_healthy = len(healthy)
-    split_idx = int(n_healthy * healthy_train_frac)
-    train_df = healthy.iloc[:split_idx]
-    val_df = healthy.iloc[split_idx:]
-    test_by_class: dict[str, pd.DataFrame] = {}
-    for cls in EVALUABLE_CLASSES:
-        cls_data = faulty[faulty["label"] == cls]
-        if len(cls_data) > 0:
-            test_by_class[f"fault_class_{cls}"] = cls_data
-    logger.info(f"  Train (healthy): {len(train_df):,}")
-    logger.info(f"  Val   (healthy): {len(val_df):,}")
-    for name, cls_df in test_by_class.items():
-        logger.info(f"  Test  ({name}): {len(cls_df):,}")
-    return {"train": train_df, "val": val_df, **test_by_class}
+    """Temporal split with autocorrelation-prevention gaps.
+
+    Splits the chronologically-sorted DataFrame into three periods:
+      - Train:  healthy rows only from the first `train_frac` of the timeline
+      - Val:    all rows (healthy + faults) from the middle `val_frac`
+      - Test:   all rows (healthy + faults) from the last portion
+
+    `gap_samples` rows are dropped at each split boundary to prevent
+    autocorrelation leakage between train/val and val/test.
+    """
+    n = len(df)
+    split1 = int(n * train_frac)
+    split2 = int(n * (train_frac + val_frac))
+
+    train_df = df.iloc[:split1]
+    train_df = train_df[train_df["label"] == 0].copy()
+
+    val_start = min(split1 + gap_samples, n)
+    val_end = split2
+    test_start = min(split2 + gap_samples, n)
+
+    val_df = df.iloc[val_start:val_end].copy()
+    test_df = df.iloc[test_start:].copy()
+
+    logger.info(f"  Split: total={n:,} | train_frac={train_frac} | val_frac={val_frac} | gap={gap_samples}")
+    logger.info(f"  Train (healthy-only): {len(train_df):,}")
+    logger.info(f"  Val   (healthy+faults): {len(val_df):,}")
+    logger.info(f"    Val labels: {dict(val_df['label'].value_counts().sort_index())}")
+    logger.info(f"  Test  (healthy+faults): {len(test_df):,}")
+    logger.info(f"    Test labels: {dict(test_df['label'].value_counts().sort_index())}")
+
+    return {"train": train_df, "val": val_df, "test": test_df}
 
 
 # ── Scaling ──────────────────────────────────────────────────────────────────
@@ -157,38 +177,6 @@ class MinMaxScaler:
 
     def transform(self, data: np.ndarray) -> np.ndarray:
         return (data - self.min_) / self.range_
-
-
-# ── Label-Pure Windowing ─────────────────────────────────────────────────────
-
-
-def create_label_pure_windows(
-    X: np.ndarray,
-    labels: np.ndarray,
-    window_size: int,
-    stride: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Create sliding windows keeping only those where ALL labels are identical.
-
-    Returns (X_windows, labels_windows) or (empty, empty) if no pure windows.
-    """
-    n = len(X)
-    if n < window_size:
-        return np.empty((0, window_size, X.shape[1]), dtype=X.dtype), np.empty((0,), dtype=labels.dtype)
-
-    windows_x: list[np.ndarray] = []
-    windows_y: list = []
-
-    for i in range(0, n - window_size + 1, stride):
-        window_labels = labels[i : i + window_size]
-        if np.all(window_labels == window_labels[0]):
-            windows_x.append(X[i : i + window_size])
-            windows_y.append(window_labels[0])
-
-    if not windows_x:
-        return np.empty((0, window_size, X.shape[1]), dtype=X.dtype), np.empty((0,), dtype=labels.dtype)
-
-    return np.stack(windows_x), np.array(windows_y)
 
 
 # ── Model Building & Training ────────────────────────────────────────────────
@@ -478,8 +466,10 @@ def run_experiment(
 
     # ── Load and split ───────────────────────────────────────────────────
     df = load_data(args.parquet_path)
-    train_frac = float(profile.get("train_frac", model_cfg.get("train_frac", 0.80)))
-    splits = split_healthy_faulty(df, healthy_train_frac=train_frac)
+    train_frac = float(profile.get("train_frac", 0.60))
+    val_frac = float(profile.get("val_frac", 0.20))
+    gap_samples = int(profile.get("split_gap_samples", 300))
+    splits = split_temporal_mixed(df, train_frac=train_frac, val_frac=val_frac, gap_samples=gap_samples)
 
     # ── Feature engineering ──────────────────────────────────────────────
     if feature_mode == "plus_physics":
@@ -534,7 +524,6 @@ def run_experiment(
     # ── GVSAO config ─────────────────────────────────────────────────────
     gvsao_cfg = model_cfg.get("gvsao", {})
     candidates = profile.get("gvsao_candidates", {})
-    window_sizes = candidates.get("window_size", [3, 5, 10, 20, 30, 60, 90])
     dmodel_nhead_pairs = candidates.get("d_model_nhead_pairs", [[64, 2]])
     num_enc_layers_list = candidates.get("num_encoder_layers", [1, 2, 3, 4])
     lstm_hidden_list = candidates.get("lstm_hidden", [16, 32, 64, 128])
@@ -545,42 +534,47 @@ def run_experiment(
             int(gvsao_cfg.get("batch_bounds", [16, 128])[0]),
             int(gvsao_cfg.get("batch_bounds", [16, 128])[1]) + 1,
         ))),
-        ParamDef(name="window_size", kind="discrete", candidates=window_sizes),
         ParamDef(name="d_model_nhead", kind="discrete", candidates=dmodel_nhead_pairs),
         ParamDef(name="num_encoder_layers", kind="discrete", candidates=num_enc_layers_list),
         ParamDef(name="lstm_hidden", kind="discrete", candidates=lstm_hidden_list),
+        ParamDef(name="threshold_percentile", kind="discrete", candidates=[90, 92, 95, 97, 99]),
     ]
+
+    pop_size = int(gvsao_cfg.get("population_size", 20))
+    max_gens = int(gvsao_cfg.get("max_generations", 10))
+    gvsao_epochs = int(gvsao_cfg.get("gvsao_epochs", 5))
+    final_epochs = int(profile.get("epochs", model_cfg.get("epochs", 50)))
+    final_patience = int(profile.get("patience", model_cfg.get("patience", 15)))
+
+    if args.mini:
+        pop_size = 5
+        max_gens = 2
+        gvsao_epochs = 2
+        final_epochs = 3
+        final_patience = 2
+        logger.info("  MINI RUN: reduced budget (pop={}, gen={}, gvsao_ep={}, final_ep={})",
+                    pop_size, max_gens, gvsao_epochs, final_epochs)
 
     gvsao_v2_config = GVSaoV2Config(
         param_defs=param_defs,
-        population_size=int(gvsao_cfg.get("population_size", 20)),
-        max_generations=int(gvsao_cfg.get("max_generations", 10)),
+        population_size=pop_size,
+        max_generations=max_gens,
         seed=args.seed,
     )
 
     dropout = float(profile.get("dropout", model_cfg.get("dropout", 0.1)))
-    gvsao_epochs = int(gvsao_cfg.get("gvsao_epochs", 5))
+    WINDOW_SIZE = 1  # point-wise reconstruction
 
-    # ── Window cache for GVSAO efficiency ────────────────────────────────
-    window_cache: dict[int, dict] = {}
+    # ── Prepare point-wise tensors ───────────────────────────────────────
+    tensors: dict[str, dict] = {}
+    for split_name, arr in scaled.items():
+        X_w = arr["X"][:, np.newaxis, :]  # (n, 1, D)
+        tensors[split_name] = {
+            "X": torch.from_numpy(X_w),
+            "labels": arr["labels"],
+        }
 
-    def get_windowed(window_size: int) -> dict:
-        w = int(window_size)
-        if w not in window_cache:
-            w_data: dict[str, dict] = {}
-            for split_name, arr in scaled.items():
-                X_w, labels_w = create_label_pure_windows(
-                    arr["X"], arr["labels"], w, stride=1
-                )
-                w_data[split_name] = {
-                    "X": torch.from_numpy(X_w),
-                    "labels": labels_w,
-                    "n_windows": len(X_w),
-                }
-            window_cache[w] = w_data
-        return window_cache[w]
-
-    # ── GVSAO fitness ────────────────────────────────────────────────────
+    # ── GVSAO fitness (F1-score based) ───────────────────────────────────
     def fitness_fn(params: dict[str, Any]) -> float:
         model = build_model(
             n_features=n_features,
@@ -591,17 +585,49 @@ def run_experiment(
             dropout=dropout,
         ).to(device)
 
-        w_data = get_windowed(params["window_size"])
-        X_train = w_data["train"]["X"]
-        X_val = w_data["val"]["X"]
-        effective_batch = min(params["batch_size"], X_train.shape[0])
+        X_tr = tensors["train"]["X"]
+        X_v = tensors["val"]["X"]
+        effective_batch = min(params["batch_size"], X_tr.shape[0])
 
         _, info = train_model(
-            model, X_train, X_val, device,
+            model, X_tr, X_v, device,
             lr=params["lr"], batch_size=effective_batch,
             epochs=gvsao_epochs, patience=3, verbose=False,
         )
-        return info["best_val_loss"]
+
+        # Compute per-feature errors
+        train_errs = evaluate_reconstruction_per_feature(model, X_tr, device, effective_batch)
+        val_errs = evaluate_reconstruction_per_feature(model, X_v, device, effective_batch)
+
+        # Use the threshold percentile from GVSAO search
+        pct = float(params["threshold_percentile"])
+        thresholds = np.percentile(train_errs, pct, axis=0)
+        norm_val = compute_normalized_errors(val_errs, thresholds)
+        val_scores = anomaly_score(norm_val)
+        val_preds = (val_scores > 1.0).astype(int)
+
+        val_labels = tensors["val"]["labels"]
+        true_bin = (val_labels > 0).astype(int)
+
+        # Per-class F1, averaged equally across the 4 fault classes
+        per_class_f1: list[float] = []
+        for cls in EVALUABLE_CLASSES:
+            mask = val_labels == cls
+            if int(mask.sum()) == 0:
+                continue
+            cls_preds = val_preds[mask]
+            cls_true = true_bin[mask]
+            tp_c = int(np.sum((cls_preds == 1) & (cls_true == 1)))
+            fp_c = int(np.sum((cls_preds == 1) & (cls_true == 0)))
+            fn_c = int(np.sum((cls_preds == 0) & (cls_true == 1)))
+            p_c = tp_c / (tp_c + fp_c) if (tp_c + fp_c) > 0 else 0.0
+            r_c = tp_c / (tp_c + fn_c) if (tp_c + fn_c) > 0 else 0.0
+            f1_c = 2 * p_c * r_c / (p_c + r_c) if (p_c + r_c) > 0 else 0.0
+            per_class_f1.append(f1_c)
+
+        macro_f1 = float(np.mean(per_class_f1)) if per_class_f1 else 0.0
+
+        return -macro_f1  # GVSAO minimises → return negative macro F1
 
     # ── GVSAO optimisation ───────────────────────────────────────────────
     final_params: dict[str, Any] = {}
@@ -616,20 +642,18 @@ def run_experiment(
         final_params = {
             "lr": args.lr or 0.001,
             "batch_size": args.batch_size or 32,
-            "window_size": args.window_size or 10,
             "d_model_nhead": [args.d_model or 64, args.nhead or 2],
             "num_encoder_layers": args.num_encoder_layers or 3,
             "lstm_hidden": args.lstm_hidden or 32,
+            "threshold_percentile": 95,
         }
 
     # ── Final training ───────────────────────────────────────────────────
-    final_window_size = int(final_params["window_size"])
-    w_data_final = get_windowed(final_window_size)
-    X_train_final = w_data_final["train"]["X"]
-    X_val_final = w_data_final["val"]["X"]
+    X_train_final = tensors["train"]["X"]
+    X_val_final = tensors["val"]["X"]
     final_batch = min(int(final_params["batch_size"]), X_train_final.shape[0])
 
-    logger.info(f"  Final training: W={final_window_size}, lr={final_params['lr']:.6f}, batch={final_batch}")
+    logger.info(f"  Final training: W={WINDOW_SIZE}, lr={final_params['lr']:.6f}, batch={final_batch}")
 
     model = build_model(
         n_features=n_features,
@@ -641,12 +665,10 @@ def run_experiment(
     ).to(device)
 
     t0 = time.perf_counter()
-    epochs = int(profile.get("epochs", model_cfg.get("epochs", 50)))
-    patience = int(profile.get("patience", model_cfg.get("patience", 15)))
     model, training_info = train_model(
         model, X_train_final, X_val_final, device,
         lr=float(final_params["lr"]), batch_size=final_batch,
-        epochs=epochs, patience=patience, verbose=True,
+        epochs=final_epochs, patience=final_patience, verbose=True,
     )
     train_time = time.perf_counter() - t0
     logger.info(f"  Training completed in {train_time:.1f}s")
@@ -659,7 +681,7 @@ def run_experiment(
         "model_state_dict": model.state_dict(),
         "n_features": n_features,
         "feature_names": sensor_cols_present,
-        "window_size": final_window_size,
+        "window_size": WINDOW_SIZE,
         "scaler_min": scaler.min_.tolist(),
         "scaler_max": scaler.max_.tolist(),
         "final_params": {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in final_params.items()},
@@ -669,106 +691,71 @@ def run_experiment(
 
     # ── Threshold computation ────────────────────────────────────────────
     percentiles = profile.get("threshold_percentiles", [90, 95, 99])
+    best_pct = float(final_params.get("threshold_percentile", 95))
     train_per_feature = evaluate_reconstruction_per_feature(model, X_train_final, device, final_batch)
     thresholds_dict = compute_per_feature_thresholds(train_per_feature, percentiles)
     logger.info(f"  Per-feature thresholds computed at percentiles: {percentiles}")
+    logger.info(f"  GVSAO-optimised threshold percentile: {best_pct}")
 
     # ── Evaluation ───────────────────────────────────────────────────────
     decision_logic = profile.get("decision_logic", "group")
     group_logic = profile.get("group_logic", "and")
     feature_groups = profile.get("feature_groups", {})
 
+    def _eval_split(errors, labels, thresholds):
+        """Evaluate one split (val or test) with per-class and overall metrics."""
+        scores = anomaly_score(compute_normalized_errors(errors, thresholds))
+        if decision_logic == "group":
+            grp = group_anomaly_score(errors, thresholds, sensor_cols_present, feature_groups)
+            preds = decide_group(grp, group_logic)
+        else:
+            preds = decide_all_features(errors, thresholds)
+
+        overall = evaluate_binary(preds, labels)
+        overall["pr_auc"] = round(evaluate_pr_auc(scores, labels), 6)
+
+        per_class: dict[str, dict] = {}
+        for cls in EVALUABLE_CLASSES:
+            mask = labels == cls
+            if int(mask.sum()) == 0:
+                continue
+            cls_res = evaluate_binary(preds[mask], labels[mask])
+            cls_res["pr_auc"] = round(evaluate_pr_auc(scores[mask], labels[mask]), 6)
+            per_class[FAULT_NAMES[cls]] = cls_res
+
+        return overall, per_class
+
     all_results: dict[str, dict] = {}
+    val_tensor = tensors["val"]["X"]
+    val_labels_arr = tensors["val"]["labels"]
+    test_tensor = tensors["test"]["X"]
+    test_labels_arr = tensors["test"]["labels"]
 
     for pct_key, pct_thresholds in thresholds_dict.items():
         pct_label = f"pct_{pct_key}"
 
-        # --- Val healthy ---
-        val_errors = evaluate_reconstruction_per_feature(model, X_val_final, device, final_batch)
-        val_scores = anomaly_score(compute_normalized_errors(val_errors, pct_thresholds))
+        val_errors = evaluate_reconstruction_per_feature(model, val_tensor, device, final_batch)
+        test_errors = evaluate_reconstruction_per_feature(model, test_tensor, device, final_batch)
 
-        if decision_logic == "group":
-            val_group_scores = group_anomaly_score(val_errors, pct_thresholds, sensor_cols_present, feature_groups)
-            val_preds = decide_group(val_group_scores, group_logic)
-        else:
-            val_preds = decide_all_features(val_errors, pct_thresholds)
-
-        val_result = evaluate_binary(val_preds, w_data_final["val"]["labels"])
-        val_fp = int(np.sum(val_preds))
-
-        # --- Per-class evaluation ---
-        class_results: dict[str, dict] = {}
-        for cls in EVALUABLE_CLASSES:
-            key = f"fault_class_{cls}"
-            if key not in w_data_final:
-                continue
-            cls_errors = evaluate_reconstruction_per_feature(
-                model, w_data_final[key]["X"], device, final_batch
-            )
-            if cls_errors.shape[0] == 0:
-                continue
-
-            cls_scores = anomaly_score(compute_normalized_errors(cls_errors, pct_thresholds))
-
-            if decision_logic == "group":
-                cls_group_scores = group_anomaly_score(cls_errors, pct_thresholds, sensor_cols_present, feature_groups)
-                cls_preds = decide_group(cls_group_scores, group_logic)
-            else:
-                cls_preds = decide_all_features(cls_errors, pct_thresholds)
-
-            cls_res = evaluate_binary(cls_preds, w_data_final[key]["labels"])
-            cls_res["pr_auc"] = round(evaluate_pr_auc(cls_scores, w_data_final[key]["labels"]), 6)
-            class_results[FAULT_NAMES[cls]] = cls_res
-
-        # --- Overall (val healthy + all fault) ---
-        all_fault_errors_list = []
-        all_fault_labels_list = []
-        for cls in EVALUABLE_CLASSES:
-            key = f"fault_class_{cls}"
-            if key not in w_data_final:
-                continue
-            all_fault_errors_list.append(
-                evaluate_reconstruction_per_feature(model, w_data_final[key]["X"], device, final_batch)
-            )
-            all_fault_labels_list.append(w_data_final[key]["labels"])
-
-        if all_fault_errors_list:
-            combined_errors = np.concatenate(all_fault_errors_list)
-            combined_labels = np.concatenate(all_fault_labels_list)
-            comb_norm = np.concatenate([val_errors, combined_errors])
-            comb_labels_all = np.concatenate([
-                np.zeros(len(val_errors), dtype=np.int32), combined_labels
-            ])
-
-            comb_scores = anomaly_score(compute_normalized_errors(comb_norm, pct_thresholds))
-
-            if decision_logic == "group":
-                comb_group = group_anomaly_score(comb_norm, pct_thresholds, sensor_cols_present, feature_groups)
-                comb_preds = decide_group(comb_group, group_logic)
-            else:
-                comb_preds = decide_all_features(comb_norm, pct_thresholds)
-
-            overall = evaluate_binary(comb_preds, comb_labels_all)
-            overall["pr_auc"] = round(evaluate_pr_auc(comb_scores, comb_labels_all), 6)
-        else:
-            overall = {}
+        val_overall, val_per_class = _eval_split(val_errors, val_labels_arr, pct_thresholds)
+        test_overall, test_per_class = _eval_split(test_errors, test_labels_arr, pct_thresholds)
 
         all_results[pct_label] = {
             "threshold_percentile": float(pct_key),
             "thresholds": pct_thresholds.tolist(),
-            "val_healthy_fp_rate": float(val_fp / len(val_errors)) if len(val_errors) > 0 else 0.0,
-            "val": val_result,
-            "per_class": class_results,
-            "overall": overall,
+            "val": {"overall": val_overall, "per_class": val_per_class},
+            "test": {"overall": test_overall, "per_class": test_per_class},
         }
 
-        f1_str = f"{overall.get('f1_score', 0):.4f}" if overall else "N/A"
         logger.info(
-            f"  [{pct_label}] Overall F1={f1_str} "
-            f"Precision={overall.get('precision', 0):.4f} "
-            f"Recall={overall.get('recall', 0):.4f} "
-            f"PR-AUC={overall.get('pr_auc', 0):.4f}"
-            if overall else f"  [{pct_label}] No overall result"
+            f"  [{pct_label}] Val  F1={val_overall['f1_score']:.4f} "
+            f"P={val_overall['precision']:.4f} R={val_overall['recall']:.4f} "
+            f"PR-AUC={val_overall.get('pr_auc', 0):.4f}"
+        )
+        logger.info(
+            f"  [{pct_label}] Test F1={test_overall['f1_score']:.4f} "
+            f"P={test_overall['precision']:.4f} R={test_overall['recall']:.4f} "
+            f"PR-AUC={test_overall.get('pr_auc', 0):.4f}"
         )
 
     # ── Assemble results payload ─────────────────────────────────────────
@@ -779,9 +766,14 @@ def run_experiment(
         "decision_logic": decision_logic,
         "group_logic": group_logic if decision_logic == "group" else None,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "window_size": final_window_size,
+        "window_size": WINDOW_SIZE,
         "input_features": sensor_cols_present,
         "n_features": n_features,
+        "split": {
+            "train_frac": train_frac,
+            "val_frac": val_frac,
+            "gap_samples": gap_samples,
+        },
         "model_config": {
             "d_model": final_params["d_model_nhead"][0],
             "nhead": final_params["d_model_nhead"][1],
@@ -836,7 +828,7 @@ def run_experiment(
         "training_info": training_info,
         "train_time": train_time,
         "gvsao_result": gvsao_result,
-        "final_window_size": final_window_size,
+        "final_window_size": WINDOW_SIZE,
         "all_results": all_results,
         "dropout": dropout,
     }
@@ -850,12 +842,16 @@ def main() -> None:
     parser.add_argument("--parquet-path", type=str, default=str(DEFAULT_DATA_PATH))
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--feature-mode", type=str, default="all",
+                        choices=["original", "plus_physics", "all"],
+                        help="Which feature set to train (default: both)")
+    parser.add_argument("--mini", action="store_true",
+                        help="Mini run: reduced GVSAO budget and epochs for quick validation")
     parser.add_argument("--no-gvsao", action="store_true", help="Skip GVSAO HPO")
     parser.add_argument("--no-mlflow", action="store_true", help="Disable MLflow logging")
     # Fallback values when --no-gvsao is used
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--window-size", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--nhead", type=int, default=None)
     parser.add_argument("--num-encoder-layers", type=int, default=None)
@@ -890,10 +886,11 @@ def main() -> None:
         except Exception as exc:
             logger.warning(f"MLflow init failed (non-fatal): {exc}")
 
-    # ── Run for both feature modes ───────────────────────────────────────
+    # ── Run selected feature modes ────────────────────────────────────────
     all_mode_results: list[dict] = []
+    modes_to_run = ["original", "plus_physics"] if args.feature_mode == "all" else [args.feature_mode]
 
-    for mode in ["original", "plus_physics"]:
+    for mode in modes_to_run:
         try:
             mode_result = run_experiment(mode, device, profile, model_cfg, args)
             all_mode_results.append(mode_result)
@@ -922,6 +919,7 @@ def main() -> None:
                 all_params[f"{mode}_best_val_loss"] = mr["training_info"]["best_val_loss"]
                 all_params[f"{mode}_dropout"] = mr["dropout"]
                 all_params[f"{mode}_gvsao_enabled"] = mr["gvsao_result"] is not None
+                all_params[f"{mode}_threshold_percentile"] = mr["final_params"].get("threshold_percentile", 95)
 
                 if mr["gvsao_result"]:
                     all_params[f"{mode}_gvsao_n_evals"] = mr["gvsao_result"].n_evals
@@ -930,17 +928,23 @@ def main() -> None:
                 all_metrics[f"{mode}_train_time_seconds"] = round(mr["train_time"], 1)
 
                 for pct_label, pct_res in mr["all_results"].items():
-                    overall = pct_res.get("overall", {})
-                    if overall:
-                        all_metrics[f"{mode}_{pct_label}_overall_f1"] = overall.get("f1_score", 0.0)
-                        all_metrics[f"{mode}_{pct_label}_overall_precision"] = overall.get("precision", 0.0)
-                        all_metrics[f"{mode}_{pct_label}_overall_recall"] = overall.get("recall", 0.0)
-                        all_metrics[f"{mode}_{pct_label}_overall_pr_auc"] = overall.get("pr_auc", 0.0)
+                    for split_name in ["val", "test"]:
+                        split_data = pct_res.get(split_name, {})
+                        overall = split_data.get("overall", {})
+                        if overall:
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_f1"] = overall.get("f1_score", 0.0)
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_precision"] = overall.get("precision", 0.0)
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_recall"] = overall.get("recall", 0.0)
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_pr_auc"] = overall.get("pr_auc", 0.0)
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_TP"] = float(overall.get("TP", 0))
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_FP"] = float(overall.get("FP", 0))
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_FN"] = float(overall.get("FN", 0))
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_TN"] = float(overall.get("TN", 0))
 
-                    for cls_name, cls_res in pct_res.get("per_class", {}).items():
-                        all_metrics[f"{mode}_{pct_label}_{cls_name}_f1"] = cls_res.get("f1_score", 0.0)
-                        all_metrics[f"{mode}_{pct_label}_{cls_name}_precision"] = cls_res.get("precision", 0.0)
-                        all_metrics[f"{mode}_{pct_label}_{cls_name}_recall"] = cls_res.get("recall", 0.0)
+                        for cls_name, cls_res in split_data.get("per_class", {}).items():
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_{cls_name}_f1"] = cls_res.get("f1_score", 0.0)
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_{cls_name}_precision"] = cls_res.get("precision", 0.0)
+                            all_metrics[f"{mode}_{pct_label}_{split_name}_{cls_name}_recall"] = cls_res.get("recall", 0.0)
 
                 all_params[f"{mode}_decision_logic"] = profile.get("decision_logic", "group")
                 if profile.get("decision_logic") == "group":

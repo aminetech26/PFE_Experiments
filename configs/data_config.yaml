@@ -467,9 +467,13 @@ feature_engineering:
       group_logic: "and"             # "and" | "or"  (only when decision_logic=group)
       threshold_percentiles: [90, 95, 99]
 
+      # --- Temporal split ---
+      train_frac: 0.70              # fraction of timeline for train (healthy-only)
+      val_frac: 0.20                # fraction of timeline for val (mixed healthy+faults)
+      split_gap_samples: 300        # rows dropped at train/val and val/test boundaries
+
       # --- GVSAO candidate lists ---
       gvsao_candidates:
-        window_size: [3, 5, 10, 20, 30, 60, 90]
         d_model_nhead_pairs:
           - [32, 2]
           - [64, 2]
