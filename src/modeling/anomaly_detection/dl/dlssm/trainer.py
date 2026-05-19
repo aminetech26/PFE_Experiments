@@ -617,12 +617,17 @@ class DLSSMLightningModule(pl.LightningModule):
             return
 
         if not self._in_sanity_check():
-            self.stability_unstable = True
-            self.stability_reason = f"raw_score_components: {'; '.join(bad_parts)}"
-            if any("nonfinite=True" in part for part in bad_parts):
+            nan_inf_parts = [p for p in bad_parts if "nonfinite=True" in p]
+            if nan_inf_parts:
+                # Only true NaN/Inf = corrupted forward pass; stop HPO trial and flag
+                self.stability_unstable = True
+                self.stability_reason = f"raw_score_nan_inf: {'; '.join(nan_inf_parts)}"
                 self.non_finite_events += 1
-            if self.hpo_mode:
-                self.trainer.should_stop = True
+                if self.hpo_mode:
+                    self.trainer.should_stop = True
+            # Large-but-finite scores are expected for extreme fault windows —
+            # combine_anomaly_score_components clamps them via max_abs_*_score_term.
+            # Log only; never abort training or HPO for finite values.
 
         if self._component_warned_batches < self.non_finite_warn_limit_per_epoch:
             logger.warning(
