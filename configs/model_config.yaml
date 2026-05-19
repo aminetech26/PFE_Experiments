@@ -323,7 +323,7 @@ training:
     reserve_cores: 1
     max_threads: null
     optuna_parallel_trials: 1
-    dl_num_workers: 12
+    dl_num_workers: 0
     dl_pin_memory: auto
-    dl_persistent_workers: true
-    dl_prefetch_factor: 4
+    dl_persistent_workers: false
+    dl_prefetch_factor: 2
