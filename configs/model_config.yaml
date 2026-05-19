@@ -180,16 +180,18 @@ anomaly_detection:
           lambda_pr_score: 0.1         # scoring weight for performance-ratio gap
 
         # Numerical stability guards for scoring / OC center
+        # NB: all values must be valid YAML float literals — PyYAML safe_load
+        # does NOT parse "1.0e5" or "1e5" as numbers (they become strings).
         stability:
           oc_center_max_norm: 50.0
-          score_instability_p95: 1.0e6
-          score_instability_max: 1.0e7
+          score_instability_p95: 1000000.0
+          score_instability_max: 10000000.0
           non_finite_warn_limit_per_epoch: 5
-          max_abs_oc_score_term: 1.0e5
-          max_abs_phys_score_term: 1.0e5
-          max_abs_pr_score_term: 1.0e5
-          max_abs_base_score_term: 1.0e5
-          max_abs_pred_score_term: 1.0e5
+          max_abs_oc_score_term: 100000.0
+          max_abs_phys_score_term: 100000.0
+          max_abs_pr_score_term: 100000.0
+          max_abs_base_score_term: 100000.0
+          max_abs_pred_score_term: 100000.0
 
         alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
         lambda_kl_score: 0.1

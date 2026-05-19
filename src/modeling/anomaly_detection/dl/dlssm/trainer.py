@@ -486,11 +486,11 @@ class DLSSMLightningModule(pl.LightningModule):
         self.score_instability_p95 = float(score_instability_p95)
         self.score_instability_max = float(score_instability_max)
         self.non_finite_warn_limit_per_epoch = int(non_finite_warn_limit_per_epoch)
-        self.max_abs_oc_score_term = max_abs_oc_score_term
-        self.max_abs_phys_score_term = max_abs_phys_score_term
-        self.max_abs_pr_score_term = max_abs_pr_score_term
-        self.max_abs_base_score_term = max_abs_base_score_term
-        self.max_abs_pred_score_term = max_abs_pred_score_term
+        self.max_abs_oc_score_term = float(max_abs_oc_score_term) if max_abs_oc_score_term is not None else None
+        self.max_abs_phys_score_term = float(max_abs_phys_score_term) if max_abs_phys_score_term is not None else None
+        self.max_abs_pr_score_term = float(max_abs_pr_score_term) if max_abs_pr_score_term is not None else None
+        self.max_abs_base_score_term = float(max_abs_base_score_term) if max_abs_base_score_term is not None else None
+        self.max_abs_pred_score_term = float(max_abs_pred_score_term) if max_abs_pred_score_term is not None else None
         self.hpo_mode = hpo_mode
 
         self._val_outputs: list[dict] = []
@@ -1522,11 +1522,16 @@ def run_dlssm(config: dict | None = None) -> None:
     non_finite_warn_limit_per_epoch: int = int(
         stability_cfg.get("non_finite_warn_limit_per_epoch", 5)
     )
-    max_abs_oc_score_term: float | None = stability_cfg.get("max_abs_oc_score_term", 1e5)
-    max_abs_phys_score_term: float | None = stability_cfg.get("max_abs_phys_score_term", 1e5)
-    max_abs_pr_score_term: float | None = stability_cfg.get("max_abs_pr_score_term", 1e5)
-    max_abs_base_score_term: float | None = stability_cfg.get("max_abs_base_score_term", 1e5)
-    max_abs_pred_score_term: float | None = stability_cfg.get("max_abs_pred_score_term", 1e5)
+    _raw_oc = stability_cfg.get("max_abs_oc_score_term")
+    max_abs_oc_score_term: float | None = float(_raw_oc) if _raw_oc is not None else 1e5
+    _raw_phys = stability_cfg.get("max_abs_phys_score_term")
+    max_abs_phys_score_term: float | None = float(_raw_phys) if _raw_phys is not None else 1e5
+    _raw_pr = stability_cfg.get("max_abs_pr_score_term")
+    max_abs_pr_score_term: float | None = float(_raw_pr) if _raw_pr is not None else 1e5
+    _raw_base = stability_cfg.get("max_abs_base_score_term")
+    max_abs_base_score_term: float | None = float(_raw_base) if _raw_base is not None else 1e5
+    _raw_pred = stability_cfg.get("max_abs_pred_score_term")
+    max_abs_pred_score_term: float | None = float(_raw_pred) if _raw_pred is not None else 1e5
 
     # Override variant to DLSSM-FDD when all stacked components are active
     if slow_context_enabled and expected_power_enabled and cvae_enabled:
