@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
+from torch.nn import functional
 
 
 def _masked_feature_mse(
@@ -100,8 +100,8 @@ def physics_consistency_loss(
     Physics constraints are only valid in physical (un-scaled) units.
     """
     x_hat_phys = inverse_standardize(x_hat_scaled, scaler_mean, scaler_scale)  # [B, W, F]
-    B = x_hat_phys.size(0)
-    loss = torch.zeros(B, device=x_hat_phys.device, dtype=x_hat_phys.dtype)
+    batch_size = x_hat_phys.size(0)
+    loss = torch.zeros(batch_size, device=x_hat_phys.device, dtype=x_hat_phys.dtype)
     n_components = 0
 
     def _get(name: str) -> torch.Tensor | None:
@@ -123,8 +123,8 @@ def physics_consistency_loss(
 
         r1 = (pdc1 - vdc1 * idc1) / pdc_scale              # [B, W]
         r2 = (pdc2 - vdc2 * idc2) / pdc_scale              # [B, W]
-        loss = loss + F.huber_loss(r1, torch.zeros_like(r1), delta=1.0, reduction="none").mean(1)
-        loss = loss + F.huber_loss(r2, torch.zeros_like(r2), delta=1.0, reduction="none").mean(1)
+        loss = loss + functional.huber_loss(r1, torch.zeros_like(r1), delta=1.0, reduction="none").mean(1)
+        loss = loss + functional.huber_loss(r2, torch.zeros_like(r2), delta=1.0, reduction="none").mean(1)
         n_components += 2
 
     # Phase 2: Imbalance consistency
@@ -134,19 +134,19 @@ def physics_consistency_loss(
         pow_imb = _get("power_imbalance")
         if all(v is not None for v in (pow_imb, pdc1, pdc2)):
             calc = (pdc1 - pdc2).abs() / (pdc1.abs() + pdc2.abs() + eps)
-            loss = loss + F.huber_loss(pow_imb, calc, delta=0.1, reduction="none").mean(1)
+            loss = loss + functional.huber_loss(pow_imb, calc, delta=0.1, reduction="none").mean(1)
             n_components += 1
 
         cur_imb = _get("current_imbalance")
         if all(v is not None for v in (cur_imb, idc1, idc2)):
             calc = (idc1 - idc2).abs() / (idc1.abs() + idc2.abs() + eps)
-            loss = loss + F.huber_loss(cur_imb, calc, delta=0.1, reduction="none").mean(1)
+            loss = loss + functional.huber_loss(cur_imb, calc, delta=0.1, reduction="none").mean(1)
             n_components += 1
 
         vol_imb = _get("voltage_imbalance")
         if all(v is not None for v in (vol_imb, vdc1, vdc2)):
             calc = (vdc1 - vdc2).abs() / (vdc1.abs() + vdc2.abs() + eps)
-            loss = loss + F.huber_loss(vol_imb, calc, delta=0.1, reduction="none").mean(1)
+            loss = loss + functional.huber_loss(vol_imb, calc, delta=0.1, reduction="none").mean(1)
             n_components += 1
 
     if n_components > 0:
@@ -176,85 +176,34 @@ def expected_voltage_loss(
         return torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
     x_voltage = x[:, :, expected_power_indices]                          # [B, W, n_voltage]
     residual = x_voltage - p_expected                                    # positive = above bound (normal)
-    pinball = tau * F.relu(residual) + (1.0 - tau) * F.relu(-residual)  # [B, W, n_voltage]
+    pinball = tau * functional.relu(residual) + (1.0 - tau) * functional.relu(-residual)  # [B, W, n_voltage]
     return pinball.mean(dim=-1).mean(dim=1)                              # [B]
 
 
-# Back-compat alias — existing call sites using the old name continue to work
-expected_power_loss = expected_voltage_loss
-
-
-def performance_gap_score(
+def voltage_drop_score(
     p_expected: torch.Tensor,
     x: torch.Tensor,
     expected_power_indices: list[int],
-    score_reduction: str = "mean",  # kept for API compat; always uses mean (degradation is sustained)
+    score_reduction: str = "mean",  # kept for API compat; always uses mean (sustained drift)
 ) -> torch.Tensor:
-    """Asymmetric performance-ratio score: ReLU(P_expected − P_observed).
+    """Voltage-Anomaly Head score: one-sided drop below the calibrated normal envelope.
 
-    Penalises under-performance only — the signature of slow degradation (class 2).
-    Always uses mean reduction: degradation is a persistent drift across the full window,
-    so mean accumulates the signal correctly regardless of the global score_reduction setting.
-    p_expected: [B, W, n_power]; x: [B, W, F]. Returns [B].
+    Computes ReLU(p_expected − x_vdc) — the gap between the head's lower-bound prediction
+    of the normal vdc envelope (trained via expected_voltage_loss) and the actual observed
+    voltage. Positive only when actual voltage falls below the calibrated lower bound,
+    which is the physical signature of the voltage-collapse fault family.
+
+    Always uses mean reduction over the window — voltage collapses (short-circuit, severe
+    degradation, soft-short) produce sustained drops, not peak events.
+
+    p_expected: [B, W, n_voltage]; x: [B, W, F]. Returns [B].
     """
     if not expected_power_indices or p_expected is None:
         return torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
-    x_power = x[:, :, expected_power_indices]  # [B, W, n_power]
-    gap = F.relu(p_expected - x_power)         # [B, W, n_power] — only under-performance
-    gap_t = gap.mean(dim=-1)                   # [B, W]
-    return gap_t.mean(dim=1)                   # always mean — sustained drift, not peak event
-
-
-def one_class_loss(q_mu: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """Deep SVDD-style compactness: pulls normal latent means toward center c.
-
-    q_mu: [B, W, Z]; c: [Z] (registered buffer, set after warmup).
-    Returns [B] window-mean squared distance.
-    """
-    return ((q_mu - c) ** 2).sum(dim=-1).mean(dim=1)
-
-
-def consistency_loss(q_mu_x: torch.Tensor, q_mu_aug: torch.Tensor) -> torch.Tensor:
-    """Consistency regularization: q_mu(x) ≈ q_mu(x_aug).
-
-    NOT Mean Teacher: there is no EMA teacher network — both forward passes
-    use the same (student) weights. The clean branch is detached only to
-    stop the augmented branch from pulling q_mu(x) toward itself, mirroring
-    the stop-gradient pattern from BYOL/SimSiam-style consistency.
-    Returns [B].
-    """
-    return ((q_mu_x.detach() - q_mu_aug) ** 2).sum(dim=-1).mean(dim=1)
-
-
-def apply_pv_safe_augmentation(
-    x: torch.Tensor,
-    noise_std: float = 0.05,
-    feature_dropout: float = 0.1,
-    protect_idx: list[int] | None = None,
-) -> torch.Tensor:
-    """PV-safe perturbation on standardized inputs [B, W, F].
-
-    - Gaussian sensor noise (std on the standardized scale).
-    - Per-feature dropout: zeroes whole features for the entire window.
-      Because inputs are standardized, zero == feature mean, so this
-      simulates *mean-imputed* sensor failure rather than a true stuck
-      reading or missing-data signal.
-    - protect_idx: feature indices to leave untouched. Required for CVAE
-      conditioning columns — perturbing them would shift the operating
-      regime, breaking the consistency contract q(z|x,c) ≈ q(z|x_aug,c).
-    """
-    noise = torch.randn_like(x) * noise_std
-    if protect_idx:
-        noise[:, :, protect_idx] = 0.0
-    out = x + noise
-
-    if feature_dropout > 0.0:
-        mask = (torch.rand(x.size(0), 1, x.size(2), device=x.device) > feature_dropout).float()
-        if protect_idx:
-            mask[:, :, protect_idx] = 1.0  # never drop conditioning features
-        out = out * mask
-    return out
-
+    x_voltage = x[:, :, expected_power_indices]  # [B, W, n_voltage]
+    gap = functional.relu(p_expected - x_voltage)         # [B, W, n_voltage] — only below-envelope
+    gap_t = gap.mean(dim=-1)                     # [B, W]
+    return gap_t.mean(dim=1)                     # [B] — sustained drift, not peak event
 
 def _reduce_score_window(t: torch.Tensor, score_reduction: str) -> torch.Tensor:
     if score_reduction == "mean":
@@ -288,8 +237,6 @@ def compute_anomaly_score_components(
     enable_imbalance: bool = True,
     x_pred: torch.Tensor | None = None,
     lambda_pred_score: float = 0.0,
-    c: torch.Tensor | None = None,
-    lambda_oc_score: float = 0.0,
     recon_mask: torch.Tensor | None = None,
     p_expected: torch.Tensor | None = None,
     lambda_pr_score: float = 0.0,
@@ -309,10 +256,6 @@ def compute_anomaly_score_components(
         pred_t = prediction_loss(x_pred, x, recon_mask=recon_mask)
         components["pred"] = _reduce_score_window(pred_t, score_reduction)
 
-    if lambda_oc_score > 0.0 and c is not None:
-        oc_t = ((q_mu - c) ** 2).sum(dim=-1)
-        components["oc"] = _reduce_score_window(oc_t, score_reduction)
-
     if (
         lambda_phys_score > 0.0
         and scaler_mean is not None
@@ -329,7 +272,7 @@ def compute_anomaly_score_components(
         )
 
     if lambda_pr_score > 0.0 and p_expected is not None and expected_power_indices:
-        components["pr"] = performance_gap_score(
+        components["pr"] = voltage_drop_score(
             p_expected, x, expected_power_indices, score_reduction
         )
 
@@ -339,12 +282,10 @@ def compute_anomaly_score_components(
 def combine_anomaly_score_components(
     components: dict[str, torch.Tensor],
     lambda_pred_score: float = 0.0,
-    lambda_oc_score: float = 0.0,
     lambda_phys_score: float = 0.0,
     lambda_pr_score: float = 0.0,
     max_abs_base_score_term: float | None = None,
     max_abs_pred_score_term: float | None = None,
-    max_abs_oc_score_term: float | None = None,
     max_abs_phys_score_term: float | None = None,
     max_abs_pr_score_term: float | None = None,
 ) -> torch.Tensor:
@@ -353,10 +294,6 @@ def combine_anomaly_score_components(
     if "pred" in components:
         base = base + lambda_pred_score * _sanitize_score_component(
             components["pred"], max_abs_pred_score_term
-        )
-    if "oc" in components:
-        base = base + lambda_oc_score * _sanitize_score_component(
-            components["oc"], max_abs_oc_score_term
         )
     if "phys" in components:
         base = base + lambda_phys_score * _sanitize_score_component(
@@ -386,15 +323,12 @@ def compute_anomaly_scores(
     enable_imbalance: bool = True,
     x_pred: torch.Tensor | None = None,
     lambda_pred_score: float = 0.0,
-    c: torch.Tensor | None = None,
-    lambda_oc_score: float = 0.0,
     recon_mask: torch.Tensor | None = None,
     p_expected: torch.Tensor | None = None,
     lambda_pr_score: float = 0.0,
     expected_power_indices: list[int] | None = None,
     max_abs_base_score_term: float | None = None,
     max_abs_pred_score_term: float | None = None,
-    max_abs_oc_score_term: float | None = None,
     max_abs_phys_score_term: float | None = None,
     max_abs_pr_score_term: float | None = None,
 ) -> torch.Tensor:
@@ -427,8 +361,6 @@ def compute_anomaly_scores(
         enable_imbalance=enable_imbalance,
         x_pred=x_pred,
         lambda_pred_score=lambda_pred_score,
-        c=c,
-        lambda_oc_score=lambda_oc_score,
         recon_mask=recon_mask,
         p_expected=p_expected,
         lambda_pr_score=lambda_pr_score,
@@ -437,12 +369,10 @@ def compute_anomaly_scores(
     return combine_anomaly_score_components(
         components,
         lambda_pred_score=lambda_pred_score,
-        lambda_oc_score=lambda_oc_score,
         lambda_phys_score=lambda_phys_score,
         lambda_pr_score=lambda_pr_score,
         max_abs_base_score_term=max_abs_base_score_term,
         max_abs_pred_score_term=max_abs_pred_score_term,
-        max_abs_oc_score_term=max_abs_oc_score_term,
         max_abs_phys_score_term=max_abs_phys_score_term,
         max_abs_pr_score_term=max_abs_pr_score_term,
     )

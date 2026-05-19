@@ -133,10 +133,10 @@ anomaly_detection:
         win_size: 60
         train_stride: 5
         eval_stride: 1
-        hidden_dim: 128
-        latent_dim: 32
-        encoder_dim: 256
-        decoder_dim: 256
+        hidden_dim: 64
+        latent_dim: 12
+        encoder_dim: 96
+        decoder_dim: 96
         n_gru_layers: 1
         dropout: 0.1
 
@@ -150,18 +150,7 @@ anomaly_detection:
           imbalance: true
           temperature_correction: false   # disabled until base is stable
 
-        # Semi-supervised paradigms — all on by default for DLSSM-FDD
-        one_class: false                  # Deep SVDD-style latent compactness (disabled)
-        lambda_oc: 0.0                    # training loss weight
-        lambda_oc_score: 0.0              # scoring weight
-        oc_warmup_epochs: 3               # train pure ELBO first; then init c
-
-        consistency: false                # disabled — half-implemented (no EMA teacher, no predictor head); KL + free-bits already regularize the latent
-        lambda_cons: 0.0
-        aug_noise_std: 0.05
-        aug_feature_dropout: 0.1
-
-        # Conditional VAE — on by default for DLSSM-FDD (expected_power_head requires it)
+        # Conditional VAE — on by default for DLSSM-FDD (voltage_anomaly_head requires it)
         cvae: true
         conditioning:
           features: [irr, pvt]
@@ -172,22 +161,20 @@ anomaly_detection:
           slow_context_enabled: true
           slow_context_seconds: 3600    # 1h of preceding context at slow_stride resolution
           slow_stride: 60              # 1 sample/min from 1Hz data
-          slow_hidden_dim: 64
-          n_attention_heads: 4
+          slow_hidden_dim: 32
+          se_reduction_ratio: 4
           expected_power_enabled: true
           expected_power_features: [vdc1, vdc2]  # vdc is the direct signature of resistive degradation (class 2); on datasets without per-string measurements use [vdc]
           lambda_expected: 0.5         # training weight for expected-voltage head pinball loss
           lambda_pr_score: 0.1         # scoring weight for voltage-drop gap
 
-        # Numerical stability guards for scoring / OC center
+        # Numerical stability guards for scoring
         # NB: all values must be valid YAML float literals — PyYAML safe_load
         # does NOT parse "1.0e5" or "1e5" as numbers (they become strings).
         stability:
-          oc_center_max_norm: 10000.0
           score_instability_p95: 1000000.0
           score_instability_max: 10000000.0
           non_finite_warn_limit_per_epoch: 5
-          max_abs_oc_score_term: 100000.0
           max_abs_phys_score_term: 100000.0
           max_abs_pr_score_term: 100000.0
           max_abs_base_score_term: 100000.0
