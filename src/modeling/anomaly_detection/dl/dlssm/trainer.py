@@ -1016,7 +1016,9 @@ class DLSSMLightningModule(pl.LightningModule):
         score_p95 = float(np.percentile(all_scores, 95))
         score_max = float(np.max(all_scores))
         c_norm = float(self.c.norm()) if bool(self.c_initialized) else 0.0
-        c_bad = bool(self.c_initialized) and (not np.isfinite(c_norm) or c_norm > self.oc_center_max_norm)
+        # Use 1% tolerance so a freshly-clipped center (norm == max_norm in float32) never
+        # triggers a false-positive that stops HPO trials prematurely.
+        c_bad = bool(self.c_initialized) and (not np.isfinite(c_norm) or c_norm > self.oc_center_max_norm * 1.01)
         score_guard_active = bool(self.c_initialized) or (self.current_epoch >= self.oc_warmup_epochs)
         score_bad = score_guard_active and (
             (not np.isfinite(score_p95))

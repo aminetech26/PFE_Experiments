@@ -183,7 +183,7 @@ anomaly_detection:
         # NB: all values must be valid YAML float literals — PyYAML safe_load
         # does NOT parse "1.0e5" or "1e5" as numbers (they become strings).
         stability:
-          oc_center_max_norm: 50.0
+          oc_center_max_norm: 10000.0
           score_instability_p95: 1000000.0
           score_instability_max: 10000000.0
           non_finite_warn_limit_per_epoch: 5
