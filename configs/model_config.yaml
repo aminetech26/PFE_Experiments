@@ -175,9 +175,9 @@ anomaly_detection:
           slow_hidden_dim: 64
           n_attention_heads: 4
           expected_power_enabled: true
-          expected_power_features: [pdc_temp_corrected_norm_irr]
-          lambda_expected: 0.5         # training weight for expected-power head MSE
-          lambda_pr_score: 0.1         # scoring weight for performance-ratio gap
+          expected_power_features: [vdc1, vdc2]  # vdc is the direct signature of resistive degradation (class 2); on datasets without per-string measurements use [vdc]
+          lambda_expected: 0.5         # training weight for expected-voltage head pinball loss
+          lambda_pr_score: 0.1         # scoring weight for voltage-drop gap
 
         # Numerical stability guards for scoring / OC center
         # NB: all values must be valid YAML float literals — PyYAML safe_load
@@ -195,7 +195,7 @@ anomaly_detection:
 
         alpha_pred: 0.1            # prediction head loss weight; 0.0 disables prediction head in loss
         lambda_kl_score: 0.1
-        lambda_phys_score: 0.03
+        lambda_phys_score: 0.15       # fixed (not HPO-tunable) — P=V×I violation is always an anomaly signal
         lambda_pred_score: 0.1
         score_reduction: max
 
@@ -226,7 +226,6 @@ anomaly_detection:
             lambda_phys:          {type: float, low: 0.02, high: 0.3, log: true}
             lambda_kl_score:      {type: float, low: 0.05, high: 0.3, log: true}
             lambda_pred_score:    {type: float, low: 0.0,  high: 0.3}
-            lambda_phys_score:    {type: float, low: 0.0,  high: 0.03}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
             # DLSSM-FDD HPO extensions (lambda_expected/pr_score tuned; slow/attn dims fixed)
             lambda_expected:      {type: float, low: 0.1, high: 1.0, log: true}

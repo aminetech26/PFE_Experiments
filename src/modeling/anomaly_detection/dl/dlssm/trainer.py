@@ -1807,7 +1807,7 @@ def run_dlssm(config: dict | None = None) -> None:
     if oc_enabled:
         score_components.append("one_class")
     if expected_power_enabled:
-        score_components.append("expected_power_pr")
+        score_components.append("expected_voltage_pr")
 
     metrics: dict = {
         "score_name": "dlssm_anomaly_score",

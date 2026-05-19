@@ -155,22 +155,33 @@ def physics_consistency_loss(
     return loss  # [B]
 
 
-def expected_power_loss(
+def expected_voltage_loss(
     p_expected: torch.Tensor,
     x: torch.Tensor,
     expected_power_indices: list[int],
+    tau: float = 0.15,
 ) -> torch.Tensor:
-    """MSE between expected power head output and observed (standardized) power signals.
+    """Pinball loss training p_expected to predict the τ-th percentile lower bound of normal vdc.
 
-    p_expected: [B, W, n_power] — head predictions for [pdc1, pdc2]
-    x:          [B, W, F]       — standardized observations
-    Returns [B] window-mean MSE. Silently returns zeros if indices missing.
+    With τ=0.15, p_expected learns the 15th-percentile of normal vdc given (irr, pvt).
+    Normal windows exceed p_expected ~85% of the time; genuinely degraded panels (series
+    resistance fault, class 2) produce a sustained voltage drop that falls below this bound,
+    making ReLU(p_expected − actual) a strong, low-noise anomaly signal.
+
+    p_expected: [B, W, n_voltage] — head predictions for [vdc1, vdc2] (or [vdc])
+    x:          [B, W, F]         — standardized observations
+    Returns [B] window-mean pinball loss. Silently returns zeros if indices missing.
     """
     if not expected_power_indices or p_expected is None:
         return torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
-    x_power = x[:, :, expected_power_indices]  # [B, W, n_power]
-    se = (p_expected - x_power) ** 2           # [B, W, n_power]
-    return se.mean(dim=-1).mean(dim=1)         # [B]
+    x_voltage = x[:, :, expected_power_indices]                          # [B, W, n_voltage]
+    residual = x_voltage - p_expected                                    # positive = above bound (normal)
+    pinball = tau * F.relu(residual) + (1.0 - tau) * F.relu(-residual)  # [B, W, n_voltage]
+    return pinball.mean(dim=-1).mean(dim=1)                              # [B]
+
+
+# Back-compat alias — existing call sites using the old name continue to work
+expected_power_loss = expected_voltage_loss
 
 
 def performance_gap_score(
