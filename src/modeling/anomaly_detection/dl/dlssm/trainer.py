@@ -634,9 +634,17 @@ class DLSSMLightningModule(pl.LightningModule):
         self._val_outputs.clear()
 
         if all_labels.sum() == 0 or all_labels.sum() == len(all_labels):
-            self.log("val_pr_auc", 0.0, prog_bar=True)
+            # Degenerate batch (sanity check or all-normal segment): log zeros with
+            # identical kwargs to the normal path so Lightning doesn't reject a kwarg mismatch.
             self.log("val_macro_per_class_pr_auc", 0.0, prog_bar=True)
             self.log("val_worst_class_pr_auc", 0.0, prog_bar=True)
+            self.log("val_pr_auc", 0.0)
+            self.log("val_roc_auc", 0.0)
+            self.log("val_f1_at_threshold", 0.0)
+            self.log("val_precision_at_threshold", 0.0)
+            self.log("val_recall_at_threshold", 0.0)
+            self.log("val_accuracy_at_threshold", 0.0)
+            self.log("val_threshold", 0.0)
             return
 
         val_pr_auc = float(average_precision_score(all_labels, all_scores))
@@ -648,18 +656,19 @@ class DLSSMLightningModule(pl.LightningModule):
         per_class_pr = compute_macro_per_class_pr_auc(
             labels=all_original_labels, scores=all_scores
         )
-        val_macro_pc_pr_auc = per_class_pr.get("macro_per_class_pr_auc") or 0.0
-        val_worst_pc_pr_auc = per_class_pr.get("worst_class_pr_auc") or 0.0
+        val_macro_pc_pr_auc = float(per_class_pr.get("macro_per_class_pr_auc") or 0.0)
+        val_worst_pc_pr_auc = float(per_class_pr.get("worst_class_pr_auc") or 0.0)
+        per_class_detail: dict = per_class_pr.get("per_class", {})
 
-        self.best_val_pr_auc = max(self.best_val_pr_auc, float(val_macro_pc_pr_auc))
+        self.best_val_pr_auc = max(self.best_val_pr_auc, val_macro_pc_pr_auc)
         self.val_threshold = threshold
         self._val_scores_np = all_scores
         self._val_labels_np = all_labels
         self._val_original_labels_np = all_original_labels
         self._val_group_ids_np = all_group_ids
 
-        self.log("val_macro_per_class_pr_auc", float(val_macro_pc_pr_auc), prog_bar=True)
-        self.log("val_worst_class_pr_auc", float(val_worst_pc_pr_auc), prog_bar=True)
+        self.log("val_macro_per_class_pr_auc", val_macro_pc_pr_auc, prog_bar=True)
+        self.log("val_worst_class_pr_auc", val_worst_pc_pr_auc, prog_bar=True)
         self.log("val_pr_auc", val_pr_auc)
         self.log("val_roc_auc", val_roc_auc)
         self.log("val_f1_at_threshold", val_f1)
@@ -667,6 +676,17 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("val_recall_at_threshold", val_rec)
         self.log("val_accuracy_at_threshold", val_acc)
         self.log("val_threshold", threshold)
+
+        # Per-class PR-AUC breakdown for visibility during training
+        pc_parts = "  ".join(
+            f"cls{k}={v:.3f}" for k, v in sorted(per_class_detail.items())
+        ) if per_class_detail else "n/a"
+        logger.info(
+            "Epoch {:3d} | macro_pc={:.4f}  worst={:.4f}  binary={:.4f}  thr={:.4f} | {}",
+            self.current_epoch,
+            val_macro_pc_pr_auc, val_worst_pc_pr_auc, val_pr_auc, threshold,
+            pc_parts,
+        )
 
     def test_step(self, batch: tuple, batch_idx: int) -> None:
         x, x_slow, labels, original_labels, group_ids = self._unpack_batch(batch)
