@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import yaml
 from loguru import logger
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.data.features import add_physics_features
@@ -162,21 +163,6 @@ def split_temporal_mixed(
     logger.info(f"    Test labels: {dict(test_df['label'].value_counts().sort_index())}")
 
     return {"train": train_df, "val": val_df, "test": test_df}
-
-
-# ── Scaling ──────────────────────────────────────────────────────────────────
-
-
-class MinMaxScaler:
-    def fit(self, data: np.ndarray) -> MinMaxScaler:
-        self.min_ = data.min(axis=0)
-        self.max_ = data.max(axis=0)
-        self.range_ = self.max_ - self.min_
-        self.range_[self.range_ < 1e-10] = 1.0
-        return self
-
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        return (data - self.min_) / self.range_
 
 
 # ── Model Building & Training ────────────────────────────────────────────────
@@ -519,12 +505,12 @@ def run_experiment(
         raw_arrays[split_name] = {"X": X_raw, "labels": labels_raw}
 
     # ── Scale ────────────────────────────────────────────────────────────
-    scaler = MinMaxScaler()
+    scaler = StandardScaler()
     scaler.fit(raw_arrays["train"]["X"])
     scaled: dict[str, dict[str, np.ndarray]] = {}
     for split_name, arr in raw_arrays.items():
         scaled[split_name] = {
-            "X": scaler.transform(arr["X"]),
+            "X": scaler.transform(arr["X"]).astype(np.float32),
             "labels": arr["labels"],
         }
 
@@ -684,8 +670,8 @@ def run_experiment(
         "n_features": n_features,
         "feature_names": sensor_cols_present,
         "window_size": WINDOW_SIZE,
-        "scaler_min": scaler.min_.tolist(),
-        "scaler_max": scaler.max_.tolist(),
+        "scaler_mean": scaler.mean_.tolist(),
+        "scaler_scale": scaler.scale_.tolist(),
         "final_params": {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in final_params.items()},
         "seed": args.seed,
     }, ckpt_path)

@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import numpy as np
+from loguru import logger
 
 
 @dataclass
@@ -179,6 +180,10 @@ def run_gvsao_v2(
                 params = decode_individual(population[i], config.param_defs)
                 fitness[i] = fitness_fn(params)
                 n_evals += 1
+                if verbose:
+                    f1 = -fitness[i] if fitness[i] <= 0 else 0.0
+                    logger.info(f"    eval {n_evals:3d}: F1={f1:.4f} | " +
+                                "  ".join(f"{k}={v}" for k, v in params.items()))
 
         sorted_idx = np.argsort(fitness)
         elite_indices = sorted_idx[:elite_size].tolist()
@@ -235,10 +240,13 @@ def run_gvsao_v2(
 
         if verbose:
             best_p = decode_individual(best_global, config.param_defs)
-            print(
+            gen_fitness = fitness[sorted_idx]
+            best_f1 = -gen_fitness[0] if gen_fitness[0] <= 0 else 0.0
+            mean_f1 = -float(np.mean(gen_fitness)) if np.mean(gen_fitness) <= 0 else 0.0
+            logger.info(
                 f"  GVSAO gen {gen+1}/{G} | "
-                f"best_fitness={best_global_fitness:.6f} | "
-                + " | ".join(f"{k}={v}" for k, v in best_p.items())
+                f"best_F1={best_f1:.4f} (mean={mean_f1:.4f}) | "
+                + "  ".join(f"{k}={v}" for k, v in best_p.items())
             )
 
         history.append({
