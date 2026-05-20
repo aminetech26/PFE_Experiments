@@ -468,7 +468,7 @@ feature_engineering:
       threshold_percentiles: [90, 95, 99]
 
       # --- Temporal split ---
-      train_frac: 0.70              # fraction of timeline for train (healthy-only)
+      train_frac: 0.80              # fraction of timeline for train (healthy-only)
       val_frac: 0.10                # fraction of timeline for val (mixed healthy+faults)
       split_gap_samples: 300        # rows dropped at train/val and val/test boundaries
 
