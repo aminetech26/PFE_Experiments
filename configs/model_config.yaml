@@ -216,8 +216,8 @@ anomaly_detection:
         # GVSAO budget
         gvsao:
           enabled: true
-          population_size: 20
-          max_generations: 10
+          population_size: 10
+          max_generations: 5
           gvsao_epochs: 5
           lr_bounds: [1.0e-5, 1.0e-1]
           batch_bounds: [16, 128]

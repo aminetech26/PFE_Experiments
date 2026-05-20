@@ -521,33 +521,31 @@ def run_experiment(
             "labels": arr["labels"],
         }
 
-    # ── GVSAO config ─────────────────────────────────────────────────────
-    gvsao_cfg = model_cfg.get("gvsao", {})
-    candidates = profile.get("gvsao_candidates", {})
-    dmodel_nhead_pairs = candidates.get("d_model_nhead_pairs", [[64, 2]])
-    num_enc_layers_list = candidates.get("num_encoder_layers", [1, 2, 3, 4])
-    lstm_hidden_list = candidates.get("lstm_hidden", [16, 32, 64, 128])
+    # ── Architecture defaults (from gtbad_model.py) ──────────────────────
+    ARCH_D_MODEL = 64
+    ARCH_NHEAD = 2
+    ARCH_NUM_ENCODER_LAYERS = 3
+    ARCH_LSTM_HIDDEN = 32
+    FITNESS_THRESHOLD_PCT = 95
 
+    # ── GVSAO config (lr + batch_size only) ───────────────────────────────
+    gvsao_cfg = model_cfg.get("gvsao", {})
     param_defs = [
         ParamDef(name="lr", kind="continuous_log", bounds=tuple(gvsao_cfg.get("lr_bounds", [1e-5, 1e-1]))),
         ParamDef(name="batch_size", kind="discrete", candidates=list(range(
             int(gvsao_cfg.get("batch_bounds", [16, 128])[0]),
             int(gvsao_cfg.get("batch_bounds", [16, 128])[1]) + 1,
         ))),
-        ParamDef(name="d_model_nhead", kind="discrete", candidates=dmodel_nhead_pairs),
-        ParamDef(name="num_encoder_layers", kind="discrete", candidates=num_enc_layers_list),
-        ParamDef(name="lstm_hidden", kind="discrete", candidates=lstm_hidden_list),
-        ParamDef(name="threshold_percentile", kind="discrete", candidates=[90, 92, 95, 97, 99]),
     ]
 
-    pop_size = int(gvsao_cfg.get("population_size", 20))
-    max_gens = int(gvsao_cfg.get("max_generations", 10))
+    pop_size = int(gvsao_cfg.get("population_size", 10))
+    max_gens = int(gvsao_cfg.get("max_generations", 5))
     gvsao_epochs = int(gvsao_cfg.get("gvsao_epochs", 5))
     final_epochs = int(profile.get("epochs", model_cfg.get("epochs", 50)))
     final_patience = int(profile.get("patience", model_cfg.get("patience", 15)))
 
     if args.mini:
-        pop_size = 5
+        pop_size = 4
         max_gens = 2
         gvsao_epochs = 2
         final_epochs = 3
@@ -574,14 +572,14 @@ def run_experiment(
             "labels": arr["labels"],
         }
 
-    # ── GVSAO fitness (F1-score based) ───────────────────────────────────
+    # ── GVSAO fitness (macro F1 over 5 classes) ──────────────────────────
     def fitness_fn(params: dict[str, Any]) -> float:
         model = build_model(
             n_features=n_features,
-            d_model=params["d_model_nhead"][0],
-            nhead=params["d_model_nhead"][1],
-            num_encoder_layers=params["num_encoder_layers"],
-            lstm_hidden=params["lstm_hidden"],
+            d_model=ARCH_D_MODEL,
+            nhead=ARCH_NHEAD,
+            num_encoder_layers=ARCH_NUM_ENCODER_LAYERS,
+            lstm_hidden=ARCH_LSTM_HIDDEN,
             dropout=dropout,
         ).to(device)
 
@@ -589,7 +587,7 @@ def run_experiment(
         X_v = tensors["val"]["X"]
         effective_batch = min(params["batch_size"], X_tr.shape[0])
 
-        _, info = train_model(
+        train_model(
             model, X_tr, X_v, device,
             lr=params["lr"], batch_size=effective_batch,
             epochs=gvsao_epochs, patience=3, verbose=False,
@@ -599,9 +597,7 @@ def run_experiment(
         train_errs = evaluate_reconstruction_per_feature(model, X_tr, device, effective_batch)
         val_errs = evaluate_reconstruction_per_feature(model, X_v, device, effective_batch)
 
-        # Use the threshold percentile from GVSAO search
-        pct = float(params["threshold_percentile"])
-        thresholds = np.percentile(train_errs, pct, axis=0)
+        thresholds = np.percentile(train_errs, FITNESS_THRESHOLD_PCT, axis=0)
         norm_val = compute_normalized_errors(val_errs, thresholds)
         val_scores = anomaly_score(norm_val)
         val_preds = (val_scores > 1.0).astype(int)
@@ -609,7 +605,7 @@ def run_experiment(
         val_labels = tensors["val"]["labels"]
         true_bin = (val_labels > 0).astype(int)
 
-        # Per-class F1, averaged equally across the 4 fault classes
+        # Per-class F1, averaged equally across all evaluable classes
         per_class_f1: list[float] = []
         for cls in EVALUABLE_CLASSES:
             mask = val_labels == cls
@@ -642,10 +638,6 @@ def run_experiment(
         final_params = {
             "lr": args.lr or 0.001,
             "batch_size": args.batch_size or 32,
-            "d_model_nhead": [args.d_model or 64, args.nhead or 2],
-            "num_encoder_layers": args.num_encoder_layers or 3,
-            "lstm_hidden": args.lstm_hidden or 32,
-            "threshold_percentile": 95,
         }
 
     # ── Final training ───────────────────────────────────────────────────
@@ -657,10 +649,10 @@ def run_experiment(
 
     model = build_model(
         n_features=n_features,
-        d_model=final_params["d_model_nhead"][0],
-        nhead=final_params["d_model_nhead"][1],
-        num_encoder_layers=final_params["num_encoder_layers"],
-        lstm_hidden=final_params["lstm_hidden"],
+        d_model=ARCH_D_MODEL,
+        nhead=ARCH_NHEAD,
+        num_encoder_layers=ARCH_NUM_ENCODER_LAYERS,
+        lstm_hidden=ARCH_LSTM_HIDDEN,
         dropout=dropout,
     ).to(device)
 
@@ -691,11 +683,9 @@ def run_experiment(
 
     # ── Threshold computation ────────────────────────────────────────────
     percentiles = profile.get("threshold_percentiles", [90, 95, 99])
-    best_pct = float(final_params.get("threshold_percentile", 95))
     train_per_feature = evaluate_reconstruction_per_feature(model, X_train_final, device, final_batch)
     thresholds_dict = compute_per_feature_thresholds(train_per_feature, percentiles)
     logger.info(f"  Per-feature thresholds computed at percentiles: {percentiles}")
-    logger.info(f"  GVSAO-optimised threshold percentile: {best_pct}")
 
     # ── Evaluation ───────────────────────────────────────────────────────
     decision_logic = profile.get("decision_logic", "group")
@@ -775,10 +765,10 @@ def run_experiment(
             "gap_samples": gap_samples,
         },
         "model_config": {
-            "d_model": final_params["d_model_nhead"][0],
-            "nhead": final_params["d_model_nhead"][1],
-            "num_encoder_layers": final_params["num_encoder_layers"],
-            "lstm_hidden": final_params["lstm_hidden"],
+            "d_model": ARCH_D_MODEL,
+            "nhead": ARCH_NHEAD,
+            "num_encoder_layers": ARCH_NUM_ENCODER_LAYERS,
+            "lstm_hidden": ARCH_LSTM_HIDDEN,
             "dropout": dropout,
         },
         "training": {
@@ -852,10 +842,6 @@ def main() -> None:
     # Fallback values when --no-gvsao is used
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--d-model", type=int, default=None)
-    parser.add_argument("--nhead", type=int, default=None)
-    parser.add_argument("--num-encoder-layers", type=int, default=None)
-    parser.add_argument("--lstm-hidden", type=int, default=None)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -909,17 +895,16 @@ def main() -> None:
                 mode = mr["results_payload"]["feature_mode"]
                 all_params[f"{mode}_n_features"] = mr["n_features"]
                 all_params[f"{mode}_window_size"] = mr["final_window_size"]
-                all_params[f"{mode}_d_model"] = mr["final_params"]["d_model_nhead"][0]
-                all_params[f"{mode}_nhead"] = mr["final_params"]["d_model_nhead"][1]
-                all_params[f"{mode}_num_encoder_layers"] = mr["final_params"]["num_encoder_layers"]
-                all_params[f"{mode}_lstm_hidden"] = mr["final_params"]["lstm_hidden"]
+                all_params[f"{mode}_d_model"] = 64
+                all_params[f"{mode}_nhead"] = 2
+                all_params[f"{mode}_num_encoder_layers"] = 3
+                all_params[f"{mode}_lstm_hidden"] = 32
                 all_params[f"{mode}_lr"] = float(mr["final_params"]["lr"])
                 all_params[f"{mode}_batch_size"] = mr["final_batch"]
                 all_params[f"{mode}_epochs_trained"] = mr["training_info"]["epochs_trained"]
                 all_params[f"{mode}_best_val_loss"] = mr["training_info"]["best_val_loss"]
                 all_params[f"{mode}_dropout"] = mr["dropout"]
                 all_params[f"{mode}_gvsao_enabled"] = mr["gvsao_result"] is not None
-                all_params[f"{mode}_threshold_percentile"] = mr["final_params"].get("threshold_percentile", 95)
 
                 if mr["gvsao_result"]:
                     all_params[f"{mode}_gvsao_n_evals"] = mr["gvsao_result"].n_evals

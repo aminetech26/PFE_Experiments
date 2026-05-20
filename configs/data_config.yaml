@@ -472,17 +472,6 @@ feature_engineering:
       val_frac: 0.20                # fraction of timeline for val (mixed healthy+faults)
       split_gap_samples: 300        # rows dropped at train/val and val/test boundaries
 
-      # --- GVSAO candidate lists ---
-      gvsao_candidates:
-        d_model_nhead_pairs:
-          - [32, 2]
-          - [64, 2]
-          - [64, 4]
-          - [128, 4]
-          - [128, 8]
-        num_encoder_layers: [1, 2, 3, 4]
-        lstm_hidden: [16, 32, 64, 128]
-
       # --- Feature groups for group-threshold decision logic ---
       # Features not in any group (irr, pvt, pdc) are excluded from group decisions.
       feature_groups:
