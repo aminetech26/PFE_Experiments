@@ -206,26 +206,6 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate_reconstruction_scalar(
-    model: nn.Module,
-    X: torch.Tensor,
-    device: torch.device,
-    batch_size: int = 256,
-) -> np.ndarray:
-    """Scalar reconstruction error per sample (sum over features and time)."""
-    model.eval()
-    all_errors: list[np.ndarray] = []
-    n = X.shape[0]
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        X_batch = X[start:end].to(device)
-        recon = model(X_batch)
-        err = torch.sum((X_batch - recon) ** 2, dim=(1, 2)).cpu().numpy()
-        all_errors.append(err)
-    return np.concatenate(all_errors) if all_errors else np.array([])
-
-
-@torch.no_grad()
 def evaluate_reconstruction_per_feature(
     model: nn.Module,
     X: torch.Tensor,
@@ -589,17 +569,11 @@ def run_experiment(
         val_labels = tensors["val"]["labels"]
         true_bin = (val_labels > 0).astype(int)
 
-        if threshold_mode == "single":
-            train_scalar = evaluate_reconstruction_scalar(model, X_tr, device, effective_batch)
-            val_scalar = evaluate_reconstruction_scalar(model, X_v, device, effective_batch)
-            t = np.percentile(train_scalar, FITNESS_THRESHOLD_PCT)
-            val_preds = (val_scalar > t).astype(int)
-        else:
-            train_errs = evaluate_reconstruction_per_feature(model, X_tr, device, effective_batch)
-            val_errs = evaluate_reconstruction_per_feature(model, X_v, device, effective_batch)
-            thresholds = np.percentile(train_errs, FITNESS_THRESHOLD_PCT, axis=0)
-            norm_val = compute_normalized_errors(val_errs, thresholds)
-            val_preds = (anomaly_score(norm_val) > 1.0).astype(int)
+        train_errs = evaluate_reconstruction_per_feature(model, X_tr, device, effective_batch)
+        val_errs = evaluate_reconstruction_per_feature(model, X_v, device, effective_batch)
+        thresholds = np.percentile(train_errs, FITNESS_THRESHOLD_PCT, axis=0)
+        norm_val = compute_normalized_errors(val_errs, thresholds)
+        val_preds = (anomaly_score(norm_val) > 1.0).astype(int)
 
         # Per-class F1, averaged equally across all evaluable classes
         per_class_f1: list[float] = []
@@ -679,23 +653,33 @@ def run_experiment(
 
     # ── Threshold computation ────────────────────────────────────────────
     percentiles = profile.get("threshold_percentiles", [90, 95, 99])
-    threshold_mode = args.threshold_mode
-
-    if threshold_mode == "single":
-        # Single scalar threshold (original GTBAD approach)
-        train_scalar = evaluate_reconstruction_scalar(model, X_train_final, device, final_batch)
-        train_scores = train_scalar  # raw MSE per sample
-        thresholds_dict = {str(pct): np.percentile(train_scalar, pct) for pct in percentiles}
-        logger.info(f"  Single-scalar thresholds computed at percentiles: {percentiles}")
-    else:
-        train_per_feature = evaluate_reconstruction_per_feature(model, X_train_final, device, final_batch)
-        thresholds_dict = compute_per_feature_thresholds(train_per_feature, percentiles)
-        logger.info(f"  Per-feature thresholds computed at percentiles: {percentiles}")
+    train_per_feature = evaluate_reconstruction_per_feature(model, X_train_final, device, final_batch)
+    thresholds_dict = compute_per_feature_thresholds(train_per_feature, percentiles)
+    logger.info(f"  Per-feature thresholds computed at percentiles: {percentiles}")
 
     # ── Evaluation ───────────────────────────────────────────────────────
     decision_logic = profile.get("decision_logic", "group")
     group_logic = profile.get("group_logic", "and")
     feature_groups = profile.get("feature_groups", {})
+
+    def _eval_split(errors, labels, thresholds):
+        scores = anomaly_score(compute_normalized_errors(errors, thresholds))
+        if decision_logic == "group":
+            grp = group_anomaly_score(errors, thresholds, sensor_cols_present, feature_groups)
+            preds = decide_group(grp, group_logic)
+        else:
+            preds = decide_all_features(errors, thresholds)
+        overall = evaluate_binary(preds, labels)
+        overall["pr_auc"] = round(evaluate_pr_auc(scores, labels), 6)
+        per_class = {}
+        for cls in EVALUABLE_CLASSES:
+            mask = labels == cls
+            if int(mask.sum()) == 0:
+                continue
+            cls_res = evaluate_binary(preds[mask], labels[mask])
+            cls_res["pr_auc"] = round(evaluate_pr_auc(scores[mask], labels[mask]), 6)
+            per_class[FAULT_NAMES[cls]] = cls_res
+        return overall, per_class
 
     all_results: dict[str, dict] = {}
     val_tensor = tensors["val"]["X"]
@@ -703,73 +687,21 @@ def run_experiment(
     test_tensor = tensors["test"]["X"]
     test_labels_arr = tensors["test"]["labels"]
 
-    for pct_key, threshold_val in thresholds_dict.items():
+    for pct_key, pct_thresholds in thresholds_dict.items():
         pct_label = f"pct_{pct_key}"
 
-        if threshold_mode == "single":
-            # Single scalar threshold
-            val_scalar = evaluate_reconstruction_scalar(model, val_tensor, device, final_batch)
-            test_scalar = evaluate_reconstruction_scalar(model, test_tensor, device, final_batch)
-            val_preds = (val_scalar > threshold_val).astype(int)
-            test_preds = (test_scalar > threshold_val).astype(int)
-            val_scores = val_scalar
-            test_scores = test_scalar
+        val_errors = evaluate_reconstruction_per_feature(model, val_tensor, device, final_batch)
+        test_errors = evaluate_reconstruction_per_feature(model, test_tensor, device, final_batch)
 
-            def _class_results(preds, scores, labels):
-                overall = evaluate_binary(preds, labels)
-                overall["pr_auc"] = round(evaluate_pr_auc(scores, labels), 6)
-                per_class = {}
-                for cls in EVALUABLE_CLASSES:
-                    mask = labels == cls
-                    if int(mask.sum()) == 0:
-                        continue
-                    cls_res = evaluate_binary(preds[mask], labels[mask])
-                    cls_res["pr_auc"] = round(evaluate_pr_auc(scores[mask], labels[mask]), 6)
-                    per_class[FAULT_NAMES[cls]] = cls_res
-                return overall, per_class
+        val_overall, val_per_class = _eval_split(val_errors, val_labels_arr, pct_thresholds)
+        test_overall, test_per_class = _eval_split(test_errors, test_labels_arr, pct_thresholds)
 
-            val_overall, val_per_class = _class_results(val_preds, val_scores, val_labels_arr)
-            test_overall, test_per_class = _class_results(test_preds, test_scores, test_labels_arr)
-
-            all_results[pct_label] = {
-                "threshold_percentile": float(pct_key),
-                "threshold": float(threshold_val),
-                "val": {"overall": val_overall, "per_class": val_per_class},
-                "test": {"overall": test_overall, "per_class": test_per_class},
-            }
-        else:
-            pct_thresholds = threshold_val  # per-feature: np.ndarray
-            val_errors = evaluate_reconstruction_per_feature(model, val_tensor, device, final_batch)
-            test_errors = evaluate_reconstruction_per_feature(model, test_tensor, device, final_batch)
-
-            def _eval_split(errors, labels, thresholds):
-                scores = anomaly_score(compute_normalized_errors(errors, thresholds))
-                if decision_logic == "group":
-                    grp = group_anomaly_score(errors, thresholds, sensor_cols_present, feature_groups)
-                    preds = decide_group(grp, group_logic)
-                else:
-                    preds = decide_all_features(errors, thresholds)
-                overall = evaluate_binary(preds, labels)
-                overall["pr_auc"] = round(evaluate_pr_auc(scores, labels), 6)
-                per_class = {}
-                for cls in EVALUABLE_CLASSES:
-                    mask = labels == cls
-                    if int(mask.sum()) == 0:
-                        continue
-                    cls_res = evaluate_binary(preds[mask], labels[mask])
-                    cls_res["pr_auc"] = round(evaluate_pr_auc(scores[mask], labels[mask]), 6)
-                    per_class[FAULT_NAMES[cls]] = cls_res
-                return overall, per_class
-
-            val_overall, val_per_class = _eval_split(val_errors, val_labels_arr, pct_thresholds)
-            test_overall, test_per_class = _eval_split(test_errors, test_labels_arr, pct_thresholds)
-
-            all_results[pct_label] = {
-                "threshold_percentile": float(pct_key),
-                "thresholds": pct_thresholds.tolist(),
-                "val": {"overall": val_overall, "per_class": val_per_class},
-                "test": {"overall": test_overall, "per_class": test_per_class},
-            }
+        all_results[pct_label] = {
+            "threshold_percentile": float(pct_key),
+            "thresholds": pct_thresholds.tolist(),
+            "val": {"overall": val_overall, "per_class": val_per_class},
+            "test": {"overall": test_overall, "per_class": test_per_class},
+        }
 
         logger.info(
             f"  [{pct_label}] Val  F1={val_overall['f1_score']:.4f} "
@@ -787,9 +719,8 @@ def run_experiment(
         "model": f"GTBAD v2 — {feature_mode}",
         "dataset": "Costa PV Fault Dataset",
         "feature_mode": feature_mode,
-        "threshold_mode": threshold_mode,
-        "decision_logic": decision_logic if threshold_mode != "single" else None,
-        "group_logic": group_logic if (threshold_mode != "single" and decision_logic == "group") else None,
+        "decision_logic": decision_logic,
+        "group_logic": group_logic if decision_logic == "group" else None,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "window_size": WINDOW_SIZE,
         "input_features": sensor_cols_present,
@@ -870,9 +801,6 @@ def main() -> None:
     parser.add_argument("--feature-mode", type=str, default="all",
                         choices=["original", "plus_physics", "all"],
                         help="Which feature set to train (default: both)")
-    parser.add_argument("--threshold-mode", type=str, default="per_feature",
-                        choices=["per_feature", "single"],
-                        help="Threshold mode: per_feature (default) or single scalar")
     parser.add_argument("--mini", action="store_true",
                         help="Mini run: reduced GVSAO budget and epochs for quick validation")
     parser.add_argument("--no-gvsao", action="store_true", help="Skip GVSAO HPO")
@@ -904,7 +832,6 @@ def main() -> None:
                 "model": "GTBAD_v2",
                 "dataset": "costa",
                 "profile": profile_name,
-                "threshold_mode": args.threshold_mode,
                 "seed": str(args.seed),
             })
             logger.info("MLflow tracking active")
