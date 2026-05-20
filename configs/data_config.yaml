@@ -469,7 +469,7 @@ feature_engineering:
 
       # --- Temporal split ---
       train_frac: 0.70              # fraction of timeline for train (healthy-only)
-      val_frac: 0.20                # fraction of timeline for val (mixed healthy+faults)
+      val_frac: 0.10                # fraction of timeline for val (mixed healthy+faults)
       split_gap_samples: 300        # rows dropped at train/val and val/test boundaries
 
       # --- Feature groups for group-threshold decision logic ---
