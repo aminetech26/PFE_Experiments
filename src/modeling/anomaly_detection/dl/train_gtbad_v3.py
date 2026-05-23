@@ -469,8 +469,8 @@ def main():
     parser.add_argument("--lstm-hidden", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--train-frac", type=float, default=0.60, help="Fraction of timeline for train (healthy-only)")
-    parser.add_argument("--val-frac", type=float, default=0.20, help="Fraction of timeline for val (mixed)")
+    parser.add_argument("--train-frac", type=float, default=0.80, help="Fraction of timeline for train (healthy-only)")
+    parser.add_argument("--val-frac", type=float, default=0.10, help="Fraction of timeline for val (mixed)")
     parser.add_argument("--gap-samples", type=int, default=300, help="Rows dropped at split boundaries")
     parser.add_argument("--threshold-percentile", type=float, default=95.0)
     parser.add_argument("--fitness-threshold-pct", type=float, default=95.0,
