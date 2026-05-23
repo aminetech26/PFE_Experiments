@@ -15,7 +15,7 @@ Key changes from train_gtbad.py (original first experiment):
 
 Everything else stays close to the original experiment:
   - Point-wise reconstruction (window_length = 1)
-  - MinMax scaler fitted on train only
+  - StandardScaler fitted on train only
   - Single-threshold anomaly detection (percentile of training errors)
   - 9 raw sensor features (vdc1, vdc2, idc1, idc2, pdc1, pdc2, pdc, irr, pvt)
   - Original GVSAO 2-parameter search space (learning_rate, batch_size)
@@ -41,6 +41,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from loguru import logger
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
@@ -111,8 +112,8 @@ def load_data(parquet_path: str | Path) -> pd.DataFrame:
 
 def split_temporal_mixed(
     df: pd.DataFrame,
-    train_frac: float = 0.60,
-    val_frac: float = 0.20,
+    train_frac: float = 0.80,
+    val_frac: float = 0.10,
     gap_samples: int = 300,
 ) -> dict[str, pd.DataFrame]:
     """Temporal split with autocorrelation-prevention gaps and mixed validation.
@@ -154,29 +155,12 @@ def split_temporal_mixed(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class MinMaxScaler:
-    """MinMax scaler that stores fit params for later transform."""
-
-    def fit(self, data: np.ndarray) -> MinMaxScaler:
-        self.min_ = data.min(axis=0)
-        self.max_ = data.max(axis=0)
-        self.range_ = self.max_ - self.min_
-        self.range_[self.range_ < 1e-10] = 1.0
-        return self
-
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        return (data - self.min_) / self.range_
-
-    def fit_transform(self, data: np.ndarray) -> np.ndarray:
-        return self.fit(data).transform(data)
-
-
 def prepare_tensors(
     splits: dict[str, pd.DataFrame],
-    scaler: MinMaxScaler | None = None,
+    scaler: StandardScaler | None = None,
     window_length: int = 1,
 ) -> dict[str, Any]:
-    """MinMax-normalize features and create windowed tensors.
+    """StandardScaler-normalize features and create windowed tensors.
 
     Scaler is fitted on TRAIN data only (leakage prevention).
     Window length = 1 for point-wise reconstruction.
@@ -185,7 +169,7 @@ def prepare_tensors(
     n_features = len(sensor_cols_present)
 
     if scaler is None:
-        scaler = MinMaxScaler()
+        scaler = StandardScaler()
         scaler.fit(splits["train"][sensor_cols_present].values)
 
     result: dict[str, Any] = {
@@ -604,8 +588,8 @@ def main():
         "model_state_dict": model.state_dict(),
         "n_features": n_features,
         "feature_names": feature_names,
-        "scaler_min": tensors["scaler"].min_.tolist(),
-        "scaler_max": tensors["scaler"].max_.tolist(),
+        "scaler_mean": tensors["scaler"].mean_.tolist(),
+        "scaler_scale": tensors["scaler"].scale_.tolist(),
         "args": vars(args),
     }, ckpt_path)
     logger.success(f"  Saved checkpoint → {ckpt_path}")
