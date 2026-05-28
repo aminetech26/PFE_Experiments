@@ -145,9 +145,9 @@ anomaly_detection:
         kl_warmup_epochs: 5
         free_bits: 0.05
 
-        # Deep SVDD
-        lambda_oc: 0.1
-        oc_warmup_epochs: 5
+        # Physics-conditioned prior (PC-DLSSM)
+        context_features: [irr, pvt]   # exogenous sensors used to condition p_c(z|c_t)
+        gamma_pc: 1.0                  # weight of aux KL(stop_grad(q) || p_c) in training loss
 
         # Numerical stability guards for scoring
         # NB: all values must be valid YAML float literals — PyYAML safe_load
@@ -157,7 +157,6 @@ anomaly_detection:
           score_instability_max: 10000000.0
           non_finite_warn_limit_per_epoch: 5
           max_abs_base_score_term: 100000.0
-          max_abs_oc_score_term: 100000.0
 
         lambda_kl_score: 0.1
         score_reduction: mean
@@ -180,7 +179,7 @@ anomaly_detection:
           min_hpo_epochs: 10
           patience_fraction: 0.33
           min_hpo_patience: 5
-          pruning_warmup_epochs: 7    # must be > oc_warmup_epochs (5) to avoid pruning on fallback recon score
+          pruning_warmup_epochs: 5
           search_space:
             learning_rate:        {type: float, low: 1.0e-4, high: 7.0e-4, log: true}
             weight_decay:         {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
@@ -188,7 +187,7 @@ anomaly_detection:
             free_bits:            {type: categorical, choices: [0.0, 0.05]}
             lambda_kl_score:      {type: float, low: 0.05, high: 0.3, log: true}
             score_reduction:      {type: categorical, choices: [center, mean, max]}
-            lambda_oc:            {type: float, low: 0.01, high: 0.5, log: true}
+            gamma_pc:             {type: float, low: 0.1, high: 5.0, log: true}
 
       pv_gdn:
         win_size: 30

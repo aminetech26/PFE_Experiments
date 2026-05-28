@@ -1,0 +1,47 @@
+{
+  "task": "anomaly_semisup",
+  "model": "dlssm",
+  "model_family": "anomaly_dl",
+  "model_artifact": "checkpoints/best.ckpt",
+  "feature_names": [
+    "current_imbalance",
+    "dI_dt",
+    "dP_dt",
+    "dV_dt",
+    "idc1",
+    "idc2",
+    "irr",
+    "pdc1",
+    "pdc2",
+    "pdc_temp_corrected",
+    "pdc_temp_corrected_norm_irr",
+    "power_imbalance",
+    "pvt",
+    "temp_loss_pmax",
+    "vdc1",
+    "vdc2",
+    "voltage_imbalance"
+  ],
+  "label_column": "label",
+  "threshold": 6.453912258148193,
+  "scaler_artifact": "scaler.joblib",
+  "classes": [
+    "0.0",
+    "1.0",
+    "2.0",
+    "3.0",
+    "4.0"
+  ],
+  "window_size": 60,
+  "score_direction": "higher_is_more_anomalous",
+  "checkpoint_available": true,
+  "threshold_policy": "q95_normal_val",
+  "selection_metric": "val_macro_per_class_pr_auc_monitor",
+  "score_name": "dlssm_score",
+  "score_components": [
+    "reconstruction",
+    "kl"
+  ],
+  "score_reduction": "mean",
+  "score_calibration_artifact": "score_calibration.json"
+}

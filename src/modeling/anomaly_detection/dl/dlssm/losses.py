@@ -84,6 +84,37 @@ def radial_deviation_score(
     return _sanitize_score_component(score, max_abs)
 
 
+def kl_q_pc_aux(
+    q_mu: torch.Tensor,
+    q_logvar: torch.Tensor,
+    p_c_mu: torch.Tensor,
+    p_c_logvar: torch.Tensor,
+    free_bits: float = 0.0,
+) -> torch.Tensor:
+    """KL(stop_grad(q) || p_c): gradient flows only into p_c weights. Returns [B, W]."""
+    return kl_divergence(q_mu.detach(), q_logvar.detach(), p_c_mu, p_c_logvar, free_bits)
+
+
+def compute_pc_anomaly_scores(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    q_mu: torch.Tensor,
+    q_logvar: torch.Tensor,
+    p_c_mu: torch.Tensor,
+    p_c_logvar: torch.Tensor,
+    score_recon_norm: float = 1.0,
+    score_kl_pc_norm: float = 1.0,
+    score_reduction: str = "center",
+    max_abs: float | None = None,
+) -> torch.Tensor:
+    """PC-DLSSM score: normalized(recon) + normalized(KL(q||p_c)). Returns [B]."""
+    recon_t = reconstruction_loss(x_hat, x)
+    kl_t = kl_divergence(q_mu, q_logvar, p_c_mu, p_c_logvar)
+    combined = recon_t / max(score_recon_norm, 1e-8) + kl_t / max(score_kl_pc_norm, 1e-8)
+    score = _reduce_score_window(combined, score_reduction)
+    return _sanitize_score_component(score, max_abs)
+
+
 def compute_anomaly_scores(
     x: torch.Tensor,
     x_hat: torch.Tensor,

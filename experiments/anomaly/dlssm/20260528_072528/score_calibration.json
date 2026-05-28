@@ -1,0 +1,64 @@
+{
+  "score_direction": "higher_is_more_anomalous",
+  "threshold_policy": "q95_normal_val",
+  "threshold": 6.453912258148193,
+  "test_not_used_for_calibration": true,
+  "score_stats": {
+    "score_name": "dlssm_score",
+    "score_reduction": "mean",
+    "lambda_kl_score": 0.1,
+    "score_components": [
+      "reconstruction",
+      "kl"
+    ]
+  },
+  "threshold_quantile": 0.95,
+  "candidate_per_true_class_thresholds": {
+    "threshold_policy": "validation_true_class_pr_curve_f1",
+    "deployment_ready": false,
+    "intended_use": "diagnostic_or_candidate_class_conditioned_gate",
+    "normal_label": 0,
+    "thresholds": {
+      "1": {
+        "threshold": 7.586928367614746,
+        "val_f1": 0.995433789954338,
+        "val_support_fault": 109,
+        "val_support_normal": 1245,
+        "test_precision": 1.0,
+        "test_recall": 1.0,
+        "test_f1": 1.0,
+        "test_pr_auc": 1.0
+      },
+      "2": {
+        "threshold": 1.351844310760498,
+        "val_f1": 0.7191011235955056,
+        "val_support_fault": 240,
+        "val_support_normal": 1245,
+        "test_precision": 0.38388625592417064,
+        "test_recall": 0.9204545454545454,
+        "test_f1": 0.5418060200668896,
+        "test_pr_auc": 0.2682667037360945
+      },
+      "3": {
+        "threshold": 509.3182067871094,
+        "val_f1": 1.0,
+        "val_support_fault": 113,
+        "val_support_normal": 1245,
+        "test_precision": 1.0,
+        "test_recall": 0.5068493150684932,
+        "test_f1": 0.6727272727272727,
+        "test_pr_auc": 1.0000000000000002
+      },
+      "4": {
+        "threshold": 1.4213231801986694,
+        "val_f1": 0.9717416378316032,
+        "val_support_fault": 3419,
+        "val_support_normal": 1245,
+        "test_precision": 0.9436416184971098,
+        "test_recall": 0.8081683168316832,
+        "test_f1": 0.8706666666666667,
+        "test_pr_auc": 0.9776082410787984
+      }
+    }
+  }
+}

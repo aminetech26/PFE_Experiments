@@ -1,0 +1,33 @@
+{
+  "variant": "DLSSM",
+  "win_size": 60,
+  "train_stride": 5,
+  "eval_stride": 1,
+  "hidden_dim": 64,
+  "latent_dim": 12,
+  "encoder_dim": 96,
+  "decoder_dim": 96,
+  "n_gru_layers": 1,
+  "dropout": 0.1,
+  "se_reduction_ratio": 4,
+  "beta_kl": 0.1,
+  "kl_warmup_epochs": 5,
+  "free_bits": 0.05,
+  "context_features": [
+    "irr",
+    "pvt"
+  ],
+  "gamma_pc": 1.0,
+  "lambda_kl_score": 0.1,
+  "score_reduction": "mean",
+  "batch_size": 1024,
+  "learning_rate": 0.001,
+  "weight_decay": 1e-05,
+  "gradient_clip_val": 1.0,
+  "accelerator": "auto",
+  "precision": "32-true",
+  "scaling": "standard",
+  "max_epochs_actual": 1,
+  "n_features": 17,
+  "seed": 42
+}

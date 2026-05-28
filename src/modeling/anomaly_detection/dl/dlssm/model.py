@@ -49,7 +49,13 @@ class FeatureSEBlock(nn.Module):
 
 
 class DeepLatentStateSpaceModel(nn.Module):
-    """Causal deep latent state-space model (pure core variant)."""
+    """Causal deep latent state-space model with optional physics-conditioned prior (PC-DLSSM).
+
+    When n_context_features > 0, a second prior p_c(z|c_t) is parameterised by
+    exogenous context (e.g. irradiance, module temperature).  This prior is used
+    only for anomaly scoring; training uses the dynamics prior p_h(z|h_{t-1})
+    via the standard ELBO, with an auxiliary loss that fits p_c to the posterior.
+    """
 
     def __init__(
         self,
@@ -62,11 +68,13 @@ class DeepLatentStateSpaceModel(nn.Module):
         n_gru_layers: int = 1,
         dropout: float = 0.1,
         se_reduction_ratio: int = 4,
+        n_context_features: int = 0,
     ) -> None:
         super().__init__()
         self.win_size = win_size
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.n_context_features = n_context_features
 
         self.feature_attn = FeatureSEBlock(
             n_features=n_features,
@@ -97,11 +105,20 @@ class DeepLatentStateSpaceModel(nn.Module):
             nn.Linear(decoder_dim, n_features),
         )
 
+        # Context prior: p_c(z | c_t).  Only present when context features are available.
+        if n_context_features > 0:
+            self.context_prior_net: nn.Module | None = nn.Sequential(
+                _ResidualMLP(n_context_features, encoder_dim, dropout),
+                nn.Linear(encoder_dim, 2 * latent_dim),
+            )
+        else:
+            self.context_prior_net = None
+
     def _split_params(self, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mu, logvar = params.chunk(2, dim=-1)
         return mu, logvar.clamp(-10.0, 10.0)
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, c: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         x_proj = self.feature_attn(x)
         h_seq, _ = self.gru(x_proj)
 
@@ -121,7 +138,7 @@ class DeepLatentStateSpaceModel(nn.Module):
         dec_input = torch.cat([z, h_prev], dim=-1)
         x_hat = self.decoder(dec_input)
 
-        return {
+        result: dict[str, torch.Tensor] = {
             "x_hat": x_hat,
             "q_mu": q_mu,
             "q_logvar": q_logvar,
@@ -131,3 +148,10 @@ class DeepLatentStateSpaceModel(nn.Module):
             "h": h_seq,
             "h_prev": h_prev,
         }
+
+        if c is not None and self.context_prior_net is not None:
+            p_c_mu, p_c_logvar = self._split_params(self.context_prior_net(c))
+            result["p_c_mu"] = p_c_mu
+            result["p_c_logvar"] = p_c_logvar
+
+        return result

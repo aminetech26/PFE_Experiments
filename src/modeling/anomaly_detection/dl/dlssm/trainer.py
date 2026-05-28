@@ -32,9 +32,9 @@ from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.dlssm.losses import (
     compute_anomaly_scores,
+    compute_pc_anomaly_scores,
     kl_divergence,
-    one_class_loss,
-    radial_deviation_score,
+    kl_q_pc_aux,
     reconstruction_loss,
 )
 from src.modeling.anomaly_detection.dl.dlssm.model import DeepLatentStateSpaceModel
@@ -153,6 +153,8 @@ def _run_hpo(
     scaler_scale_t: torch.Tensor,
     feature_idx: dict,
     n_features: int,
+    n_context_features: int,
+    context_feature_indices: list[int],
     seed: int,
     n_trials_override: int | None,
     se_reduction_ratio: int = 4,
@@ -160,9 +162,7 @@ def _run_hpo(
     score_instability_max: float = 1e7,
     non_finite_warn_limit_per_epoch: int = 5,
     max_abs_base_score_term: float | None = 1e5,
-    lambda_oc: float = 0.0,
-    oc_warmup_epochs: int = 5,
-    max_abs_oc_score_term: float | None = 1e5,
+    gamma_pc: float = 1.0,
 ) -> dict:
     """Run Optuna TPE + ASHA sweep. Returns best params dict."""
     search_space = hpo_cfg.get("search_space", {})
@@ -193,12 +193,14 @@ def _run_hpo(
             n_gru_layers=int(cfg.get("n_gru_layers", 1)),
             dropout=float(suggested.get("dropout", cfg.get("dropout", 0.1))),
             se_reduction_ratio=se_reduction_ratio,
+            n_context_features=n_context_features,
         )
         hpo_lit = DLSSMLightningModule(
             model=hpo_model,
             scaler_mean=scaler_mean_t,
             scaler_scale=scaler_scale_t,
             feature_idx=feature_idx,
+            context_feature_indices=context_feature_indices,
             learning_rate=float(suggested.get("learning_rate", cfg.get("learning_rate", 1e-3))),
             weight_decay=float(suggested.get("weight_decay", cfg.get("weight_decay", 1e-5))),
             gradient_clip_val=float(cfg.get("gradient_clip_val", 1.0)),
@@ -216,9 +218,7 @@ def _run_hpo(
             score_instability_max=score_instability_max,
             non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
             max_abs_base_score_term=max_abs_base_score_term,
-            lambda_oc=float(suggested.get("lambda_oc", lambda_oc)),
-            oc_warmup_epochs=oc_warmup_epochs,
-            max_abs_oc_score_term=max_abs_oc_score_term,
+            gamma_pc=float(suggested.get("gamma_pc", gamma_pc)),
             hpo_mode=True,
         )
 
@@ -324,6 +324,7 @@ class DLSSMLightningModule(pl.LightningModule):
         scaler_mean: torch.Tensor,
         scaler_scale: torch.Tensor,
         feature_idx: dict[str, int],
+        context_feature_indices: list[int] | None = None,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
         gradient_clip_val: float = 1.0,
@@ -342,10 +343,8 @@ class DLSSMLightningModule(pl.LightningModule):
         score_instability_max: float = 1e7,
         non_finite_warn_limit_per_epoch: int = 5,
         max_abs_base_score_term: float | None = 1e5,
-        # Deep SVDD
-        lambda_oc: float = 0.0,
-        oc_warmup_epochs: int = 5,
-        max_abs_oc_score_term: float | None = 1e5,
+        # Physics-conditioned prior
+        gamma_pc: float = 1.0,
         hpo_mode: bool = False,
     ) -> None:
         super().__init__()
@@ -353,6 +352,7 @@ class DLSSMLightningModule(pl.LightningModule):
         self.register_buffer("scaler_mean", scaler_mean)
         self.register_buffer("scaler_scale", scaler_scale)
         self.feature_idx = feature_idx
+        self.context_feature_indices: list[int] = list(context_feature_indices or [])
 
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -370,18 +370,13 @@ class DLSSMLightningModule(pl.LightningModule):
         self.score_instability_max = float(score_instability_max)
         self.non_finite_warn_limit_per_epoch = int(non_finite_warn_limit_per_epoch)
         self.max_abs_base_score_term = float(max_abs_base_score_term) if max_abs_base_score_term is not None else None
-        self.lambda_oc = float(lambda_oc)
-        self.oc_warmup_epochs = int(oc_warmup_epochs)
-        self.max_abs_oc_score_term = float(max_abs_oc_score_term) if max_abs_oc_score_term is not None else None
+        self.gamma_pc = float(gamma_pc)
         self.hpo_mode = hpo_mode
 
-        # SVDD center — registered as buffer (persisted in checkpoint, moved to device automatically)
-        self.register_buffer("oc_center", torch.zeros(latent_dim))
-        self.register_buffer("oc_center_initialized", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer("oc_radius_center", torch.tensor(0.0))
-        self.register_buffer("oc_radius_scale", torch.tensor(1.0))
-        # Keep python mirror for readability; source of truth is the buffer.
-        self.c_initialized: bool = bool(self.oc_center_initialized.item())
+        # PC score normalizers — computed from train data after KL warmup
+        self.register_buffer("score_recon_norm", torch.tensor(1.0))
+        self.register_buffer("score_kl_pc_norm", torch.tensor(1.0))
+        self.register_buffer("pc_scoring_active", torch.tensor(False, dtype=torch.bool))
 
         self._val_outputs: list[dict] = []
         self._test_outputs: list[dict] = []
@@ -402,19 +397,14 @@ class DLSSMLightningModule(pl.LightningModule):
         self._test_original_labels_np: np.ndarray | None = None
         self._test_group_ids_np: np.ndarray | None = None
 
-    def _svdd_scoring_active(self) -> bool:
-        if self.lambda_oc <= 0.0:
-            return False
-        return bool(self.oc_center_initialized.item())
+    def _pc_scoring_active(self) -> bool:
+        return bool(self.pc_scoring_active.item()) and bool(self.context_feature_indices)
 
-    def _set_center_initialized(self, value: bool) -> None:
-        self.oc_center_initialized.fill_(bool(value))
-        self.c_initialized = bool(value)
-
-    def on_load_checkpoint(self, checkpoint: dict) -> None:
-        # Sync Python mirror after PyTorch Lightning restores buffers via load_state_dict.
-        if "oc_center_initialized" in checkpoint.get("state_dict", {}):
-            self.c_initialized = bool(checkpoint["state_dict"]["oc_center_initialized"].item())
+    def _extract_context(self, x: torch.Tensor) -> torch.Tensor | None:
+        if not self.context_feature_indices:
+            return None
+        idx = torch.tensor(self.context_feature_indices, device=x.device, dtype=torch.long)
+        return x[:, :, idx]  # [B, W, n_ctx]
 
     def _unpack_batch(self, batch: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list | None]:
         x = batch[0]
@@ -444,7 +434,7 @@ class DLSSMLightningModule(pl.LightningModule):
 
     def _check_model_outputs_finite(self, out: dict, stage: str, batch_idx: int) -> None:
         """Detect non-finite model outputs before score sanitization can hide them."""
-        names = ("x_hat", "q_mu", "q_logvar", "p_mu", "p_logvar")
+        names = ("x_hat", "q_mu", "q_logvar", "p_mu", "p_logvar", "p_c_mu", "p_c_logvar")
         bad_parts: list[str] = []
         for name in names:
             value = out.get(name)
@@ -486,55 +476,53 @@ class DLSSMLightningModule(pl.LightningModule):
         return torch.tensor(1.0, device=loss.device, dtype=loss.dtype)
 
     def on_train_epoch_start(self) -> None:
-        if self.lambda_oc > 0.0 and self.current_epoch == self.oc_warmup_epochs and not self._svdd_scoring_active():
-            self._init_center_from_loader()
+        if (
+            self.context_feature_indices
+            and self.current_epoch == self.kl_warmup_epochs
+            and not self._pc_scoring_active()
+        ):
+            self._init_score_normalizers()
 
-    def _init_center_from_loader(self) -> None:
-        """Initialize SVDD center and normal radial distance statistics."""
+    def _init_score_normalizers(self) -> None:
+        """Compute recon and KL(q||p_c) scale factors from the training set.
+
+        After KL warmup the posterior is stable enough to compute a meaningful
+        scale.  Dividing each score component by its train-set mean makes the two
+        terms contribute on comparable scales without learned weights.
+        """
+        if not self.context_feature_indices:
+            return
         self.model.eval()
+        recon_parts: list[torch.Tensor] = []
+        kl_pc_parts: list[torch.Tensor] = []
         with torch.no_grad():
-            acc = torch.zeros_like(self.oc_center)
-            n = 0
             for batch in self.trainer.train_dataloader:
                 x = batch[0].to(self.device)
-                out = self.model(x)
-                acc += out["q_mu"].sum(dim=(0, 1))              # sum over B and W → [D]
-                n += out["q_mu"].shape[0] * out["q_mu"].shape[1]  # total (sample, timestep) pairs
-            if n > 0:
-                self.oc_center.copy_(acc / n)
-
-            radial_parts: list[torch.Tensor] = []
-            for batch in self.trainer.train_dataloader:
-                x = batch[0].to(self.device)
-                out = self.model(x)
-                diff = out["q_mu"] - self.oc_center.unsqueeze(0).unsqueeze(0)
-                radial_t = (diff ** 2).mean(dim=-1)
-                if self.score_reduction == "mean":
-                    radial_parts.append(radial_t.mean(dim=1).detach())
-                elif self.score_reduction == "max":
-                    radial_parts.append(radial_t.max(dim=1).values.detach())
-                else:
-                    radial_parts.append(radial_t[:, radial_t.size(1) // 2].detach())
-
-            if radial_parts:
-                radial = torch.cat(radial_parts, dim=0)
-                self.oc_radius_center.copy_(radial.mean())
-                self.oc_radius_scale.copy_(radial.std(unbiased=False).clamp(min=1e-6))
-            else:
-                self.oc_radius_center.fill_(0.0)
-                self.oc_radius_scale.fill_(1.0)
+                c = self._extract_context(x)
+                out = self.model(x, c)
+                if "p_c_mu" not in out:
+                    break
+                from src.modeling.anomaly_detection.dl.dlssm.losses import reconstruction_loss as _rl, kl_divergence as _kl
+                recon_t = _rl(out["x_hat"], x).mean(dim=1)  # [B]
+                kl_t = _kl(out["q_mu"], out["q_logvar"], out["p_c_mu"], out["p_c_logvar"]).mean(dim=1)  # [B]
+                recon_parts.append(recon_t.detach().cpu())
+                kl_pc_parts.append(kl_t.detach().cpu())
         self.model.train()
-        self._set_center_initialized(True)
-        logger.info(
-            "SVDD initialized: center_norm={:.4f} radius_mu={:.6f} radius_sigma={:.6f}",
-            self.oc_center.norm().item(),
-            float(self.oc_radius_center.item()),
-            float(self.oc_radius_scale.item()),
-        )
+        if recon_parts and kl_pc_parts:
+            recon_mean = float(torch.cat(recon_parts).mean().clamp(min=1e-8).item())
+            kl_pc_mean = float(torch.cat(kl_pc_parts).mean().clamp(min=1e-8).item())
+            self.score_recon_norm.fill_(recon_mean)
+            self.score_kl_pc_norm.fill_(kl_pc_mean)
+            self.pc_scoring_active.fill_(True)
+            logger.info(
+                "PC scoring initialized: recon_norm={:.6f}  kl_pc_norm={:.6f}",
+                recon_mean, kl_pc_mean,
+            )
 
     def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         x, _, _, _ = self._unpack_batch(batch)
-        out = self.model(x)
+        c = self._extract_context(x)
+        out = self.model(x, c)
 
         # Per-window loss components [B]
         recon_w = reconstruction_loss(out["x_hat"], x).mean(dim=1)
@@ -548,12 +536,15 @@ class DLSSMLightningModule(pl.LightningModule):
 
         per_window = recon_w + beta * kl_w
 
-        # SVDD: add latent distance loss after center is initialized
+        # PC aux: fit p_c to posterior on normal data (stop_grad ensures gradient flows only into p_c)
         loss_components: dict[str, torch.Tensor] = {"recon": recon_w, "kl": kl_w}
-        if self._svdd_scoring_active():
-            oc_w = one_class_loss(out["q_mu"], self.oc_center)
-            per_window = per_window + self.lambda_oc * oc_w
-            loss_components["oc"] = oc_w
+        if "p_c_mu" in out and self.gamma_pc > 0.0:
+            kl_pc_w = kl_q_pc_aux(
+                out["q_mu"], out["q_logvar"], out["p_c_mu"], out["p_c_logvar"],
+                free_bits=self.free_bits,
+            ).mean(dim=1)
+            per_window = per_window + self.gamma_pc * kl_pc_w
+            loss_components["kl_pc"] = kl_pc_w
 
         loss = per_window.mean()
 
@@ -566,24 +557,25 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("train_recon", recon_w.mean(), on_step=False, on_epoch=True)
         self.log("train_kl", kl_w.mean(), on_step=False, on_epoch=True)
         self.log("train_beta_kl", beta, on_step=False, on_epoch=True)
-        if "oc" in loss_components:
-            self.log("train_oc", loss_components["oc"].mean(), on_step=False, on_epoch=True)
-        if self.lambda_oc > 0.0:
-            self.log("latent_q_mu_std", out["q_mu"].std(dim=(0, 1)).mean(), on_step=False, on_epoch=True)
-            self.log("latent_q_mu_abs", out["q_mu"].abs().mean(), on_step=False, on_epoch=True)
+        if "kl_pc" in loss_components:
+            self.log("train_kl_pc", loss_components["kl_pc"].mean(), on_step=False, on_epoch=True)
         return loss
 
     def _score_batch(self, x: torch.Tensor, out: dict) -> torch.Tensor:
-        if self._svdd_scoring_active():
-            return radial_deviation_score(
-                out["q_mu"],
-                self.oc_center,
-                self.oc_radius_center,
-                self.oc_radius_scale,
+        if self._pc_scoring_active() and "p_c_mu" in out:
+            return compute_pc_anomaly_scores(
+                x=x,
+                x_hat=out["x_hat"],
+                q_mu=out["q_mu"],
+                q_logvar=out["q_logvar"],
+                p_c_mu=out["p_c_mu"],
+                p_c_logvar=out["p_c_logvar"],
+                score_recon_norm=float(self.score_recon_norm.item()),
+                score_kl_pc_norm=float(self.score_kl_pc_norm.item()),
                 score_reduction=self.score_reduction,
-                max_abs=self.max_abs_oc_score_term,
+                max_abs=self.max_abs_base_score_term,
             )
-        # Fallback before center is initialized (warmup epochs / SVDD disabled)
+        # Base score: pre-normalizer-init or no context features
         return compute_anomaly_scores(
             x=x,
             x_hat=out["x_hat"],
@@ -599,7 +591,7 @@ class DLSSMLightningModule(pl.LightningModule):
     def validation_step(self, batch: tuple, batch_idx: int) -> None:
         x, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
-            out = self.model(x)
+            out = self.model(x, self._extract_context(x))
         self._check_model_outputs_finite(out, "Validation", batch_idx)
         scores = self._score_batch(x, out).cpu()
         non_finite = ~torch.isfinite(scores)
@@ -667,7 +659,7 @@ class DLSSMLightningModule(pl.LightningModule):
             # Degenerate batch (sanity check or all-normal segment): log zeros with
             # identical kwargs to the normal path so Lightning doesn't reject a kwarg mismatch.
             self.log("val_macro_per_class_pr_auc", 0.0, prog_bar=True)
-            self.log("val_macro_per_class_pr_auc_monitor", -1.0 if self.lambda_oc > 0.0 else 0.0, prog_bar=False)
+            self.log("val_macro_per_class_pr_auc_monitor", 0.0, prog_bar=False)
             self.log("val_worst_class_pr_auc", 0.0, prog_bar=True)
             self.log("val_pr_auc", 0.0)
             self.log("val_roc_auc", 0.0)
@@ -692,12 +684,6 @@ class DLSSMLightningModule(pl.LightningModule):
         per_class_detail: dict = per_class_pr.get("per_class_pr_auc_vs_normal", {})
 
         monitor_score = val_macro_pc_pr_auc
-        if self.lambda_oc > 0.0 and not self._svdd_scoring_active():
-            monitor_score = -1.0
-            logger.info(
-                "Epoch {:3d} | SVDD warmup active (center not initialized), monitor metric held at -1.0",
-                self.current_epoch,
-            )
 
         self.best_val_pr_auc = max(self.best_val_pr_auc, monitor_score)
         self.best_val_worst_pr_auc = max(self.best_val_worst_pr_auc, val_worst_pc_pr_auc)
@@ -717,12 +703,9 @@ class DLSSMLightningModule(pl.LightningModule):
         self.log("val_accuracy_at_threshold", val_acc)
         self.log("val_threshold", threshold)
         self.log("val_macro_per_class_pr_auc_monitor", monitor_score, prog_bar=False)
-
-        # SVDD collapse monitoring — log latent statistics for diagnosing posterior collapse
-        if self.lambda_oc > 0.0:
-            self.log("oc_center_norm", self.oc_center.norm())
-            self.log("oc_radius_center", self.oc_radius_center)
-            self.log("oc_radius_scale", self.oc_radius_scale)
+        if self._pc_scoring_active():
+            self.log("pc_score_recon_norm", self.score_recon_norm)
+            self.log("pc_score_kl_pc_norm", self.score_kl_pc_norm)
 
         # Per-class PR-AUC breakdown for visibility during training
         pc_parts = "  ".join(
@@ -775,7 +758,7 @@ class DLSSMLightningModule(pl.LightningModule):
     def test_step(self, batch: tuple, batch_idx: int) -> None:
         x, labels, original_labels, group_ids = self._unpack_batch(batch)
         with torch.no_grad():
-            out = self.model(x)
+            out = self.model(x, self._extract_context(x))
         self._check_model_outputs_finite(out, "Test", batch_idx)
         scores = self._score_batch(x, out).cpu()
         non_finite = ~torch.isfinite(scores)
@@ -836,7 +819,7 @@ class DLSSMLightningModule(pl.LightningModule):
     @torch.no_grad()
     def score_windows(self, x: torch.Tensor) -> torch.Tensor:
         """Score a batch of windows [B, W, F] → anomaly scores [B]."""
-        out = self.model(x)
+        out = self.model(x, self._extract_context(x))
         return self._score_batch(x, out)
 
     def configure_optimizers(self):
@@ -953,6 +936,21 @@ def run_dlssm(config: dict | None = None) -> None:
     n_features = len(features)
     feature_idx = {name: i for i, name in enumerate(features)}
 
+    # Context features for the physics-conditioned prior (must be in the feature set)
+    context_feature_names: list[str] = dlssm_cfg.get("context_features", ["irr", "pvt"])
+    context_feature_indices: list[int] = [feature_idx[f] for f in context_feature_names if f in feature_idx]
+    n_context_features = len(context_feature_indices)
+    if context_feature_names and n_context_features == 0:
+        logger.warning(
+            "None of the configured context_features {} found in feature set — PC prior disabled.",
+            context_feature_names,
+        )
+    elif n_context_features < len(context_feature_names):
+        missing = [f for f in context_feature_names if f not in feature_idx]
+        logger.warning("Context features {} not in feature set — using only {}", missing, context_feature_indices)
+    else:
+        logger.info("PC prior context features: {} → indices {}", context_feature_names, context_feature_indices)
+
     y_train = (train_df[label_col].to_numpy() != 0).astype(int)
     y_val = (val_df[label_col].to_numpy() != 0).astype(int)
     y_test = (test_df[label_col].to_numpy() != 0).astype(int)
@@ -1059,8 +1057,7 @@ def run_dlssm(config: dict | None = None) -> None:
     _raw_oc = stability_cfg.get("max_abs_oc_score_term")
     max_abs_oc_score_term: float | None = float(_raw_oc) if _raw_oc is not None else 1e5
 
-    lambda_oc: float = float(dlssm_cfg.get("lambda_oc", 0.0))
-    oc_warmup_epochs: int = int(dlssm_cfg.get("oc_warmup_epochs", 5))
+    gamma_pc: float = float(dlssm_cfg.get("gamma_pc", 1.0))
 
     # Apply best params from --best-params JSON or from HPO sweep
     hpo_params: dict = {}
@@ -1081,6 +1078,8 @@ def run_dlssm(config: dict | None = None) -> None:
             scaler_scale_t=scaler_scale_t,
             feature_idx=feature_idx,
             n_features=n_features,
+            n_context_features=n_context_features,
+            context_feature_indices=context_feature_indices,
             seed=seed,
             n_trials_override=args.n_trials,
             se_reduction_ratio=se_reduction_ratio,
@@ -1088,17 +1087,14 @@ def run_dlssm(config: dict | None = None) -> None:
             score_instability_max=score_instability_max,
             non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
             max_abs_base_score_term=max_abs_base_score_term,
-            lambda_oc=lambda_oc,
-            oc_warmup_epochs=oc_warmup_epochs,
-            max_abs_oc_score_term=max_abs_oc_score_term,
+            gamma_pc=gamma_pc,
         )
         logger.info("HPO best params: {}", json.dumps(hpo_params, default=str))
 
     # Merge hpo_params into dlssm_cfg (non-destructive — only affects this run)
     if hpo_params:
         dlssm_cfg = {**dlssm_cfg, **hpo_params}
-        lambda_oc = float(dlssm_cfg.get("lambda_oc", lambda_oc))
-        oc_warmup_epochs = int(dlssm_cfg.get("oc_warmup_epochs", oc_warmup_epochs))
+        gamma_pc = float(dlssm_cfg.get("gamma_pc", gamma_pc))
 
     # Build model and Lightning module
     pl.seed_everything(seed, workers=True)
@@ -1113,6 +1109,7 @@ def run_dlssm(config: dict | None = None) -> None:
         n_gru_layers=int(dlssm_cfg.get("n_gru_layers", 1)),
         dropout=float(dlssm_cfg.get("dropout", 0.1)),
         se_reduction_ratio=se_reduction_ratio,
+        n_context_features=n_context_features,
     )
 
     lit = DLSSMLightningModule(
@@ -1120,6 +1117,7 @@ def run_dlssm(config: dict | None = None) -> None:
         scaler_mean=scaler_mean_t,
         scaler_scale=scaler_scale_t,
         feature_idx=feature_idx,
+        context_feature_indices=context_feature_indices,
         learning_rate=float(dlssm_cfg.get("learning_rate", 1e-3)),
         weight_decay=float(dlssm_cfg.get("weight_decay", 1e-5)),
         gradient_clip_val=float(dlssm_cfg.get("gradient_clip_val", 1.0)),
@@ -1137,9 +1135,7 @@ def run_dlssm(config: dict | None = None) -> None:
         score_instability_max=score_instability_max,
         non_finite_warn_limit_per_epoch=non_finite_warn_limit_per_epoch,
         max_abs_base_score_term=max_abs_base_score_term,
-        lambda_oc=lambda_oc,
-        oc_warmup_epochs=oc_warmup_epochs,
-        max_abs_oc_score_term=max_abs_oc_score_term,
+        gamma_pc=gamma_pc,
         hpo_mode=False,
     )
 
@@ -1272,7 +1268,7 @@ def run_dlssm(config: dict | None = None) -> None:
         test_pr_auc, test_roc_auc, test_f1, test_prec, test_rec,
     )
 
-    score_components = ["two_sided_latent_radial_deviation"] if lit._svdd_scoring_active() else ["reconstruction", "kl"]
+    score_components = ["reconstruction", "kl_q_pc"] if lit._pc_scoring_active() else ["reconstruction", "kl"]
 
     metrics: dict = {
         "score_name": "dlssm_score",
