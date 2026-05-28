@@ -111,6 +111,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--run-id", default=None)
     p.add_argument("--run-dir", default=None)
     p.add_argument("--hpo", action="store_true", help="Run two-stage Optuna HPO")
+    p.add_argument("--n-trials", type=int, default=None,
+                   help="Override HPO trial count (default: from config)")
     p.add_argument("--smoke", action="store_true", help="Smoke test: 3 epochs, large stride, no HPO")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--artifacts-dir", default=None)
@@ -1166,6 +1168,9 @@ def run_maat(config: dict | None = None) -> None:
     if run_hpo:
         trial_budget: dict = hpo_cfg.get("trial_budget", {})
         n_trials = int(trial_budget.get("stage1_training", 20)) + int(trial_budget.get("stage2_architecture", 40))
+        if getattr(args, "n_trials", None) is not None:
+            n_trials = int(args.n_trials)
+            logger.info("MAAT HPO trial count overridden by --n-trials: {}", n_trials)
         hpo_epochs = max(
             int(hpo_cfg.get("min_hpo_epochs", 10)),
             int(max_epochs * float(hpo_cfg.get("max_epochs_fraction", 0.25))),
