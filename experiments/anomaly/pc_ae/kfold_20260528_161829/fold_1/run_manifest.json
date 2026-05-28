@@ -1,0 +1,15 @@
+{
+  "task": "anomaly_semisup",
+  "model": "pc_ae",
+  "model_family": "anomaly_dl",
+  "dataset": "costa",
+  "split_path": "path_a",
+  "feature_profile": "None",
+  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\anomaly_semisup\\runs\\plus_physics",
+  "seed": 42,
+  "run_type": "smoke",
+  "artifact_contract_version": 1,
+  "run_name": "pc_ae_20260528_162016",
+  "variant": "PC-AE",
+  "contribution": "point_wise_physics_conditioned_ae_with_c_invariance"
+}

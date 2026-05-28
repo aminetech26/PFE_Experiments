@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import optuna
+import pandas as pd
 import pytorch_lightning as pl
 import torch
 import yaml
@@ -87,6 +88,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--hpo", action="store_true")
     p.add_argument("--n-trials", type=int, default=None)
     p.add_argument("--best-params", default=None)
+    # k-fold override: swap val/test DataFrames for one fold of episode-stratified CV
+    p.add_argument("--val-parquet-override", default=None,
+                   help="Path to a parquet file whose rows replace val_df (must share schema with the original val parquet)")
+    p.add_argument("--test-parquet-override", default=None,
+                   help="Path to a parquet file whose rows replace test_df (must share schema with the original test parquet)")
+    p.add_argument("--fold-id", type=int, default=None,
+                   help="Fold index (for logging / artifact naming only)")
     return p.parse_args()
 
 
@@ -515,6 +523,25 @@ def run_pc_ae(config: dict | None = None) -> None:
         task=args.task, profile=args.profile, run_dir=args.run_dir,
         run_id=args.run_id, dataset=args.dataset, split_path=args.split_path,
     )
+    # K-fold override: swap val/test with per-fold parquet files (train unchanged)
+    if getattr(args, "val_parquet_override", None):
+        new_val = pd.read_parquet(args.val_parquet_override)
+        missing = set(val_df.columns) - set(new_val.columns)
+        if missing:
+            raise RuntimeError(f"val_parquet_override missing columns: {missing}")
+        logger.info("FOLD OVERRIDE: val rows {} → {} (from {})",
+                    len(val_df), len(new_val), args.val_parquet_override)
+        val_df = new_val[list(val_df.columns)].reset_index(drop=True)
+    if getattr(args, "test_parquet_override", None):
+        new_test = pd.read_parquet(args.test_parquet_override)
+        missing = set(test_df.columns) - set(new_test.columns)
+        if missing:
+            raise RuntimeError(f"test_parquet_override missing columns: {missing}")
+        logger.info("FOLD OVERRIDE: test rows {} → {} (from {})",
+                    len(test_df), len(new_test), args.test_parquet_override)
+        test_df = new_test[list(test_df.columns)].reset_index(drop=True)
+    if getattr(args, "fold_id", None) is not None:
+        logger.info("FOLD ID: {}", args.fold_id)
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
     n_features = len(features)
