@@ -94,6 +94,12 @@ MODEL_REGISTRY: dict[str, dict] = {
         "hpo_on_args": ["--hpo"], "hpo_off_args": [],
         "default_args": [], "subdir": "bocd", "supports_smoke": False,
     },
+    "pc_flow": {
+        "module": "src.modeling.anomaly_detection.dl.pc_flow.trainer",
+        "best_params_file": "hpo_best_params.json",
+        "hpo_on_args": ["--hpo"], "hpo_off_args": [],
+        "default_args": [], "subdir": "pc_flow", "supports_smoke": True,
+    },
 }
 
 

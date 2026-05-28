@@ -258,6 +258,46 @@ anomaly_detection:
             dropout:       {type: float, low: 0.0,    high: 0.3}
             lambda_c_inv:  {type: float, low: 0.1,    high: 10.0, log: true}
 
+      pc_flow:
+        # Physics-Conditioned Normalizing Flow (RealNVP-style)
+        # Conditional affine-coupling blocks model p(x | irr, pvt).
+        # Anomaly score = NLL = -log p(x | c). No MSE averaging → directly
+        # sensitive to subtle multivariate imbalances (cls2 degradation).
+        # ~12k params, stateless, ONNX-exportable, sub-ms CPU inference.
+        win_size: 1
+        train_stride: 1
+        eval_stride: 1
+        n_coupling_layers: 4
+        hidden_dim: 32
+        dropout: 0.0
+        context_features: [irr, pvt]
+        # Shared GPD threshold strategy (see anomaly_detection.threshold)
+        batch_size: 4096
+        learning_rate: 3.0e-4
+        weight_decay: 1.0e-5
+        gradient_clip_val: 1.0
+        max_epochs: 50
+        patience: 10
+        accelerator: auto
+        precision: 32-true
+        hpo:
+          mode: single_stage
+          sampler: tpe
+          pruner: median
+          n_trials: 10
+          timeout_seconds: 10800
+          max_epochs_fraction: 0.30
+          min_hpo_epochs: 5
+          patience_fraction: 0.40
+          min_hpo_patience: 3
+          pruning_warmup_epochs: 3
+          search_space:
+            learning_rate:      {type: float, low: 1.0e-4, high: 1.0e-3, log: true}
+            weight_decay:       {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+            n_coupling_layers:  {type: categorical, choices: [3, 4, 5]}
+            hidden_dim:         {type: categorical, choices: [32, 64]}
+            dropout:            {type: float, low: 0.0, high: 0.2}
+
       pv_gdn:
         win_size: 30
         train_stride: 5

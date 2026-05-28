@@ -1,0 +1,29 @@
+{
+  "val": {
+    "episode_binary_pr_auc": 0.9395249176811439,
+    "episode_macro_per_class_pr_auc": 0.5687407031116947,
+    "episode_worst_class_pr_auc": 0.08070230851709059,
+    "episode_per_class_pr_auc_vs_normal": {
+      "1": 0.25847738862444747,
+      "2": 0.08070230851709059,
+      "3": 1.0,
+      "4": 0.9357831153052409
+    },
+    "n_episodes": 660,
+    "agg": "p95"
+  },
+  "test": {
+    "episode_binary_pr_auc": 0.9336688663778804,
+    "episode_macro_per_class_pr_auc": 0.6972656344911342,
+    "episode_worst_class_pr_auc": 0.08952954266811416,
+    "episode_per_class_pr_auc_vs_normal": {
+      "1": 0.7713789682539682,
+      "2": 0.08952954266811416,
+      "3": 0.9999999999999999,
+      "4": 0.9281540270424546
+    },
+    "n_episodes": 671,
+    "agg": "p95"
+  },
+  "agg": "p95"
+}

@@ -1,0 +1,26 @@
+{
+  "variant": "PC-Flow",
+  "win_size": 1,
+  "train_stride": 1,
+  "eval_stride": 1,
+  "n_coupling_layers": 4,
+  "hidden_dim": 32,
+  "dropout": 0.03668090197068676,
+  "context_features": [
+    "irr",
+    "pvt"
+  ],
+  "batch_size": 4096,
+  "learning_rate": 0.0003991305878561678,
+  "weight_decay": 0.000133112160807369,
+  "gradient_clip_val": 1.0,
+  "max_epochs": 50,
+  "patience": 10,
+  "accelerator": "auto",
+  "precision": "32-true",
+  "max_epochs_actual": 1,
+  "n_features": 17,
+  "n_non_context": 15,
+  "n_params": 7548,
+  "seed": 42
+}
