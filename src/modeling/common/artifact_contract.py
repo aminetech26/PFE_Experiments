@@ -120,6 +120,92 @@ def compute_macro_per_class_pr_auc(
     }
 
 
+def compute_episode_level_pr_auc(
+    *,
+    labels: np.ndarray,
+    scores: np.ndarray,
+    original_labels: np.ndarray,
+    group_ids: np.ndarray,
+    agg: str = "p95",
+    normal_label: float | int = 0,
+) -> dict[str, float | dict[str, float | None] | None]:
+    """Aggregate per-sample scores to per-episode then compute PR-AUC.
+
+    For each unique group_id, the episode score is computed via ``agg`` over
+    the constituent sample scores; the episode label is the majority original
+    label of those samples (ties broken toward the non-normal class).  Returns
+    binary PR-AUC, macro per-class PR-AUC, worst-class PR-AUC, and a per-class
+    breakdown — all at the episode level.
+    """
+    scores_arr = np.asarray(scores, dtype=float)
+    labels_arr = np.asarray(labels, dtype=int)
+    orig_arr = np.asarray(original_labels)
+    groups = np.asarray(group_ids, dtype=object)
+
+    if groups.size == 0 or len(np.unique(groups)) <= 1:
+        return {
+            "episode_binary_pr_auc": None,
+            "episode_macro_per_class_pr_auc": None,
+            "episode_worst_class_pr_auc": None,
+            "episode_per_class_pr_auc_vs_normal": {},
+            "n_episodes": 0,
+        }
+
+    if agg == "p95":
+        agg_fn = lambda s: float(np.percentile(s, 95))
+    elif agg == "max":
+        agg_fn = lambda s: float(np.max(s))
+    elif agg == "mean":
+        agg_fn = lambda s: float(np.mean(s))
+    elif agg == "trimmed_mean":
+        def agg_fn(s):
+            lo, hi = np.percentile(s, [10, 90])
+            return float(np.mean(s[(s >= lo) & (s <= hi)]))
+    else:
+        raise ValueError(f"Unsupported agg: {agg}")
+
+    unique_groups, inv = np.unique(groups, return_inverse=True)
+    n_groups = len(unique_groups)
+    ep_scores = np.empty(n_groups, dtype=float)
+    ep_orig_labels = np.empty(n_groups, dtype=float)
+    ep_binary_labels = np.empty(n_groups, dtype=int)
+
+    for gi in range(n_groups):
+        mask = inv == gi
+        ep_scores[gi] = agg_fn(scores_arr[mask])
+        # Episode label = majority of original labels; ties favor non-normal
+        sub = orig_arr[mask]
+        vals, counts = np.unique(sub, return_counts=True)
+        # If there is any non-normal value, prefer the most common non-normal
+        non_normal_mask = vals != normal_label
+        if non_normal_mask.any():
+            nn_vals = vals[non_normal_mask]
+            nn_counts = counts[non_normal_mask]
+            ep_orig_labels[gi] = float(nn_vals[np.argmax(nn_counts)])
+        else:
+            ep_orig_labels[gi] = float(normal_label)
+        ep_binary_labels[gi] = int(ep_orig_labels[gi] != normal_label)
+
+    binary_pr_auc: float | None = None
+    if ep_binary_labels.sum() not in (0, n_groups):
+        binary_pr_auc = float(average_precision_score(ep_binary_labels, ep_scores))
+
+    per_class_summary = compute_macro_per_class_pr_auc(
+        labels=ep_orig_labels, scores=ep_scores, normal_label=normal_label
+    )
+
+    return {
+        "episode_binary_pr_auc": binary_pr_auc,
+        "episode_macro_per_class_pr_auc": per_class_summary.get("macro_per_class_pr_auc"),
+        "episode_worst_class_pr_auc": per_class_summary.get("worst_class_pr_auc"),
+        "episode_per_class_pr_auc_vs_normal": per_class_summary.get(
+            "per_class_pr_auc_vs_normal", {}
+        ),
+        "n_episodes": n_groups,
+        "agg": agg,
+    }
+
+
 def compute_anomaly_per_class_metrics(
     *,
     labels: np.ndarray,

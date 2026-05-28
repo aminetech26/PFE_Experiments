@@ -1,0 +1,61 @@
+{
+  "score_direction": "higher_is_more_anomalous",
+  "threshold_policy": "q95_train_errors",
+  "threshold": 3.2961134910583496,
+  "test_not_used_for_calibration": true,
+  "score_stats": {
+    "score_name": "pc_ae_recon_mse",
+    "score_components": [
+      "reconstruction_mse"
+    ]
+  },
+  "threshold_quantile": 0.95,
+  "candidate_per_true_class_thresholds": {
+    "threshold_policy": "validation_true_class_pr_curve_f1",
+    "deployment_ready": false,
+    "intended_use": "diagnostic_or_candidate_class_conditioned_gate",
+    "normal_label": 0,
+    "thresholds": {
+      "1": {
+        "threshold": 7.178852558135986,
+        "val_f1": 0.9740673970323116,
+        "val_support_fault": 3560,
+        "val_support_normal": 38481,
+        "test_precision": 0.9822723609991942,
+        "test_recall": 0.999589995899959,
+        "test_f1": 0.9908555171713066,
+        "test_pr_auc": 0.9371683122995014
+      },
+      "2": {
+        "threshold": 1.3371754884719849,
+        "val_f1": 0.706668646962721,
+        "val_support_fault": 7516,
+        "val_support_normal": 38481,
+        "test_precision": 0.5115299779426509,
+        "test_recall": 0.8935201401050789,
+        "test_f1": 0.6505993369038511,
+        "test_pr_auc": 0.42699636634487376
+      },
+      "3": {
+        "threshold": 491.54412841796875,
+        "val_f1": 1.0,
+        "val_support_fault": 3614,
+        "val_support_normal": 38481,
+        "test_precision": 1.0,
+        "test_recall": 0.9995850622406639,
+        "test_f1": 0.9997924880680639,
+        "test_pr_auc": 1.0
+      },
+      "4": {
+        "threshold": 1.112626075744629,
+        "val_f1": 0.9520954264208713,
+        "val_support_fault": 107253,
+        "val_support_normal": 38481,
+        "test_precision": 0.9323674322724016,
+        "test_recall": 0.8275973941706247,
+        "test_f1": 0.8768639529207944,
+        "test_pr_auc": 0.9706883744623558
+      }
+    }
+  }
+}

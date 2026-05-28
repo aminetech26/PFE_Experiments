@@ -189,6 +189,49 @@ anomaly_detection:
             score_reduction:      {type: categorical, choices: [center, mean, max]}
             gamma_pc:             {type: float, low: 0.1, high: 5.0, log: true}
 
+      pc_ae:
+        # Point-wise Physics-Conditioned Autoencoder
+        # Stateless MLP encoder/decoder. window=1 (point-wise scoring).
+        # c-invariance regularizer forces z to encode only the operating-point-invariant
+        # part of the signal (the I-V manifold), which PV faults break.
+        win_size: 1
+        train_stride: 1
+        eval_stride: 1
+        hidden_dim: 64
+        latent_dim: 16
+        dropout: 0.1
+        # Context features for the conditional decoder; also targeted by c-invariance regularizer.
+        context_features: [irr, pvt]
+        # Regularizer weight: forces encode(x) ≈ encode(shuffle_c_in_x(x))
+        lambda_c_inv: 1.0
+        # Threshold calibration: q-th percentile of TRAINING reconstruction errors.
+        threshold_percentile: 95.0
+        batch_size: 4096
+        learning_rate: 1.0e-3
+        weight_decay: 1.0e-5
+        gradient_clip_val: 1.0
+        max_epochs: 50
+        patience: 10
+        accelerator: auto
+        precision: 32-true
+        scaling: standard
+        hpo:
+          mode: single_stage
+          sampler: tpe
+          pruner: median
+          n_trials: 40
+          timeout_seconds: 10800
+          max_epochs_fraction: 0.30
+          min_hpo_epochs: 10
+          patience_fraction: 0.40
+          min_hpo_patience: 5
+          pruning_warmup_epochs: 3
+          search_space:
+            learning_rate: {type: float, low: 1.0e-4, high: 3.0e-3, log: true}
+            weight_decay:  {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+            dropout:       {type: float, low: 0.0,    high: 0.3}
+            lambda_c_inv:  {type: float, low: 0.1,    high: 10.0, log: true}
+
       pv_gdn:
         win_size: 30
         train_stride: 5
