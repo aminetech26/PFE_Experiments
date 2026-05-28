@@ -33,6 +33,7 @@ from src.modeling.anomaly_detection.ml.one_class_svm_model import (
     _prepare_xy,
     _save_pr_curve,
     _save_score_histogram,
+    _set_ocsvm_threshold_config as _set_shared_threshold_config,
     _save_score_timeline,
 )
 from src.modeling.common.artifact_contract import (
@@ -46,6 +47,7 @@ from src.modeling.common.artifact_contract import (
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
+from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
 from src.modeling.common.hyperparameter_optimizer import run_optuna, suggest_params_from_space
 from src.utils.paths import get_experiments_root
 
@@ -227,6 +229,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--artifacts-dir", default=None)
     p.add_argument("--comparison-records-path", default=str(_default_comparison_records_path()))
     p.add_argument("--run-type", default="baseline", help="baseline | ablation | final")
+    p.add_argument("--best-params", default=None,
+                   help="JSON string of best params to apply directly (skips HPO)")
+    add_fold_override_args(p)
     return p.parse_args()
 
 
@@ -242,6 +247,17 @@ def run_bocd(config: dict | None = None) -> None:
         config = _load_config()
 
     bocd_cfg = config["anomaly_detection"]["ml"]["models"]["bocd"]
+    # Shared threshold calibration (GPD by default)
+    from src.modeling.common.threshold_calibration import (
+        load_threshold_config as _load_thr_cfg,
+        threshold_policy_str as _thr_policy_str,
+    )
+    _thr_cfg = _load_thr_cfg(config, bocd_cfg)
+    _set_shared_threshold_config(_thr_cfg)
+    _bocd_threshold_policy = _thr_policy_str(
+        {"strategy": _thr_cfg["strategy"], "percentile": _thr_cfg["percentile"],
+         "pot_quantile": _thr_cfg["pot_quantile"], "target_tail_prob": _thr_cfg["target_tail_prob"]}
+    )
     hpo_cfg = config["anomaly_detection"]["ml"]["hpo"]
 
     max_run_length: int = int(bocd_cfg.get("max_run_length", 500))
@@ -263,6 +279,7 @@ def run_bocd(config: dict | None = None) -> None:
         dataset=args.dataset,
         split_path=args.split_path,
     )
+    val_df, test_df = apply_fold_overrides(args, val_df, test_df)
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
 
@@ -314,7 +331,11 @@ def run_bocd(config: dict | None = None) -> None:
         val_macro = macro.get("macro_per_class_pr_auc")
         return float(val_macro) if isinstance(val_macro, (int, float, np.integer, np.floating)) else 0.0
 
-    if args.hpo and search_space:
+    if args.best_params:
+        best_params = json.loads(args.best_params)
+        logger.info("Applying best_params from CLI (skipping HPO): {}", best_params)
+        study = None
+    elif args.hpo and search_space:
         logger.info("Running Optuna HPO: {} trials", n_trials)
         best_params, study = run_optuna(
             _objective_clean,
@@ -407,7 +428,7 @@ def run_bocd(config: dict | None = None) -> None:
         "val_worst_class_pr_auc": val_worst_class_pr_auc,
         "val_selection_score": val_selection_score,
         "threshold": threshold,
-        "threshold_policy": "validation_pr_curve_f1",
+        "threshold_policy": _bocd_threshold_policy,
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "test_f1_at_threshold": test_f1,
@@ -486,7 +507,7 @@ def run_bocd(config: dict | None = None) -> None:
         classes=[str(c) for c in sorted(np.unique(y_test).tolist())],
         extras={
             "group_column": str(group_col),
-            "threshold_policy": "validation_pr_curve_f1",
+            "threshold_policy": _bocd_threshold_policy,
             "score_calibration_artifact": score_calibration_path.name,
         },
     )
@@ -494,7 +515,7 @@ def run_bocd(config: dict | None = None) -> None:
         score_calibration_path,
         build_score_calibration_payload(
             threshold=threshold,
-            threshold_policy="validation_pr_curve_f1",
+            threshold_policy=_bocd_threshold_policy,
             threshold_quantile=None,
             candidate_per_true_class_thresholds=candidate_per_true_class_thresholds,
         ),

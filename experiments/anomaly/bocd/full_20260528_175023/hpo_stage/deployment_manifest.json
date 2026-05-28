@@ -1,0 +1,39 @@
+{
+  "task": "anomaly_semisup",
+  "model": "bocd",
+  "model_family": "anomaly_ml",
+  "model_artifact": "detector.joblib",
+  "feature_names": [
+    "current_imbalance",
+    "dI_dt",
+    "dP_dt",
+    "dV_dt",
+    "idc1",
+    "idc2",
+    "irr",
+    "pdc1",
+    "pdc2",
+    "pdc_temp_corrected",
+    "pdc_temp_corrected_norm_irr",
+    "power_imbalance",
+    "pvt",
+    "temp_loss_pmax",
+    "vdc1",
+    "vdc2",
+    "voltage_imbalance"
+  ],
+  "label_column": "label",
+  "threshold": -4.918956053763227,
+  "scaler_artifact": "scaler.joblib",
+  "classes": [
+    "0.0",
+    "1.0",
+    "2.0",
+    "3.0",
+    "4.0"
+  ],
+  "score_direction": "higher_is_more_anomalous",
+  "group_column": "segment_id",
+  "threshold_policy": "validation_pr_curve_f1",
+  "score_calibration_artifact": "score_calibration.json"
+}

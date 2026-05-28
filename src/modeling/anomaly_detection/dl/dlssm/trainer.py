@@ -54,6 +54,12 @@ from src.modeling.common.dl_training_utils import (
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
+from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
+from src.modeling.common.threshold_calibration import (
+    calibrate_threshold,
+    load_threshold_config,
+    threshold_policy_str,
+)
 from src.modeling.common.hyperparameter_optimizer import (
     _build_pruner,
     _build_sampler,
@@ -88,6 +94,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--hpo", action="store_true", help="Run Optuna HPO sweep then retrain best config")
     p.add_argument("--n-trials", type=int, default=None, help="Override number of HPO trials")
     p.add_argument("--best-params", default=None, help="JSON string of best params to apply directly (skips HPO search)")
+    add_fold_override_args(p)
     return p.parse_args()
 
 
@@ -97,18 +104,30 @@ def _load_config() -> dict:
         return yaml.safe_load(fh)
 
 
+_DLSSM_THRESHOLD_CFG: dict = {"strategy": "gpd", "percentile": 95.0,
+                              "pot_quantile": 0.90, "target_tail_prob": 0.05}
+
+
+def _set_dlssm_threshold_config(cfg: dict) -> None:
+    """Called once at run_dlssm startup to inject shared threshold config."""
+    global _DLSSM_THRESHOLD_CFG
+    _DLSSM_THRESHOLD_CFG = dict(cfg)
+
+
 def _calibrate_threshold(
     scores: np.ndarray, labels: np.ndarray
 ) -> tuple[float, float, float, float]:
-    """Return (threshold, f1, precision, recall) using q95 of normal-class scores.
+    """Return (threshold, f1, precision, recall) using shared threshold calibration
+    (GPD by default) on normal-class scores.
 
-    Deploy-realistic: calibrated from the 95th-percentile of the score distribution
-    over normal-class (label==0) windows — no fault-label leakage at calibration
-    time. F1/precision/recall are reported AT this threshold for monitoring only,
+    Deploy-realistic: calibrated from the score distribution over normal-class
+    (label==0) windows only — no fault-label leakage at calibration time.
+    F1/precision/recall are reported AT this threshold for monitoring only,
     not for model selection (selection uses val_macro_per_class_pr_auc).
     """
     normal_scores = scores[labels == 0]
-    threshold = float(np.percentile(normal_scores if len(normal_scores) > 0 else scores, 95))
+    src = normal_scores if len(normal_scores) > 0 else scores
+    threshold, _ = calibrate_threshold(src, **_DLSSM_THRESHOLD_CFG)
     preds = (scores >= threshold).astype(int)
     f1 = float(f1_score(labels, preds, zero_division=0))
     prec = float(precision_score(labels, preds, zero_division=0))
@@ -914,6 +933,14 @@ def run_dlssm(config: dict | None = None) -> None:
     training_cfg: dict = config.get("training", {})
     threading_cfg: dict = config.get("training", {}).get("threading", {})
     seed: int = args.seed
+    # Inject shared threshold config so _calibrate_threshold uses GPD by default.
+    _thr_cfg = load_threshold_config(config, dlssm_cfg)
+    _set_dlssm_threshold_config(_thr_cfg)
+    _dlssm_threshold_policy = threshold_policy_str(
+        {"strategy": _thr_cfg["strategy"], "percentile": _thr_cfg["percentile"],
+         "pot_quantile": _thr_cfg["pot_quantile"], "target_tail_prob": _thr_cfg["target_tail_prob"]}
+    )
+    logger.info("DLSSM threshold policy: {}", _dlssm_threshold_policy)
     is_smoke: bool = args.smoke
 
     run_type = "smoke" if is_smoke else args.run_type
@@ -931,6 +958,7 @@ def run_dlssm(config: dict | None = None) -> None:
         dataset=args.dataset,
         split_path=args.split_path,
     )
+    val_df, test_df = apply_fold_overrides(args, val_df, test_df)
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
     n_features = len(features)
@@ -1274,7 +1302,7 @@ def run_dlssm(config: dict | None = None) -> None:
         "score_name": "dlssm_score",
         "score_components": score_components,
         "score_reduction": str(dlssm_cfg.get("score_reduction", "center")),
-        "threshold_policy": "q95_normal_val",
+        "threshold_policy": _dlssm_threshold_policy,
         "selection_metric": "val_macro_per_class_pr_auc_monitor",
         "val_pr_auc": val_pr_auc,
         "val_roc_auc": val_roc_auc,
@@ -1347,7 +1375,7 @@ def run_dlssm(config: dict | None = None) -> None:
         calibration_path,
         build_score_calibration_payload(
             threshold=threshold,
-            threshold_policy="q95_normal_val",
+            threshold_policy=_dlssm_threshold_policy,
             threshold_quantile=0.95,
             candidate_per_true_class_thresholds=candidate_thresholds,
             score_stats={
@@ -1385,7 +1413,7 @@ def run_dlssm(config: dict | None = None) -> None:
         classes=[str(c) for c in sorted(np.unique(test_per_class_source).tolist())],
         extras={
             "checkpoint_available": bool(best_ckpt_path),
-            "threshold_policy": "q95_normal_val",
+            "threshold_policy": _dlssm_threshold_policy,
             "selection_metric": "val_macro_per_class_pr_auc_monitor",
             "score_name": "dlssm_score",
             "score_components": score_components,
@@ -1467,7 +1495,7 @@ def run_dlssm(config: dict | None = None) -> None:
                 "hidden_dim": int(dlssm_cfg.get("hidden_dim", 64)),
                 "latent_dim": int(dlssm_cfg.get("latent_dim", 16)),
                 "threshold": threshold,
-                "threshold_policy": "q95_normal_val",
+                "threshold_policy": _dlssm_threshold_policy,
                 "selection_metric": "val_macro_per_class_pr_auc_monitor",
                 "val_selection_score": val_macro.get("macro_per_class_pr_auc"),
                 "score_name": "dlssm_score",

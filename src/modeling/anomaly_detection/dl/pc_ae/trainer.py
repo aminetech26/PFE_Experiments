@@ -48,6 +48,13 @@ from src.modeling.common.artifact_contract import (
     compute_macro_per_class_pr_auc,
     write_json,
 )
+from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
+from src.modeling.common.threshold_calibration import (
+    calibrate_threshold,
+    calibrate_threshold_quantile,
+    load_threshold_config,
+    threshold_policy_str as _threshold_policy_str,
+)
 from src.modeling.common.dl_training_utils import (
     _build_warmup_cosine_scheduler,
     _resolve_loader_runtime,
@@ -88,13 +95,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--hpo", action="store_true")
     p.add_argument("--n-trials", type=int, default=None)
     p.add_argument("--best-params", default=None)
-    # k-fold override: swap val/test DataFrames for one fold of episode-stratified CV
-    p.add_argument("--val-parquet-override", default=None,
-                   help="Path to a parquet file whose rows replace val_df (must share schema with the original val parquet)")
-    p.add_argument("--test-parquet-override", default=None,
-                   help="Path to a parquet file whose rows replace test_df (must share schema with the original test parquet)")
-    p.add_argument("--fold-id", type=int, default=None,
-                   help="Fold index (for logging / artifact naming only)")
+    add_fold_override_args(p)
     return p.parse_args()
 
 
@@ -105,8 +106,9 @@ def _load_config() -> dict:
 
 
 def _calibrate_threshold_train(train_scores: np.ndarray, percentile: float = 95.0) -> float:
-    """Threshold = q-th percentile of training reconstruction errors (all normal)."""
-    return float(np.percentile(train_scores, percentile))
+    """Back-compat alias for older callers expecting a plain float."""
+    thr, _ = calibrate_threshold_quantile(train_scores, percentile)
+    return thr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -523,25 +525,7 @@ def run_pc_ae(config: dict | None = None) -> None:
         task=args.task, profile=args.profile, run_dir=args.run_dir,
         run_id=args.run_id, dataset=args.dataset, split_path=args.split_path,
     )
-    # K-fold override: swap val/test with per-fold parquet files (train unchanged)
-    if getattr(args, "val_parquet_override", None):
-        new_val = pd.read_parquet(args.val_parquet_override)
-        missing = set(val_df.columns) - set(new_val.columns)
-        if missing:
-            raise RuntimeError(f"val_parquet_override missing columns: {missing}")
-        logger.info("FOLD OVERRIDE: val rows {} → {} (from {})",
-                    len(val_df), len(new_val), args.val_parquet_override)
-        val_df = new_val[list(val_df.columns)].reset_index(drop=True)
-    if getattr(args, "test_parquet_override", None):
-        new_test = pd.read_parquet(args.test_parquet_override)
-        missing = set(test_df.columns) - set(new_test.columns)
-        if missing:
-            raise RuntimeError(f"test_parquet_override missing columns: {missing}")
-        logger.info("FOLD OVERRIDE: test rows {} → {} (from {})",
-                    len(test_df), len(new_test), args.test_parquet_override)
-        test_df = new_test[list(test_df.columns)].reset_index(drop=True)
-    if getattr(args, "fold_id", None) is not None:
-        logger.info("FOLD ID: {}", args.fold_id)
+    val_df, test_df = apply_fold_overrides(args, val_df, test_df)
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
     n_features = len(features)
@@ -685,12 +669,14 @@ def run_pc_ae(config: dict | None = None) -> None:
         lit, dataloaders=test_dl, ckpt_path=best_ckpt_path
     )
 
-    # Threshold from TRAIN reconstruction errors (q95)
-    threshold_percentile = float(pc_ae_cfg.get("threshold_percentile", 95.0))
+    # Shared threshold calibration on TRAIN reconstruction errors (normal-only).
+    thr_cfg = load_threshold_config(config, pc_ae_cfg)
+    threshold_percentile = float(thr_cfg.get("percentile", 95.0))
     train_scores_np = lit.collect_train_scores(train_dl_seq)
-    threshold = _calibrate_threshold_train(train_scores_np, threshold_percentile)
+    threshold, threshold_diag = calibrate_threshold(train_scores_np, **thr_cfg)
     lit.val_threshold = threshold
-    logger.info("Train-side threshold (q{}): {:.6f}", threshold_percentile, threshold)
+    threshold_policy_str = _threshold_policy_str(threshold_diag)
+    logger.info("Threshold ({} strategy) = {:.6f}", threshold_diag.get("strategy"), threshold)
 
     val_scores = lit._val_scores_np; val_labels = lit._val_labels_np
     val_original_labels = lit._val_original_labels_np; val_group_ids = lit._val_group_ids_np
@@ -752,7 +738,7 @@ def run_pc_ae(config: dict | None = None) -> None:
     metrics = {
         "score_name": "pc_ae_recon_mse",
         "score_components": ["reconstruction_mse"],
-        "threshold_policy": "q95_train_errors",
+        "threshold_policy": threshold_policy_str,
         "selection_metric": "val_macro_per_class_pr_auc_monitor",
         "threshold": threshold,
         "val_pr_auc": val_pr_auc, "val_roc_auc": val_roc_auc,
@@ -822,13 +808,15 @@ def run_pc_ae(config: dict | None = None) -> None:
         val_labels=val_pc_source, val_scores=val_scores,
     )
     candidate_thresholds = build_candidate_per_true_class_thresholds(per_class_metrics, normal_label=0)
-    write_json(calibration_path, build_score_calibration_payload(
-        threshold=threshold, threshold_policy="q95_train_errors",
+    calibration_payload = build_score_calibration_payload(
+        threshold=threshold, threshold_policy=threshold_policy_str,
         threshold_quantile=threshold_percentile / 100.0,
         candidate_per_true_class_thresholds=candidate_thresholds,
         score_stats={"score_name": "pc_ae_recon_mse",
                      "score_components": ["reconstruction_mse"]},
-    ))
+    )
+    calibration_payload["threshold_diagnostics"] = threshold_diag
+    write_json(calibration_path, calibration_payload)
     write_json(per_class_metrics_path, per_class_metrics)
     write_json(episode_metrics_path, {
         "val": val_episode_metrics, "test": test_episode_metrics, "agg": "p95",
@@ -851,7 +839,7 @@ def run_pc_ae(config: dict | None = None) -> None:
         classes=[str(c) for c in sorted(np.unique(test_pc_source).tolist())],
         extras={
             "checkpoint_available": bool(best_ckpt_path),
-            "threshold_policy": "q95_train_errors",
+            "threshold_policy": threshold_policy_str,
             "selection_metric": "val_macro_per_class_pr_auc_monitor",
             "score_name": "pc_ae_recon_mse",
             "score_calibration_artifact": calibration_path.name,
@@ -898,7 +886,7 @@ def run_pc_ae(config: dict | None = None) -> None:
                 "run_type": run_type, "seed": seed, "feature_profile": str(args.profile),
                 "feature_run_dir": str(resolved_run_dir), "n_features": n_features,
                 "win_size": win_size, "latent_dim": int(pc_ae_cfg.get("latent_dim", 16)),
-                "threshold": threshold, "threshold_policy": "q95_train_errors",
+                "threshold": threshold, "threshold_policy": threshold_policy_str,
                 "selection_metric": "val_macro_per_class_pr_auc_monitor",
                 "score_name": "pc_ae_recon_mse", "score_components": ["reconstruction_mse"],
                 **{k: v for k, v in metrics.items() if not isinstance(v, (dict, list))},

@@ -39,6 +39,12 @@ from src.modeling.common.artifact_contract import (
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
+from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
+from src.modeling.common.threshold_calibration import (
+    calibrate_threshold,
+    load_threshold_config,
+    threshold_policy_str as _threshold_policy_str,
+)
 from src.modeling.common.hyperparameter_optimizer import (
     midpoint_params_from_space,
     run_optuna,
@@ -74,6 +80,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--artifacts-dir", default=None)
     p.add_argument("--comparison-records-path", default=str(_default_comparison_records_path()))
     p.add_argument("--run-type", default="baseline", help="baseline | ablation | final")
+    p.add_argument("--best-params", default=None,
+                   help="JSON string of best params to apply directly (skips HPO; equivalent to --no-optuna with explicit params)")
+    add_fold_override_args(p)
     return p.parse_args()
 
 
@@ -188,24 +197,31 @@ def _subsample_train_indices(
     }
 
 
+_OCSVM_THRESHOLD_CFG: dict = {"strategy": "gpd", "percentile": 95.0,
+                              "pot_quantile": 0.90, "target_tail_prob": 0.05}
+
+
+def _set_ocsvm_threshold_config(cfg: dict) -> None:
+    global _OCSVM_THRESHOLD_CFG
+    _OCSVM_THRESHOLD_CFG = dict(cfg)
+
+
 def _calibrate_threshold(
     scores: np.ndarray, labels: np.ndarray
 ) -> tuple[float, float, float, float]:
-    """Return (threshold, best_f1, precision, recall) by maximising F1 on the PR curve."""
-    prec, rec, thresholds = precision_recall_curve(labels, scores)
-    # prec/rec have len = n_thresholds + 1; zip with thresholds (len = n_thresholds)
-    f1_vals = np.where(
-        (prec[:-1] + rec[:-1]) > 0,
-        2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1]),
-        0.0,
-    )
-    best_idx = int(np.argmax(f1_vals))
-    return (
-        float(thresholds[best_idx]),
-        float(f1_vals[best_idx]),
-        float(prec[best_idx]),
-        float(rec[best_idx]),
-    )
+    """Calibrate threshold via shared GPD/quantile calibration on normal-class scores.
+
+    Returns (threshold, f1_at_threshold, precision_at_threshold, recall_at_threshold).
+    f1/prec/rec are reported AT the calibrated threshold for monitoring only.
+    """
+    normal_scores = scores[labels == 0]
+    src = normal_scores if len(normal_scores) > 0 else scores
+    threshold, _ = calibrate_threshold(src, **_OCSVM_THRESHOLD_CFG)
+    preds = (scores >= threshold).astype(int)
+    f1 = float(f1_score(labels, preds, zero_division=0))
+    prec = float(precision_score(labels, preds, zero_division=0))
+    rec = float(recall_score(labels, preds, zero_division=0))
+    return float(threshold), f1, prec, rec
 
 
 def _save_pr_curve(
@@ -292,6 +308,13 @@ def run_one_class_svm(config: dict | None = None) -> None:
     ocsvm_cfg = config["anomaly_detection"]["ml"]["models"]["one_class_svm"]
     hpo_cfg = config["anomaly_detection"]["ml"]["hpo"]
     kernel_space: dict = ocsvm_cfg["kernels"][kernel]
+    # Inject shared threshold calibration config (GPD by default)
+    _thr_cfg = load_threshold_config(config, ocsvm_cfg)
+    _set_ocsvm_threshold_config(_thr_cfg)
+    _ocsvm_threshold_policy = _threshold_policy_str(
+        {"strategy": _thr_cfg["strategy"], "percentile": _thr_cfg["percentile"],
+         "pot_quantile": _thr_cfg["pot_quantile"], "target_tail_prob": _thr_cfg["target_tail_prob"]}
+    )
 
     # Fixed SVM params (not tuned)
     fixed_params: dict = {
@@ -324,6 +347,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
         dataset=args.dataset,
         split_path=args.split_path,
     )
+    val_df, test_df = apply_fold_overrides(args, val_df, test_df)
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
 
@@ -396,7 +420,11 @@ def run_one_class_svm(config: dict | None = None) -> None:
         val_macro = macro.get("macro_per_class_pr_auc")
         return float(val_macro) if isinstance(val_macro, (int, float, np.integer, np.floating)) else 0.0
 
-    if args.no_optuna:
+    if args.best_params:
+        best_params = json.loads(args.best_params)
+        study = None
+        logger.info(f"Applying best_params from CLI (skipping HPO): {best_params}")
+    elif args.no_optuna:
         best_params = midpoint_params_from_space(search_space)
         study = None
         logger.info(f"HPO skipped — using midpoint params: {best_params}")
@@ -478,7 +506,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
         "val_worst_class_pr_auc": val_worst_class_pr_auc,
         "val_selection_score": val_selection_score,
         "threshold": threshold,
-        "threshold_policy": "validation_pr_curve_f1",
+        "threshold_policy": _ocsvm_threshold_policy,
         "test_pr_auc": test_pr_auc,
         "test_roc_auc": test_roc_auc,
         "test_f1_at_threshold": test_f1,
@@ -522,6 +550,8 @@ def run_one_class_svm(config: dict | None = None) -> None:
     pr_curve_path = artifacts_dir / "pr_curve.png"
     histogram_path = artifacts_dir / "score_histogram.png"
     timeline_path = artifacts_dir / "score_timeline.png"
+    best_params_path = artifacts_dir / "hpo_best_params.json"
+    best_params_path.write_text(json.dumps(best_params, indent=2, default=str), encoding="utf-8")
 
     joblib.dump(final_model, model_path)
     joblib.dump(scaler, scaler_path)
@@ -561,7 +591,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
         score_direction="higher_is_more_anomalous",
         classes=[str(c) for c in sorted(np.unique(y_test).tolist())],
         extras={
-            "threshold_policy": "validation_pr_curve_f1",
+            "threshold_policy": _ocsvm_threshold_policy,
             "score_calibration_artifact": score_calibration_path.name,
         },
     )
@@ -569,7 +599,7 @@ def run_one_class_svm(config: dict | None = None) -> None:
         score_calibration_path,
         build_score_calibration_payload(
             threshold=threshold,
-            threshold_policy="validation_pr_curve_f1",
+            threshold_policy=_ocsvm_threshold_policy,
             threshold_quantile=None,
             candidate_per_true_class_thresholds=candidate_per_true_class_thresholds,
         ),

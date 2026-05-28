@@ -56,6 +56,12 @@ from src.modeling.common.dl_training_utils import (
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.feature_loader import load_features_for_task
+from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
+from src.modeling.common.threshold_calibration import (
+    calibrate_threshold,
+    load_threshold_config,
+    threshold_policy_str,
+)
 from src.modeling.common.hyperparameter_optimizer import HPOStageResult
 from src.utils.paths import get_experiments_root
 
@@ -119,6 +125,7 @@ def _parse_args() -> argparse.Namespace:
             'Example: \'{"learning_rate": 3.2e-4, "k": 4.77, "temperature": 10}\''
         ),
     )
+    add_fold_override_args(p)
     return p.parse_args()
 
 
@@ -1030,6 +1037,7 @@ def run_maat(config: dict | None = None) -> None:
         dataset=args.dataset,
         split_path=args.split_path,
     )
+    val_df, test_df = apply_fold_overrides(args, val_df, test_df)
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
     n_features = len(features)
@@ -1382,7 +1390,20 @@ def run_maat(config: dict | None = None) -> None:
         logger.error("Score arrays not populated — test may not have run.")
         return
 
-    threshold = final_lit.val_threshold
+    # Override the F1-sweep threshold with the shared GPD/quantile calibration on
+    # val-normal scores so the comparison-table threshold strategy is uniform
+    # across PC-AE / PC-DLSSM / MAAT / OC-SVM / IForest / BOCD.
+    _thr_cfg = load_threshold_config(config, maat_cfg)
+    _normal_val_scores = val_scores[val_labels == 0]
+    if _normal_val_scores.size > 0:
+        threshold, _thr_diag = calibrate_threshold(_normal_val_scores, **_thr_cfg)
+        logger.info("MAAT threshold overridden by shared calibration ({}): {:.6f}",
+                    _thr_diag.get("strategy"), threshold)
+        final_lit.val_threshold = threshold
+        _maat_threshold_policy = threshold_policy_str(_thr_diag)
+    else:
+        threshold = final_lit.val_threshold
+        _maat_threshold_policy = THRESHOLD_POLICY_NAME
     val_pr_auc = _safe_pr_auc(val_labels, val_scores)
     val_roc_auc = _safe_roc_auc(val_labels, val_scores)
     val_preds = (val_scores >= threshold).astype(int)

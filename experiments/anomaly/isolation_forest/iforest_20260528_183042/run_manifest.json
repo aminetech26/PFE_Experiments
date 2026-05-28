@@ -1,0 +1,13 @@
+{
+  "task": "anomaly_semisup",
+  "model": "isolation_forest",
+  "model_family": "anomaly_ml",
+  "dataset": "costa",
+  "split_path": "path_a",
+  "feature_profile": "None",
+  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\anomaly_semisup\\runs\\plus_physics",
+  "seed": 42,
+  "run_type": "baseline",
+  "artifact_contract_version": 1,
+  "run_name": "anomaly_isolation_forest_20260528_183042"
+}

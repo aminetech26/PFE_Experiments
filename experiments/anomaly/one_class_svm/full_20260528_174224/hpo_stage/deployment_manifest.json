@@ -1,0 +1,38 @@
+{
+  "task": "anomaly_semisup",
+  "model": "one_class_svm",
+  "model_family": "anomaly_ml",
+  "model_artifact": "model.joblib",
+  "feature_names": [
+    "current_imbalance",
+    "dI_dt",
+    "dP_dt",
+    "dV_dt",
+    "idc1",
+    "idc2",
+    "irr",
+    "pdc1",
+    "pdc2",
+    "pdc_temp_corrected",
+    "pdc_temp_corrected_norm_irr",
+    "power_imbalance",
+    "pvt",
+    "temp_loss_pmax",
+    "vdc1",
+    "vdc2",
+    "voltage_imbalance"
+  ],
+  "label_column": "label",
+  "threshold": 1.762926216275602,
+  "scaler_artifact": "scaler.joblib",
+  "classes": [
+    "0.0",
+    "1.0",
+    "2.0",
+    "3.0",
+    "4.0"
+  ],
+  "score_direction": "higher_is_more_anomalous",
+  "threshold_policy": "validation_pr_curve_f1",
+  "score_calibration_artifact": "score_calibration.json"
+}

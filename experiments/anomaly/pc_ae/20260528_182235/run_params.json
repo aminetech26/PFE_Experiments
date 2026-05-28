@@ -1,0 +1,30 @@
+{
+  "variant": "PC-AE",
+  "win_size": 1,
+  "train_stride": 1,
+  "eval_stride": 1,
+  "hidden_dim": 64,
+  "latent_dim": 16,
+  "dropout": 0.1,
+  "context_features": [
+    "irr",
+    "pvt"
+  ],
+  "lambda_c_inv": 1.0,
+  "threshold_strategy": "gpd",
+  "pot_quantile": 0.9,
+  "target_tail_prob": 0.05,
+  "threshold_percentile": 95.0,
+  "batch_size": 4096,
+  "learning_rate": 0.001,
+  "weight_decay": 1e-05,
+  "gradient_clip_val": 1.0,
+  "max_epochs": 50,
+  "patience": 10,
+  "accelerator": "auto",
+  "precision": "32-true",
+  "scaling": "standard",
+  "max_epochs_actual": 1,
+  "n_features": 17,
+  "seed": 42
+}

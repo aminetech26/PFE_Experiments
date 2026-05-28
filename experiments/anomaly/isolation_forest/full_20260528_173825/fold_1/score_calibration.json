@@ -1,0 +1,55 @@
+{
+  "score_direction": "higher_is_more_anomalous",
+  "threshold_policy": "validation_pr_curve_f1",
+  "threshold": 0.5020286761553675,
+  "test_not_used_for_calibration": true,
+  "score_stats": {},
+  "candidate_per_true_class_thresholds": {
+    "threshold_policy": "validation_true_class_pr_curve_f1",
+    "deployment_ready": false,
+    "intended_use": "diagnostic_or_candidate_class_conditioned_gate",
+    "normal_label": 0,
+    "thresholds": {
+      "1": {
+        "threshold": 0.5808004750530534,
+        "val_f1": 0.9550488599348534,
+        "val_support_fault": 3712,
+        "val_support_normal": 32390,
+        "test_precision": 0.3686331399097357,
+        "test_recall": 1.0,
+        "test_f1": 0.5386880226121776,
+        "test_pr_auc": 0.2869772151907731
+      },
+      "2": {
+        "threshold": 0.5245891033836131,
+        "val_f1": 0.6458411742566805,
+        "val_support_fault": 2855,
+        "val_support_normal": 32390,
+        "test_precision": 0.4227840827467318,
+        "test_recall": 0.7831293241085684,
+        "test_f1": 0.5491183879093199,
+        "test_pr_auc": 0.34950342875617135
+      },
+      "3": {
+        "threshold": 0.676373677323315,
+        "val_f1": 0.9998958441828977,
+        "val_support_fault": 4800,
+        "val_support_normal": 32390,
+        "test_precision": 0.9991809991809992,
+        "test_recall": 0.9967320261437909,
+        "test_f1": 0.9979550102249489,
+        "test_pr_auc": 0.9999540733330261
+      },
+      "4": {
+        "threshold": 0.5020286761553675,
+        "val_f1": 0.9493250350631136,
+        "val_support_fault": 114576,
+        "val_support_normal": 32390,
+        "test_precision": 0.8392926645735489,
+        "test_recall": 0.9276690327669033,
+        "test_f1": 0.8812707321558717,
+        "test_pr_auc": 0.9443889345239412
+      }
+    }
+  }
+}

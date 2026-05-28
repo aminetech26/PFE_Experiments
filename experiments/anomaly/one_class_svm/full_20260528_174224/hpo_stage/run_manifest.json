@@ -1,0 +1,14 @@
+{
+  "task": "anomaly_semisup",
+  "model": "one_class_svm",
+  "model_family": "anomaly_ml",
+  "dataset": "costa",
+  "split_path": "path_a",
+  "feature_profile": "None",
+  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\anomaly_semisup\\runs\\plus_physics",
+  "seed": 42,
+  "run_type": "hpo_stage",
+  "artifact_contract_version": 1,
+  "run_name": "anomaly_one_class_svm_rbf_20260528_174443",
+  "kernel": "rbf"
+}

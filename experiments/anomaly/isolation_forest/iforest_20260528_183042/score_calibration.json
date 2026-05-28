@@ -1,0 +1,55 @@
+{
+  "score_direction": "higher_is_more_anomalous",
+  "threshold_policy": "gpd_pot0.9_p0.05",
+  "threshold": 0.5524675965682557,
+  "test_not_used_for_calibration": true,
+  "score_stats": {},
+  "candidate_per_true_class_thresholds": {
+    "threshold_policy": "validation_true_class_pr_curve_f1",
+    "deployment_ready": false,
+    "intended_use": "diagnostic_or_candidate_class_conditioned_gate",
+    "normal_label": 0,
+    "thresholds": {
+      "1": {
+        "threshold": 0.5705685748820888,
+        "val_f1": 0.8961569910057237,
+        "val_support_fault": 3560,
+        "val_support_normal": 38481,
+        "test_precision": 0.9577023498694517,
+        "test_recall": 0.7519475194751948,
+        "test_f1": 0.842443729903537,
+        "test_pr_auc": 0.9508840405808916
+      },
+      "2": {
+        "threshold": 0.5286814327024729,
+        "val_f1": 0.5916977115486962,
+        "val_support_fault": 7516,
+        "val_support_normal": 38481,
+        "test_precision": 0.3979560235366987,
+        "test_recall": 0.4500875656742557,
+        "test_f1": 0.42241946088099935,
+        "test_pr_auc": 0.3360905417354986
+      },
+      "3": {
+        "threshold": 0.6456941808707202,
+        "val_f1": 1.0,
+        "val_support_fault": 3614,
+        "val_support_normal": 38481,
+        "test_precision": 1.0,
+        "test_recall": 0.9759336099585062,
+        "test_f1": 0.9878202435951281,
+        "test_pr_auc": 1.0
+      },
+      "4": {
+        "threshold": 0.4654000558430398,
+        "val_f1": 0.8903905887165153,
+        "val_support_fault": 107253,
+        "val_support_normal": 38481,
+        "test_precision": 0.69925011683732,
+        "test_recall": 0.8543305042954658,
+        "test_f1": 0.7690501501115615,
+        "test_pr_auc": 0.9076879965217914
+      }
+    }
+  }
+}

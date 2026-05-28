@@ -11,6 +11,21 @@ experiment:
 # TASK A — Anomaly Detection
 # ============================================================================
 anomaly_detection:
+  # ── Shared threshold calibration — applies to every anomaly detector ───────
+  # All baselines (PC-AE, PC-DLSSM, MAAT, OC-SVM, IForest, BOCD) use this same
+  # procedure on their normal-class scores so cross-model comparisons are
+  # apples-to-apples. Per-model overrides are still possible via
+  # `<model>.threshold_strategy` etc., but the default is what's set here.
+  threshold:
+    # "gpd"      — Peaks-Over-Threshold + Generalized Pareto fit (recommended).
+    # "quantile" — q-th percentile of normal scores (simple fallback).
+    strategy: gpd
+    # GPD params:
+    pot_quantile: 0.90          # quantile that starts the tail (typical 0.80–0.95)
+    target_tail_prob: 0.05      # desired P(score > threshold) on normal data
+    # Quantile-strategy fallback / param:
+    percentile: 95.0
+
   # Runtime decomposition: ml + dl
   ml:
     active_model: one_class_svm
@@ -204,7 +219,18 @@ anomaly_detection:
         context_features: [irr, pvt]
         # Regularizer weight: forces encode(x) ≈ encode(shuffle_c_in_x(x))
         lambda_c_inv: 1.0
-        # Threshold calibration: q-th percentile of TRAINING reconstruction errors.
+        # Threshold calibration strategy.
+        # - "gpd": Peaks-Over-Threshold + Generalized Pareto fit on training tail.
+        #          Extrapolates the tail rather than relying on a single empirical
+        #          quantile — more rigorous when targeting a low FAR. (Default.)
+        # - "quantile": Threshold = q-th percentile of training reconstruction errors.
+        threshold_strategy: gpd
+        # GPD parameters (only used when threshold_strategy = gpd):
+        #   pot_quantile: quantile defining the start of the tail (typical 0.80–0.95).
+        #   target_tail_prob: desired P(score > threshold) on normal data (FAR target).
+        pot_quantile: 0.90
+        target_tail_prob: 0.05
+        # Fallback quantile if threshold_strategy = quantile or GPD has too few exceedances.
         threshold_percentile: 95.0
         batch_size: 4096
         learning_rate: 1.0e-3
