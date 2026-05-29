@@ -61,6 +61,10 @@ from src.modeling.common.dl_training_utils import (
     _trainer_runtime_kwargs,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
+from src.modeling.common.operating_point import (
+    compute_operating_points,
+    flatten_operating_points,
+)
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.hyperparameter_optimizer import (
     _build_pruner,
@@ -735,6 +739,22 @@ def run_pc_ae(config: dict | None = None) -> None:
                     test_episode_metrics.get("episode_worst_class_pr_auc") or 0.0,
                     test_episode_metrics.get("n_episodes") or 0)
 
+    # ── Uniform operating-point system (GPD baseline + sensitive + hysteresis) ──
+    _op_cfg = config["anomaly_detection"].get("operating_point", {})
+    operating_points = compute_operating_points(
+        calib_normal_scores=val_scores[val_labels == 0],  # held-out val-normal (uniform across models)
+        test_labels=test_labels, test_scores=test_scores, test_group_ids=test_group_ids,
+        pot_quantile=float(thr_cfg.get("pot_quantile", 0.90)),
+        baseline_fpr=float(_op_cfg.get("baseline_fpr", 0.05)),
+        sensitive_fpr=float(_op_cfg.get("sensitive_fpr", 0.20)),
+        hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
+    )
+    _op = operating_points["sensitive_hysteresis"]
+    logger.info(
+        "Operating points — gpd_baseline F1={:.4f} | sensitive+hyst(N={}) F1={:.4f} P={:.4f} R={:.4f}",
+        operating_points["gpd_baseline"]["f1"], _op["hysteresis_n"], _op["f1"], _op["precision"], _op["recall"],
+    )
+
     metrics = {
         "score_name": "pc_ae_recon_mse",
         "score_components": ["reconstruction_mse"],
@@ -773,6 +793,8 @@ def run_pc_ae(config: dict | None = None) -> None:
         "n_features": n_features, "n_context_features": len(context_feature_indices),
         "fit_time_s": round(fit_time, 2),
     }
+    metrics.update(flatten_operating_points(operating_points, "test"))
+
     run_name = f"pc_ae_{ts}"
     run_params = {
         "variant": variant,

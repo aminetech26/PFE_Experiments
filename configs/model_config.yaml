@@ -26,6 +26,18 @@ anomaly_detection:
     # Quantile-strategy fallback / param:
     percentile: 95.0
 
+  # ── Uniform operating-point system — applied to EVERY detector ─────────────
+  # Reported alongside threshold-free PR-AUC. All thresholds calibrated on TRAIN
+  # normal scores only (blindfolded). sensitive_fpr and hysteresis_n are a-priori
+  # design choices (N = detection-latency budget in samples), NEVER tuned on test.
+  # Rationale: temporal hysteresis suppresses the transient false alarms a
+  # sensitive per-sample threshold admits, so the detector runs a more sensitive
+  # cutoff (recall up) while the N-consecutive rule restores precision.
+  operating_point:
+    baseline_fpr: 0.05          # conservative GPD reference operating point
+    sensitive_fpr: 0.20         # sensitive GPD threshold (recovers recall)
+    hysteresis_n: 10            # N-consecutive confirmation (9 s latency at 1 Hz)
+
   # Runtime decomposition: ml + dl
   ml:
     active_model: one_class_svm
@@ -35,7 +47,7 @@ anomaly_detection:
       sampler: tpe
       pruner: none
       study_name_prefix: anomaly_ml
-      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_ml.db"
+      storage_url: null          # in-memory Optuna; SQLite-on-Drive hangs (see MAAT fix)
       n_trials_phase1: 35
       timeout_seconds: null
     models:
@@ -98,10 +110,13 @@ anomaly_detection:
     hpo:
       mode: conditional
       sampler: tpe
-      pruner: hyperband
+      pruner: median             # was hyperband; median prunes predictably at low n_trials
       early_stopping: true
       study_name_prefix: anomaly_dl_maat
-      storage_url: "sqlite:////content/drive/MyDrive/PV-FDD/optuna/db/optuna_dl.db"
+      timeout_seconds: 10800     # 3h hard wall-clock cap on the HPO study (safety net)
+      # storage_url removed — MAAT now uses an in-memory Optuna study. A SQLite DB
+      # on the Google-Drive mount hangs indefinitely on lock acquisition (8h silent hang).
+      storage_url: null
       trial_budget:
         stage1_training: 35
         stage2_architecture: 25
@@ -268,7 +283,7 @@ anomaly_detection:
         win_size: 1
         train_stride: 1
         eval_stride: 1
-        coupling_type: spline          # "affine" or "spline"
+        coupling_type: affine          # "affine" (contribution) or "spline" (negative ablation)
         spline_bins: 8                 # bins per spline segment (ignored for affine)
         tail_bound: 5.0                # spline domain ±tail_bound; identity outside
         n_coupling_layers: 4

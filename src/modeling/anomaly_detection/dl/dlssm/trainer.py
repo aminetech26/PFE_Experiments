@@ -53,6 +53,10 @@ from src.modeling.common.dl_training_utils import (
     _trainer_runtime_kwargs,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
+from src.modeling.common.operating_point import (
+    compute_operating_points,
+    flatten_operating_points,
+)
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
 from src.modeling.common.threshold_calibration import (
@@ -1298,6 +1302,23 @@ def run_dlssm(config: dict | None = None) -> None:
 
     score_components = ["reconstruction", "kl_q_pc"] if lit._pc_scoring_active() else ["reconstruction", "kl"]
 
+    # ── Uniform operating-point system (GPD baseline + sensitive + hysteresis) ──
+    _op_cfg = config["anomaly_detection"].get("operating_point", {})
+    _normal_scores = val_scores[val_labels == 0]  # blindfolded normal calibration source
+    operating_points = compute_operating_points(
+        calib_normal_scores=_normal_scores,  # held-out val-normal (uniform across models)
+        test_labels=test_labels, test_scores=test_scores, test_group_ids=test_group_ids,
+        pot_quantile=float(_thr_cfg.get("pot_quantile", 0.90)),
+        baseline_fpr=float(_op_cfg.get("baseline_fpr", 0.05)),
+        sensitive_fpr=float(_op_cfg.get("sensitive_fpr", 0.20)),
+        hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
+    )
+    _op = operating_points["sensitive_hysteresis"]
+    logger.info(
+        "Operating points — gpd_baseline F1={:.4f} | sensitive+hyst(N={}) F1={:.4f} P={:.4f} R={:.4f}",
+        operating_points["gpd_baseline"]["f1"], _op["hysteresis_n"], _op["f1"], _op["precision"], _op["recall"],
+    )
+
     metrics: dict = {
         "score_name": "dlssm_score",
         "score_components": score_components,
@@ -1332,6 +1353,8 @@ def run_dlssm(config: dict | None = None) -> None:
         "n_features": n_features,
         "fit_time_s": round(fit_time, 2),
     }
+    metrics.update(flatten_operating_points(operating_points, "test"))
+
     run_name = f"dlssm_{ts}"
 
     # Save artifacts

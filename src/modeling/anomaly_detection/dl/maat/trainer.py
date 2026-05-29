@@ -55,6 +55,10 @@ from src.modeling.common.dl_training_utils import (
     _trainer_runtime_kwargs,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
+from src.modeling.common.operating_point import (
+    compute_operating_points,
+    flatten_operating_points,
+)
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
 from src.modeling.common.threshold_calibration import (
@@ -1235,18 +1239,60 @@ def run_maat(config: dict | None = None) -> None:
         )
 
         sampler = optuna.samplers.TPESampler(seed=seed)
-        pruner = optuna.pruners.HyperbandPruner()
+        pruner = optuna.pruners.MedianPruner(n_warmup_steps=pruning_warmup_epochs)
+        # In-memory study — NOT a SQLite DB on a Google-Drive mount. Drive-mounted
+        # SQLite hangs indefinitely on lock acquisition with no log output (the
+        # 8h silent-hang root cause). HPO runs once and best params are persisted
+        # to JSON, so no Optuna DB is needed. MedianPruner (not Hyperband) prunes
+        # predictably at low trial counts; matches pc_flow/pc_ae/dlssm.
         study = optuna.create_study(
             direction="maximize",
             sampler=sampler,
             pruner=pruner,
-            storage=hpo_cfg.get("storage_url"),
             study_name=study_name,
-            load_if_exists=True,
         )
 
-        logger.info(f"Running conditional HPO | n_trials={n_trials} | study={study_name}")
-        study.optimize(_conditional_objective, n_trials=n_trials)
+        _hpo_timeout = hpo_cfg.get("timeout_seconds")
+        logger.info(
+            "Running conditional HPO | n_trials={} | timeout={}s | study={}",
+            n_trials, _hpo_timeout, study_name,
+        )
+
+        # Per-trial progress logging (mirrors pc_flow) + a START line so a hang
+        # mid-trial is pinpointed: you see "trial N starting" then silence.
+        _hpo_start = time.time()
+        _done = 0
+
+        def _objective_with_progress(trial: optuna.Trial) -> float:
+            nonlocal _done
+            logger.info(
+                "HPO trial {}/{} starting | elapsed {:.0f}s",
+                _done + 1, n_trials, time.time() - _hpo_start,
+            )
+            try:
+                score = _conditional_objective(trial)
+                logger.info("HPO trial {}/{} done | selection_score={:.4f}", _done + 1, n_trials, score)
+                return score
+            except optuna.exceptions.TrialPruned:
+                logger.info("HPO trial {}/{} pruned", _done + 1, n_trials)
+                raise
+            finally:
+                _done += 1
+                _elapsed = time.time() - _hpo_start
+                _rate = _done / _elapsed if _elapsed > 0 else 0.0
+                _eta = (n_trials - _done) / _rate if _rate > 0 else 0.0
+                logger.info(
+                    "HPO progress {}/{} | elapsed {:.0f}s | ETA {:.0f}s",
+                    _done, n_trials, _elapsed, _eta,
+                )
+
+        study.optimize(_objective_with_progress, n_trials=n_trials, timeout=_hpo_timeout)
+        _completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        logger.info(
+            "HPO finished | {} trials completed in {:.0f}s | best={:.4f}",
+            len(_completed), time.time() - _hpo_start,
+            study.best_value if _completed else float("nan"),  # best_value raises if none completed
+        )
 
         stage_results = [HPOStageResult(
             name="conditional",
@@ -1448,6 +1494,22 @@ def run_maat(config: dict | None = None) -> None:
     _val_n_pos = int(val_labels.sum()) if val_labels is not None else 0
     _threshold_method = "max_macro_fault_f1"
 
+    # ── Uniform operating-point system (GPD baseline + sensitive + hysteresis) ──
+    _op_cfg = config["anomaly_detection"].get("operating_point", {})
+    operating_points = compute_operating_points(
+        calib_normal_scores=_normal_val_scores,  # held-out val-normal (uniform across models)
+        test_labels=test_labels, test_scores=test_scores, test_group_ids=test_group_ids,
+        pot_quantile=float(_thr_cfg.get("pot_quantile", 0.90)),
+        baseline_fpr=float(_op_cfg.get("baseline_fpr", 0.05)),
+        sensitive_fpr=float(_op_cfg.get("sensitive_fpr", 0.20)),
+        hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
+    )
+    _op = operating_points["sensitive_hysteresis"]
+    logger.info(
+        "Operating points — gpd_baseline F1={:.4f} | sensitive+hyst(N={}) F1={:.4f} P={:.4f} R={:.4f}",
+        operating_points["gpd_baseline"]["f1"], _op["hysteresis_n"], _op["f1"], _op["precision"], _op["recall"],
+    )
+
     metrics: dict = {
         "score_name": "pv_maat_score",
         "score_fusion": OFFICIAL_SCORE_FUSION,
@@ -1488,6 +1550,7 @@ def run_maat(config: dict | None = None) -> None:
         "val_gate_stats": (final_lit._val_gate_raw or {}).copy(),
         "test_gate_stats": (final_lit._test_gate_raw or {}).copy(),
     }
+    metrics.update(flatten_operating_points(operating_points, "test"))
     run_name = f"anomaly_maat_{ts}"
 
     # ── Save artifacts ──────────────────────────────────────────────────────────

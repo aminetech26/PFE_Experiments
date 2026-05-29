@@ -33,11 +33,16 @@ from src.modeling.common.artifact_contract import (
     build_deployment_manifest,
     build_run_manifest,
     build_score_calibration_payload,
-    compute_macro_per_class_pr_auc,
     compute_anomaly_per_class_metrics,
+    compute_episode_level_pr_auc,
+    compute_macro_per_class_pr_auc,
     write_json,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
+from src.modeling.common.operating_point import (
+    compute_operating_points,
+    flatten_operating_points,
+)
 from src.modeling.common.feature_loader import load_features_for_task
 from src.modeling.common.fold_override import add_fold_override_args, apply_fold_overrides
 from src.modeling.common.threshold_calibration import (
@@ -529,6 +534,39 @@ def run_one_class_svm(config: dict | None = None) -> None:
     logger.info(
         f"Test — PR-AUC={test_pr_auc:.4f}  ROC-AUC={test_roc_auc:.4f}  ACC@thr={test_acc:.4f}  "
         f"F1@thr={test_f1:.4f}  Prec={test_prec_val:.4f}  Rec={test_rec_val:.4f}"
+    )
+
+    # ── Episode-level PR-AUC (closes the ML null-gap) ────────────────────────
+    if test_group_ids is not None:
+        test_episode_metrics = compute_episode_level_pr_auc(
+            labels=y_test_bin, scores=test_scores,
+            original_labels=y_test, group_ids=test_group_ids, agg="p95",
+        )
+        metrics.update({
+            "test_episode_binary_pr_auc": test_episode_metrics.get("episode_binary_pr_auc"),
+            "test_episode_macro_per_class_pr_auc": test_episode_metrics.get("episode_macro_per_class_pr_auc"),
+            "test_episode_worst_class_pr_auc": test_episode_metrics.get("episode_worst_class_pr_auc"),
+            "test_episode_class1_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("1"),
+            "test_episode_class2_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("2"),
+            "test_episode_class3_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("3"),
+            "test_episode_class4_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("4"),
+        })
+
+    # ── Uniform operating-point system (GPD baseline + sensitive + hysteresis) ──
+    _op_cfg = config.get("anomaly_detection", {}).get("operating_point", {})
+    _pot_q = config.get("anomaly_detection", {}).get("threshold", {}).get("pot_quantile", 0.90)
+    operating_points = compute_operating_points(
+        calib_normal_scores=val_scores[y_val_bin == 0], test_labels=y_test_bin, test_scores=test_scores,
+        test_group_ids=test_group_ids, pot_quantile=float(_pot_q),
+        baseline_fpr=float(_op_cfg.get("baseline_fpr", 0.05)),
+        sensitive_fpr=float(_op_cfg.get("sensitive_fpr", 0.20)),
+        hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
+    )
+    metrics.update(flatten_operating_points(operating_points, "test"))
+    _op = operating_points["sensitive_hysteresis"]
+    logger.info(
+        "Operating points — gpd_baseline F1={:.4f} | sensitive+hyst(N={}) F1={:.4f} P={:.4f} R={:.4f}",
+        operating_points["gpd_baseline"]["f1"], _op["hysteresis_n"], _op["f1"], _op["precision"], _op["recall"],
     )
 
     # ── Save artifacts ────────────────────────────────────────────────────────

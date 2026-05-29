@@ -68,6 +68,10 @@ from src.modeling.common.hyperparameter_optimizer import (
     _build_sampler,
     suggest_params_from_space,
 )
+from src.modeling.common.operating_point import (
+    compute_operating_points,
+    flatten_operating_points,
+)
 from src.modeling.common.threshold_calibration import (
     calibrate_threshold,
     calibrate_threshold_quantile,
@@ -721,6 +725,24 @@ def run_pc_flow(config: dict | None = None) -> None:
                     test_episode_metrics.get("episode_worst_class_pr_auc") or 0.0,
                     test_episode_metrics.get("n_episodes") or 0)
 
+    # ── Uniform operating-point system (GPD baseline + sensitive + hysteresis) ──
+    op_cfg = config["anomaly_detection"].get("operating_point", {})
+    operating_points = compute_operating_points(
+        calib_normal_scores=val_scores[val_labels == 0],  # held-out val-normal (uniform across models)
+        test_labels=test_labels, test_scores=test_scores, test_group_ids=test_group_ids,
+        pot_quantile=float(thr_cfg.get("pot_quantile", 0.90)),
+        baseline_fpr=float(op_cfg.get("baseline_fpr", 0.05)),
+        sensitive_fpr=float(op_cfg.get("sensitive_fpr", 0.20)),
+        hysteresis_n=int(op_cfg.get("hysteresis_n", 10)),
+    )
+    _op_sh = operating_points["sensitive_hysteresis"]
+    logger.info(
+        "Operating points — gpd_baseline F1={:.4f} | sensitive F1={:.4f} | "
+        "sensitive+hyst(N={}) F1={:.4f} P={:.4f} R={:.4f}",
+        operating_points["gpd_baseline"]["f1"], operating_points["sensitive"]["f1"],
+        _op_sh["hysteresis_n"], _op_sh["f1"], _op_sh["precision"], _op_sh["recall"],
+    )
+
     metrics = {
         "score_name": "pc_flow_nll",
         "score_components": ["negative_log_likelihood"],
@@ -759,6 +781,7 @@ def run_pc_flow(config: dict | None = None) -> None:
         "n_context_features": len(context_feature_indices),
         "n_params": model.n_params, "fit_time_s": round(fit_time, 2),
     }
+    metrics.update(flatten_operating_points(operating_points, "test"))
 
     run_name = f"pc_flow_{ts}"
     run_params = {
