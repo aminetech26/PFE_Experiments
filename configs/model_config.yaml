@@ -116,23 +116,28 @@ anomaly_detection:
   dl:
     active_model: maat
     hpo:
-      mode: conditional
+      # Single-stage HPO over a flat search space — same simple pattern as pc_ae/pc_flow.
+      # (Replaced the two-stage conditional HPO, which was the MAAT trainability problem.)
+      mode: single_stage
       sampler: tpe
-      pruner: median             # was hyperband; median prunes predictably at low n_trials
-      early_stopping: true
+      pruner: median
       study_name_prefix: anomaly_dl_maat
-      timeout_seconds: 10800     # 3h hard wall-clock cap on the HPO study (safety net)
-      # storage_url removed — MAAT now uses an in-memory Optuna study. A SQLite DB
-      # on the Google-Drive mount hangs indefinitely on lock acquisition (8h silent hang).
-      storage_url: null
-      trial_budget:
-        stage1_training: 35
-        stage2_architecture: 25
-      max_epochs_fraction: 0.45
-      min_hpo_epochs: 15
+      timeout_seconds: 10800     # 3h hard wall-clock cap (safety net)
+      storage_url: null          # in-memory study (no SQLite-on-Drive hang)
+      n_trials: 30
+      max_epochs_fraction: 0.30
+      min_hpo_epochs: 10
       patience_fraction: 0.40
-      min_hpo_patience: 8
-      pruning_warmup_epochs: 7
+      min_hpo_patience: 5
+      pruning_warmup_epochs: 5
+      search_space:
+        learning_rate:     {type: float, low: 5.0e-5, high: 8.0e-4, log: true}
+        weight_decay:      {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+        dropout:           {type: float, low: 0.0, high: 0.25}
+        k:                 {type: float, low: 2.0, high: 6.0}
+        temperature:       {type: categorical, choices: [10, 25, 50, 100]}
+        batch_size:        {type: categorical, choices: [512, 1024, 2048]}
+        gradient_clip_val: {type: categorical, choices: [0.5, 1.0, 2.0]}
     models:
       maat:
         win_size: 30
@@ -149,23 +154,8 @@ anomaly_detection:
         score_reduction: max
         scaling: standard
         gate_mode: learned          # learned | attention_only | mamba_only
-        hpo_stage1:
-          learning_rate:     {type: float, low: 5.0e-5, high: 8.0e-4, log: true}
-          weight_decay:      {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
-          dropout:           {type: float, low: 0.0, high: 0.25}
-          k:                 {type: float, low: 2.0, high: 6.0}
-          temperature:       {type: categorical, choices: [10, 25, 50, 100]}
-          batch_size:        {type: categorical, choices: [512, 1024, 2048]}
-          gradient_clip_val: {type: categorical, choices: [0.5, 1.0, 2.0]}
-        hpo_stage2:
-          win_size:     {type: categorical, choices: [30, 60, 90, 120]}
-          block_size:   {type: categorical, choices: [5, 10, 15, 30]}
-          d_model:      {type: categorical, choices: [32, 64, 128]}
-          n_heads:      {type: categorical, choices: [2, 4, 8]}
-          e_layers:     {type: int, low: 1, high: 4}
-          d_ff:         {type: categorical, choices: [128, 256, 512]}
-        # Single conditional study — replaces greedy two-stage when hpo.mode=conditional
-        # n_trials = stage1_training + stage2_architecture (back-compat sum)
+        # Architecture fixed at the defaults above; HPO (dl.hpo.search_space) tunes
+        # training HPs only — single-stage, like the other models.
 
       dlssm:
         win_size: 60

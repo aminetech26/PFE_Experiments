@@ -45,10 +45,6 @@ from src.modeling.common.artifact_contract import (
     compute_anomaly_per_class_metrics,
     write_json,
 )
-from src.modeling.common.conditional_search_space import (
-    normalize_conditional_params,
-    suggest_conditional_params,
-)
 from src.modeling.common.dl_training_utils import (
     _build_warmup_cosine_scheduler,
     _resolve_loader_runtime,
@@ -67,7 +63,7 @@ from src.modeling.common.threshold_calibration import (
     load_threshold_config,
     threshold_policy_str,
 )
-from src.modeling.common.hyperparameter_optimizer import HPOStageResult
+from src.modeling.common.hyperparameter_optimizer import suggest_params_from_space
 from src.utils.paths import get_experiments_root
 
 # trainer.py lives under dl/maat/, so PROJECT_ROOT is 5 levels up
@@ -1171,35 +1167,33 @@ def run_maat(config: dict | None = None) -> None:
         logger.info(f"Skipping HPO — using injected params: {injected_params}")
 
     if run_hpo:
-        trial_budget: dict = hpo_cfg.get("trial_budget", {})
-        n_trials = int(trial_budget.get("stage1_training", 20)) + int(trial_budget.get("stage2_architecture", 40))
+        search_space = hpo_cfg.get("search_space", {})
+        n_trials = int(hpo_cfg.get("n_trials", 30))
         if getattr(args, "n_trials", None) is not None:
             n_trials = int(args.n_trials)
             logger.info("MAAT HPO trial count overridden by --n-trials: {}", n_trials)
         hpo_epochs = max(
             int(hpo_cfg.get("min_hpo_epochs", 10)),
-            int(max_epochs * float(hpo_cfg.get("max_epochs_fraction", 0.25))),
+            int(max_epochs * float(hpo_cfg.get("max_epochs_fraction", 0.30))),
         )
         hpo_patience = max(
             int(hpo_cfg.get("min_hpo_patience", 5)),
-            int(patience * float(hpo_cfg.get("patience_fraction", 0.33))),
+            int(patience * float(hpo_cfg.get("patience_fraction", 0.40))),
         )
         pruning_warmup_epochs = int(hpo_cfg.get("pruning_warmup_epochs", 3))
 
-        def _conditional_objective(trial: optuna.Trial) -> float:
-            trial_p = suggest_conditional_params(trial)
-            trial_p["score_reduction"] = "max"
-
-            trial_maat_cfg = {**maat_cfg, **trial_p}
+        def _objective(trial: optuna.Trial) -> float:
+            suggested = suggest_params_from_space(trial, search_space)
+            trial_maat_cfg = {**maat_cfg, **suggested, "score_reduction": "max"}
             trial_training_cfg = {**training_cfg, **{
-                k: trial_p[k] for k in ("weight_decay", "batch_size", "gradient_clip_val")
-                if k in trial_p
+                k: suggested[k] for k in ("weight_decay", "batch_size", "gradient_clip_val")
+                if k in suggested
             }}
-            if "learning_rate" in trial_p:
-                trial_training_cfg["lr"] = float(trial_p["learning_rate"])
+            if "learning_rate" in suggested:
+                trial_training_cfg["lr"] = float(suggested["learning_rate"])
 
             trial_bs = int(trial_training_cfg.get("batch_size", min(batch_size, 128)))
-            trial_stride = int(trial_p.get("train_stride", train_stride))
+            trial_stride = int(suggested.get("train_stride", train_stride))
 
             try:
                 t_dl, v_dl, _ = _make_dataloaders(
@@ -1231,33 +1225,14 @@ def run_maat(config: dict | None = None) -> None:
                 raise optuna.TrialPruned()
             return selection_score
 
-        profile_str = str(args.profile or "default").replace("/", "_").replace("\\", "_")
-        cfg_hash = _hpo_config_fingerprint(maat_cfg, hpo_cfg, seed)
-        study_name = (
-            f"{hpo_cfg.get('study_name_prefix', 'anomaly_dl_maat')}"
-            f"_{args.dataset}_{args.task}_{args.split_path}_{profile_str}_{cfg_hash}"
-            f"__conditional"
-        )
-
         sampler = optuna.samplers.TPESampler(seed=seed)
         pruner = optuna.pruners.MedianPruner(n_warmup_steps=pruning_warmup_epochs)
-        # In-memory study — NOT a SQLite DB on a Google-Drive mount. Drive-mounted
-        # SQLite hangs indefinitely on lock acquisition with no log output (the
-        # 8h silent-hang root cause). HPO runs once and best params are persisted
-        # to JSON, so no Optuna DB is needed. MedianPruner (not Hyperband) prunes
-        # predictably at low trial counts; matches pc_flow/pc_ae/dlssm.
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=sampler,
-            pruner=pruner,
-            study_name=study_name,
-        )
+        # In-memory study (no SQLite-on-Drive → no lock hang). Single-stage flat
+        # search space — same simple pattern as pc_ae / pc_flow / dlssm.
+        study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
 
         _hpo_timeout = hpo_cfg.get("timeout_seconds")
-        logger.info(
-            "Running conditional HPO | n_trials={} | timeout={}s | study={}",
-            n_trials, _hpo_timeout, study_name,
-        )
+        logger.info("Running single-stage HPO | n_trials={} | timeout={}s", n_trials, _hpo_timeout)
 
         # Per-trial progress logging (mirrors pc_flow) + a START line so a hang
         # mid-trial is pinpointed: you see "trial N starting" then silence.
@@ -1271,7 +1246,7 @@ def run_maat(config: dict | None = None) -> None:
                 _done + 1, n_trials, time.time() - _hpo_start,
             )
             try:
-                score = _conditional_objective(trial)
+                score = _objective(trial)
                 logger.info("HPO trial {}/{} done | selection_score={:.4f}", _done + 1, n_trials, score)
                 return score
             except optuna.exceptions.TrialPruned:
@@ -1295,43 +1270,10 @@ def run_maat(config: dict | None = None) -> None:
             study.best_value if _completed else float("nan"),  # best_value raises if none completed
         )
 
-        stage_results = [HPOStageResult(
-            name="conditional",
-            best_params=normalize_conditional_params(study.best_params),
-            best_value=float(study.best_value),
-            study=study,
-        )]
-
-        # Validation-only selection: top-decile by macro-fault F1, tiebreak by simplicity
-        def _simplicity_score(t: optuna.trial.FrozenTrial) -> tuple:
-            p = normalize_conditional_params(t.params)
-            return (
-                -int(p.get("d_model", 64)),
-                -int(p.get("e_layers", 2)),
-                -int(p.get("d_ff", 256)),
-                -float(p.get("learning_rate", 1.0e-4)),
-                 int(p.get("batch_size", 256)),
-            )
-
-        completed = [
-            t for t in study.trials
-            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-            and math.isfinite(t.value)
-        ]
-        if completed:
-            top_n = max(1, len(completed) // 10)
-            top_decile = sorted(completed, key=lambda t: t.value, reverse=True)[:top_n]
-            picked = max(top_decile, key=_simplicity_score)
-            best_params = normalize_conditional_params(dict(picked.params))
-            logger.info(
-                f"[conditional] val-only select | top-decile={top_n}/{len(completed)} | "
-                f"picked selection_score={picked.value:.4f} (study max={study.best_value:.4f}) | "
-                f"params={best_params}"
-            )
-        else:
-            best_params = normalize_conditional_params(dict(study.best_params))
-
-        logger.info(f"HPO validation-only selected params: {best_params}")
+        if not _completed:
+            raise RuntimeError("MAAT HPO finished with zero completed trials.")
+        best_params = dict(study.best_params)
+        logger.info("HPO selected params: {}", best_params)
     else:
         if not injected_params:
             best_params = {}
@@ -1734,7 +1676,7 @@ def run_maat(config: dict | None = None) -> None:
                 "feature_profile": str(args.profile),
                 "feature_run_dir": str(resolved_run_dir),
                 "hpo_enabled": run_hpo,
-                "hpo_stage_budgets": hpo_cfg.get("trial_budget", {}),
+                "hpo_n_trials": hpo_cfg.get("n_trials"),
                 "best_params": best_params,
                 "n_features": n_features,
                 "win_size": int(final_maat_cfg["win_size"]),
