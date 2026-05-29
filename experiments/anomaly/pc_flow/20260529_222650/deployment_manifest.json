@@ -1,0 +1,48 @@
+{
+  "task": "anomaly_semisup",
+  "model": "pc_flow",
+  "model_family": "anomaly_dl",
+  "model_artifact": "checkpoints/best.ckpt",
+  "feature_names": [
+    "current_imbalance",
+    "dI_dt",
+    "dP_dt",
+    "dV_dt",
+    "idc1",
+    "idc2",
+    "irr",
+    "pdc1",
+    "pdc2",
+    "pdc_temp_corrected",
+    "pdc_temp_corrected_norm_irr",
+    "power_imbalance",
+    "pvt",
+    "temp_loss_pmax",
+    "vdc1",
+    "vdc2",
+    "voltage_imbalance"
+  ],
+  "label_column": "label",
+  "threshold": 19.66102512007015,
+  "scaler_artifact": "scaler.joblib",
+  "classes": [
+    "0.0",
+    "1.0",
+    "2.0",
+    "3.0",
+    "4.0"
+  ],
+  "window_size": 1,
+  "score_direction": "higher_is_more_anomalous",
+  "checkpoint_available": true,
+  "threshold_policy": "gpd_pot0.9_p0.05",
+  "selection_metric": "val_macro_per_class_pr_auc_monitor",
+  "score_name": "pc_flow_nll",
+  "context_features": [
+    "irr",
+    "pvt"
+  ],
+  "n_params": 28338,
+  "n_coupling_layers": 4,
+  "onnx_exportable": true
+}

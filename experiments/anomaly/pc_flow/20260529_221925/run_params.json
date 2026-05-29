@@ -1,0 +1,29 @@
+{
+  "variant": "PC-Flow-typicality",
+  "win_size": 1,
+  "train_stride": 1,
+  "eval_stride": 1,
+  "coupling_type": "affine",
+  "spline_bins": 8,
+  "tail_bound": 5.0,
+  "n_coupling_layers": 4,
+  "hidden_dim": 32,
+  "dropout": 0.0,
+  "context_features": [
+    "irr",
+    "pvt"
+  ],
+  "batch_size": 4096,
+  "learning_rate": 0.0003,
+  "weight_decay": 1e-05,
+  "gradient_clip_val": 1.0,
+  "max_epochs": 50,
+  "patience": 10,
+  "accelerator": "auto",
+  "precision": "32-true",
+  "max_epochs_actual": 1,
+  "n_features": 17,
+  "n_non_context": 15,
+  "n_params": 7548,
+  "seed": 42
+}

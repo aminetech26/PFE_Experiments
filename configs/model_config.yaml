@@ -37,6 +37,14 @@ anomaly_detection:
     baseline_fpr: 0.05          # conservative GPD reference operating point
     sensitive_fpr: 0.20         # sensitive GPD threshold (recovers recall)
     hysteresis_n: 10            # N-consecutive confirmation (9 s latency at 1 Hz)
+    # Conformal calibration (distribution-free FPR guarantee) + BH false-discovery control.
+    conformal_alpha: 0.05       # conformal level: P(flag | normal) <= alpha, no tail assumption
+    fdr_q: 0.10                 # Benjamini-Hochberg FDR among alarms <= q (Bates et al. 2023)
+    # CUSUM sequential detector (Page/Lorden) — principled temporal layer.
+    cusum_k: 0.5                # slack/reference in std units (≈ half the shift to detect); h auto-set to baseline_fpr
+    # NOTE: DSPOT (drift-adaptive streaming EVT) was removed — its drift adaptation
+    # can MASK slow-onset degradation (cls2 is a slow drift), and seasonal drift is
+    # already handled by PC-Flow's (irr,pvt) conditioning. See task-a-decisions memory.
 
   # Runtime decomposition: ml + dl
   ml:

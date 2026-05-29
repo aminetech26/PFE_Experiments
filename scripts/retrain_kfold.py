@@ -100,6 +100,22 @@ MODEL_REGISTRY: dict[str, dict] = {
         "hpo_on_args": ["--hpo"], "hpo_off_args": [],
         "default_args": [], "subdir": "pc_flow", "supports_smoke": True,
     },
+    # ── The two PC-Flow ablations (same module + 5-fold path; distinct subdirs) ──
+    "pc_flow_uncond": {  # ABLATION 1: drop physics conditioning → proves conditioning drives the win
+        "module": "src.modeling.anomaly_detection.dl.pc_flow.trainer",
+        "best_params_file": "hpo_best_params.json",
+        "hpo_on_args": ["--hpo"], "hpo_off_args": [],
+        "default_args": ["--unconditional"], "subdir": "pc_flow_uncond", "supports_smoke": True,
+    },
+    "pc_flow_spline_typicality": {  # ABLATION 2: does typicality rescue the spline's OOD-likelihood pathology?
+        "module": "src.modeling.anomaly_detection.dl.pc_flow.trainer",
+        "best_params_file": "hpo_best_params.json",
+        "hpo_on_args": ["--hpo"], "hpo_off_args": [],
+        "default_args": ["--coupling-type", "spline", "--score-mode", "typicality"],
+        "subdir": "pc_flow_spline_typicality", "supports_smoke": True,
+    },
+    # spline-NLL negative result already exists; it is the baseline the spline_typicality
+    # ablation is compared against (run via --coupling-type spline if a re-run is needed).
 }
 
 

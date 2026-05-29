@@ -749,6 +749,8 @@ def run_pc_ae(config: dict | None = None) -> None:
         baseline_fpr=float(_op_cfg.get("baseline_fpr", 0.05)),
         sensitive_fpr=float(_op_cfg.get("sensitive_fpr", 0.20)),
         hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
+        conformal_alpha=float(_op_cfg.get("conformal_alpha", 0.05)),
+        fdr_q=float(_op_cfg.get("fdr_q", 0.10)), op_cfg=_op_cfg,
     )
     _op = operating_points["sensitive_hysteresis"]
     logger.info(

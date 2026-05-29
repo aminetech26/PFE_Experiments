@@ -105,6 +105,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--hpo", action="store_true")
     p.add_argument("--n-trials", type=int, default=None)
     p.add_argument("--best-params", default=None)
+    # ── Ablation switches ────────────────────────────────────────────────────
+    p.add_argument("--unconditional", action="store_true",
+                   help="Ablation: drop physics conditioning — flow learns p(x), not p(x|irr,pvt).")
+    p.add_argument("--score-mode", default="nll", choices=["nll", "typicality"],
+                   help="Ablation: 'nll' = -log p(x|c); 'typicality' = |NLL - E[NLL_normal]| (two-sided).")
+    p.add_argument("--coupling-type", default=None, choices=["affine", "spline"],
+                   help="Override config coupling_type (affine=contribution, spline=negative ablation).")
     add_fold_override_args(p)
     return p.parse_args()
 
@@ -508,6 +515,15 @@ def run_pc_flow(config: dict | None = None) -> None:
     run_type = "smoke" if is_smoke else args.run_type
     variant = "PC-Flow"
 
+    # ── Ablation overrides ───────────────────────────────────────────────────
+    if args.coupling_type:
+        pc_flow_cfg = {**pc_flow_cfg, "coupling_type": args.coupling_type}
+        variant += f"-{args.coupling_type}"
+    if args.unconditional:
+        variant += "-uncond"
+    if args.score_mode == "typicality":
+        variant += "-typicality"
+
     logger.info("Loading features | task={} dataset={} split_path={} profile={}",
                 args.task, args.dataset, args.split_path, args.profile)
     train_df, val_df, test_df, manifest, resolved_run_dir = load_features_for_task(
@@ -521,11 +537,16 @@ def run_pc_flow(config: dict | None = None) -> None:
     n_features = len(features)
     feature_idx = {name: i for i, name in enumerate(features)}
 
-    context_feature_names: list[str] = pc_flow_cfg.get("context_features", ["irr", "pvt"])
-    context_feature_indices = [feature_idx[f] for f in context_feature_names if f in feature_idx]
-    if not context_feature_indices:
-        raise RuntimeError(f"None of context_features {context_feature_names} found in features {features}")
-    logger.info("Context features {} → indices {}", context_feature_names, context_feature_indices)
+    if args.unconditional:
+        context_feature_names = []
+        context_feature_indices: list[int] = []
+        logger.info("UNCONDITIONAL ablation: no physics conditioning — flow models p(x) over all {} features", n_features)
+    else:
+        context_feature_names = pc_flow_cfg.get("context_features", ["irr", "pvt"])
+        context_feature_indices = [feature_idx[f] for f in context_feature_names if f in feature_idx]
+        if not context_feature_indices:
+            raise RuntimeError(f"None of context_features {context_feature_names} found in features {features}")
+        logger.info("Context features {} → indices {}", context_feature_names, context_feature_indices)
 
     # Non-context feature indices (what the flow models)
     all_idx = set(range(n_features))
@@ -666,6 +687,18 @@ def run_pc_flow(config: dict | None = None) -> None:
     # Threshold calibration on TRAIN NLL scores (normal only)
     thr_cfg = load_threshold_config(config, pc_flow_cfg)
     train_scores_np = lit.collect_train_scores(train_dl_seq)
+    if args.score_mode == "typicality":
+        # Two-sided typicality score |NLL - E[NLL_normal]|; mu on train-normal NLL.
+        # Flags faults that are atypically LOW-density (high NLL) OR atypically
+        # HIGH-density (low NLL — the flow OOD-likelihood pathology). Transform all
+        # score arrays so GPD/operating-points/leakage all use the same score.
+        _mu = float(np.mean(train_scores_np))
+        train_scores_np = np.abs(train_scores_np - _mu)
+        if lit._val_scores_np is not None:
+            lit._val_scores_np = np.abs(lit._val_scores_np - _mu)
+        if lit._test_scores_np is not None:
+            lit._test_scores_np = np.abs(lit._test_scores_np - _mu)
+        logger.info("TYPICALITY ablation: score=|NLL - mu|, mu(train-normal NLL)={:.3f}", _mu)
     threshold, threshold_diag = calibrate_threshold(train_scores_np, **thr_cfg)
     lit.val_threshold = threshold
     threshold_policy_str_val = _threshold_policy_str(threshold_diag)
@@ -735,6 +768,8 @@ def run_pc_flow(config: dict | None = None) -> None:
         baseline_fpr=float(op_cfg.get("baseline_fpr", 0.05)),
         sensitive_fpr=float(op_cfg.get("sensitive_fpr", 0.20)),
         hysteresis_n=int(op_cfg.get("hysteresis_n", 10)),
+        conformal_alpha=float(op_cfg.get("conformal_alpha", 0.05)),
+        fdr_q=float(op_cfg.get("fdr_q", 0.10)), op_cfg=op_cfg,
     )
     _op_sh = operating_points["sensitive_hysteresis"]
     logger.info(
