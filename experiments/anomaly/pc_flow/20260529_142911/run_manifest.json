@@ -1,0 +1,16 @@
+{
+  "task": "anomaly_semisup",
+  "model": "pc_flow",
+  "model_family": "anomaly_dl",
+  "dataset": "costa",
+  "split_path": "path_a",
+  "feature_profile": "plus_physics",
+  "feature_run_dir": "C:\\Users\\AmineTECH\\Documents\\DevProjects\\pfe-experiments\\PFE_Experiments\\data\\processed\\features\\costa\\anomaly_semisup\\runs\\plus_physics",
+  "seed": 42,
+  "run_type": "smoke",
+  "artifact_contract_version": 1,
+  "run_name": "pc_flow_20260529_142911",
+  "variant": "PC-Flow",
+  "contribution": "conditional_normalizing_flow_nll_anomaly_scoring",
+  "n_params": 7548
+}

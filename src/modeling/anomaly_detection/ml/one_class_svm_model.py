@@ -26,7 +26,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 
-from src.evaluation.leakage_checks import performance_sanity_check
+from src.evaluation.leakage_checks import performance_sanity_check, run_anomaly_leakage_report
 from src.mlflow_setup import init_tracking
 from src.modeling.common.artifact_contract import (
     build_candidate_per_true_class_thresholds,
@@ -563,6 +563,13 @@ def run_one_class_svm(config: dict | None = None) -> None:
         hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
     )
     metrics.update(flatten_operating_points(operating_points, "test"))
+    leakage_report = run_anomaly_leakage_report(
+        test_scores=test_scores, test_labels=y_test_bin, pr_auc=metrics.get("test_pr_auc"), seed=seed,
+    )
+    metrics.update({
+        "leakage_is_clean": int(leakage_report["is_clean"]),
+        "leakage_shuffle_pr_auc": leakage_report["label_shuffle"]["mean_shuffle_pr_auc"],
+    })
     _op = operating_points["sensitive_hysteresis"]
     logger.info(
         "Operating points — gpd_baseline F1={:.4f} | sensitive+hyst(N={}) F1={:.4f} P={:.4f} R={:.4f}",

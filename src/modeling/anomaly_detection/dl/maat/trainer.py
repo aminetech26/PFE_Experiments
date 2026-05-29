@@ -54,6 +54,7 @@ from src.modeling.common.dl_training_utils import (
     _resolve_loader_runtime,
     _trainer_runtime_kwargs,
 )
+from src.evaluation.leakage_checks import run_anomaly_leakage_report
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.operating_point import (
     compute_operating_points,
@@ -1551,6 +1552,13 @@ def run_maat(config: dict | None = None) -> None:
         "test_gate_stats": (final_lit._test_gate_raw or {}).copy(),
     }
     metrics.update(flatten_operating_points(operating_points, "test"))
+    leakage_report = run_anomaly_leakage_report(
+        test_scores=test_scores, test_labels=test_labels, pr_auc=test_pr_auc, seed=seed,
+    )
+    metrics.update({
+        "leakage_is_clean": int(leakage_report["is_clean"]),
+        "leakage_shuffle_pr_auc": leakage_report["label_shuffle"]["mean_shuffle_pr_auc"],
+    })
     run_name = f"anomaly_maat_{ts}"
 
     # ── Save artifacts ──────────────────────────────────────────────────────────

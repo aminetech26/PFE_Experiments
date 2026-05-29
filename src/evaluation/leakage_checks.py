@@ -314,6 +314,124 @@ def bootstrap_confidence_interval(
 
 
 # ============================================================================
+# ANOMALY-DETECTION LEAKAGE REPORT (semi-supervised, score-based)
+# ============================================================================
+# The supervised label_shuffle_test / feature_importance_audit above do NOT apply
+# to semi-supervised anomaly detectors: training never sees labels, and the
+# decision is a threshold on a continuous score, not model.predict(X). These
+# functions implement the AD-appropriate checks on (scores, labels, features).
+
+
+def anomaly_label_shuffle_test(
+    scores: np.ndarray, labels: np.ndarray, n_shuffles: int = 10, seed: int = 42
+) -> dict:
+    """Metric-level label shuffle for anomaly detection.
+
+    Random label permutations must collapse PR-AUC toward the base rate (fault
+    prevalence) — a ranking-based metric on shuffled labels has no signal. If the
+    shuffled PR-AUC stays well above the base rate, the metric/eval is artifactual
+    (a bug or leakage), not the model. No retraining: scores are fixed.
+    """
+    from sklearn.metrics import average_precision_score
+
+    labels = np.asarray(labels).astype(int)
+    scores = np.asarray(scores, dtype=float)
+    real = float(average_precision_score(labels, scores))
+    base_rate = float(labels.mean())
+    rng = np.random.default_rng(seed)
+    shuffled = [float(average_precision_score(rng.permutation(labels), scores)) for _ in range(n_shuffles)]
+    mean_shuffle = float(np.mean(shuffled))
+    # Random ranking → PR-AUC ≈ base rate. Flag if it stays materially above it.
+    is_leaking = mean_shuffle > base_rate + 0.05
+    result = {
+        "real_pr_auc": real,
+        "base_rate": base_rate,
+        "mean_shuffle_pr_auc": mean_shuffle,
+        "shuffle_minus_base": mean_shuffle - base_rate,
+        "is_leaking": is_leaking,
+    }
+    if is_leaking:
+        logger.warning(
+            "LEAKAGE ALERT (label shuffle): shuffled PR-AUC {:.3f} >> base rate {:.3f} "
+            "(real {:.3f}) — metric may be artifactual",
+            mean_shuffle, base_rate, real,
+        )
+    else:
+        logger.success(
+            "Label shuffle OK: shuffled PR-AUC {:.3f} ≈ base rate {:.3f} (real {:.3f})",
+            mean_shuffle, base_rate, real,
+        )
+    return result
+
+
+def array_overlap_check(
+    train_features: np.ndarray, test_features: np.ndarray, decimals: int = 6
+) -> dict:
+    """Exact-row overlap between train and test feature matrices (data leakage).
+
+    Any test row that is an exact duplicate of a train row means train/test share
+    samples — the real leakage risk for AD (e.g. a window appearing in both).
+    """
+    tr = {tuple(r) for r in np.round(np.asarray(train_features, dtype=float), decimals)}
+    test_rows = [tuple(r) for r in np.round(np.asarray(test_features, dtype=float), decimals)]
+    overlap = sum(1 for r in test_rows if r in tr)
+    pct = (overlap / len(test_rows) * 100.0) if test_rows else 0.0
+    result = {
+        "train_rows": len(tr),
+        "test_rows": len(test_rows),
+        "overlapping_rows": overlap,
+        "overlap_pct": pct,
+        "is_leaking": pct > 1.0,
+    }
+    if result["is_leaking"]:
+        logger.warning("LEAKAGE ALERT (duplicates): {:.2f}% of test rows duplicate train rows", pct)
+    else:
+        logger.success("Duplicate check OK: {:.3f}% train/test row overlap", pct)
+    return result
+
+
+def run_anomaly_leakage_report(
+    *,
+    test_scores: np.ndarray,
+    test_labels: np.ndarray,
+    train_features: np.ndarray | None = None,
+    test_features: np.ndarray | None = None,
+    pr_auc: float | None = None,
+    n_shuffles: int = 10,
+    seed: int = 42,
+) -> dict:
+    """Post-training leakage report for a semi-supervised anomaly detector.
+
+    Runs the MODELING-stage-relevant checks: (1) metric label-shuffle (also a
+    score/label alignment sanity check) and (2) suspicious-score sanity check.
+
+    Train/test exact-row overlap is NOT run here: train/test disjointness is
+    already guaranteed by the segment-aware temporal split (and preserved by the
+    episode-stratified k-fold, where train is fixed and shares no episode with
+    val/test). The overlap check belongs at split-time. It remains available via
+    the optional `train_features`/`test_features` args for that purpose only.
+    """
+    logger.info("── Anomaly leakage report ──")
+    report: dict = {}
+    report["label_shuffle"] = anomaly_label_shuffle_test(test_scores, test_labels, n_shuffles, seed)
+    if train_features is not None and test_features is not None:
+        report["duplicate_overlap"] = array_overlap_check(train_features, test_features)
+    if pr_auc is not None:
+        report["sanity_check"] = performance_sanity_check(
+            "test_pr_auc", float(pr_auc), warning_threshold=0.999, task="anomaly"
+        )
+    flags = [k for k, v in report.items()
+             if isinstance(v, dict) and (v.get("is_leaking") or v.get("is_suspicious"))]
+    report["leakage_flags"] = flags
+    report["is_clean"] = len(flags) == 0
+    if report["is_clean"]:
+        logger.success("Anomaly leakage report: CLEAN")
+    else:
+        logger.warning("Anomaly leakage flags raised: {}", flags)
+    return report
+
+
+# ============================================================================
 # FULL LEAKAGE REPORT
 # ============================================================================
 

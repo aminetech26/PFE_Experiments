@@ -46,6 +46,7 @@ from src.modeling.common.artifact_contract import (
     compute_macro_per_class_pr_auc,
     write_json,
 )
+from src.evaluation.leakage_checks import run_anomaly_leakage_report
 from src.modeling.common.episode_metrics import episode_macro_f1_binary
 from src.modeling.common.operating_point import (
     compute_operating_points,
@@ -374,6 +375,13 @@ def run_isolation_forest(config: dict | None = None) -> None:
         hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
     )
     metrics.update(flatten_operating_points(operating_points, "test"))
+    leakage_report = run_anomaly_leakage_report(
+        test_scores=test_scores, test_labels=y_test_bin, pr_auc=metrics.get("test_pr_auc"), seed=seed,
+    )
+    metrics.update({
+        "leakage_is_clean": int(leakage_report["is_clean"]),
+        "leakage_shuffle_pr_auc": leakage_report["label_shuffle"]["mean_shuffle_pr_auc"],
+    })
 
     run_name = f"anomaly_isolation_forest_{ts}"
     run_manifest = build_run_manifest(

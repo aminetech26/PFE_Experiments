@@ -68,6 +68,7 @@ from src.modeling.common.hyperparameter_optimizer import (
     _build_sampler,
     suggest_params_from_space,
 )
+from src.evaluation.leakage_checks import run_anomaly_leakage_report
 from src.modeling.common.operating_point import (
     compute_operating_points,
     flatten_operating_points,
@@ -743,6 +744,11 @@ def run_pc_flow(config: dict | None = None) -> None:
         _op_sh["hysteresis_n"], _op_sh["f1"], _op_sh["precision"], _op_sh["recall"],
     )
 
+    # ── Post-training leakage report (label-shuffle + sanity; overlap is split-enforced) ──
+    leakage_report = run_anomaly_leakage_report(
+        test_scores=test_scores, test_labels=test_labels, pr_auc=test_pr_auc, seed=seed,
+    )
+
     metrics = {
         "score_name": "pc_flow_nll",
         "score_components": ["negative_log_likelihood"],
@@ -782,6 +788,10 @@ def run_pc_flow(config: dict | None = None) -> None:
         "n_params": model.n_params, "fit_time_s": round(fit_time, 2),
     }
     metrics.update(flatten_operating_points(operating_points, "test"))
+    metrics.update({
+        "leakage_is_clean": int(leakage_report["is_clean"]),
+        "leakage_shuffle_pr_auc": leakage_report["label_shuffle"]["mean_shuffle_pr_auc"],
+    })
 
     run_name = f"pc_flow_{ts}"
     run_params = {
