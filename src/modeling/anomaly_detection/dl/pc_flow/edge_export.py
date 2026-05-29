@@ -44,6 +44,10 @@ def export_onnx(
                       "z": {0: "batch"}, "log_det": {0: "batch"}},
         opset_version=opset,
         do_constant_folding=True,
+        # Legacy TorchScript exporter: stable for this static MLP graph, honors
+        # dynamic_axes, and avoids the onnxscript dependency the dynamo exporter
+        # (torch>=2.x default) requires. Needs only `onnx` at export time.
+        dynamo=False,
     )
 
 

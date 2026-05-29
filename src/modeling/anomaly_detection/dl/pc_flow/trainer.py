@@ -381,6 +381,9 @@ def _run_hpo(
             n_coupling_layers=int(cfg.get("n_coupling_layers", 4)),
             hidden_dim=int(cfg.get("hidden_dim", 32)),
             dropout=float(suggested.get("dropout", cfg.get("dropout", 0.0))),
+            coupling_type=str(base_cfg.get("coupling_type", "affine")),
+            spline_bins=int(cfg.get("spline_bins", 8)),
+            tail_bound=float(base_cfg.get("tail_bound", 5.0)),
         )
         hpo_lit = PCFlowLightningModule(
             model=hpo_model,
@@ -601,6 +604,9 @@ def run_pc_flow(config: dict | None = None) -> None:
         n_coupling_layers=int(pc_flow_cfg.get("n_coupling_layers", 4)),
         hidden_dim=int(pc_flow_cfg.get("hidden_dim", 32)),
         dropout=float(pc_flow_cfg.get("dropout", 0.0)),
+        coupling_type=str(pc_flow_cfg.get("coupling_type", "affine")),
+        spline_bins=int(pc_flow_cfg.get("spline_bins", 8)),
+        tail_bound=float(pc_flow_cfg.get("tail_bound", 5.0)),
     )
     logger.info("PC-Flow params: {:,}", model.n_params)
 

@@ -259,14 +259,18 @@ anomaly_detection:
             lambda_c_inv:  {type: float, low: 0.1,    high: 10.0, log: true}
 
       pc_flow:
-        # Physics-Conditioned Normalizing Flow (RealNVP-style)
-        # Conditional affine-coupling blocks model p(x | irr, pvt).
+        # Physics-Conditioned Normalizing Flow
+        # coupling_type="spline" uses rational-quadratic splines (Durkan et al. 2019)
+        # for more expressive per-block density than affine coupling.
         # Anomaly score = NLL = -log p(x | c). No MSE averaging → directly
         # sensitive to subtle multivariate imbalances (cls2 degradation).
-        # ~12k params, stateless, ONNX-exportable, sub-ms CPU inference.
+        # Stateless, ONNX-exportable, sub-ms CPU inference.
         win_size: 1
         train_stride: 1
         eval_stride: 1
+        coupling_type: spline          # "affine" or "spline"
+        spline_bins: 8                 # bins per spline segment (ignored for affine)
+        tail_bound: 5.0                # spline domain ±tail_bound; identity outside
         n_coupling_layers: 4
         hidden_dim: 32
         dropout: 0.0
@@ -297,6 +301,7 @@ anomaly_detection:
             n_coupling_layers:  {type: categorical, choices: [3, 4, 5]}
             hidden_dim:         {type: categorical, choices: [32, 64]}
             dropout:            {type: float, low: 0.0, high: 0.2}
+            spline_bins:        {type: categorical, choices: [4, 8, 16]}
 
       pv_gdn:
         win_size: 30
