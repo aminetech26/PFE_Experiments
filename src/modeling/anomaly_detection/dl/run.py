@@ -49,9 +49,14 @@ def main() -> None:
         run_pv_gdn(config=config)
         return
 
+    if active_model == "pc_flow":
+        from src.modeling.anomaly_detection.dl.pc_flow.trainer import run_pc_flow  # noqa: PLC0415
+        run_pc_flow(config=config)
+        return
+
     raise ValueError(
         f"Unsupported anomaly_detection dl model: '{active_model}'. "
-        f"Supported: maat, dlssm, pv_gdn"
+        f"Supported: maat, dlssm, pv_gdn, pc_flow"
     )
 
 

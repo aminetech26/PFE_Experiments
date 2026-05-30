@@ -287,7 +287,11 @@ anomaly_detection:
         n_coupling_layers: 4
         hidden_dim: 32
         dropout: 0.0
-        context_features: [irr, pvt]
+        context_features: [irr, pvt]          # default (Costa / Mendeley)
+        context_features_by_dataset:
+          costa:      [irr, pvt]
+          la_reunion: [GTI, TPV]
+          mendeley:   []                       # unconditional — no irr/pvt equivalent
         # Shared GPD threshold strategy (see anomaly_detection.threshold)
         batch_size: 4096
         learning_rate: 3.0e-4

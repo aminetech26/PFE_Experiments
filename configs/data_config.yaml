@@ -64,13 +64,17 @@ paths:
       feature_engineering:
         sensor_columns: [Pg, Vg, Ig, Eg, Fg, Ia, GTI, TA, TPV]
         flags:
-          enable_hour_cyclic:        true   # real timestamps, time-of-day is meaningful
-          enable_delta_temp:         true   # TA and TPV both present
-          enable_dP_dt:              true
-          enable_dV_dt:              true
-          enable_dI_dt:              true
-          enable_Vg_normalized:      true
-          enable_differential_signal: false  # requires dt3 (healthy inverter ref)
+          enable_hour_cyclic:           true   # real timestamps, time-of-day is meaningful
+          enable_delta_temp:            true   # TA and TPV both present
+          enable_dP_dt:                 true   # Pg available
+          enable_dV_dt:                 true   # Vg available
+          enable_dI_dt:                 true   # Ig available
+          enable_Vg_normalized:         true   # rolling-median norm, no GTI dep
+          enable_differential_signal:   false  # requires dt3 (healthy inverter ref)
+          enable_power_imbalance:       false  # single inverter — no pdc1/pdc2
+          enable_current_imbalance:     false  # single inverter — no idc1/idc2
+          enable_voltage_imbalance:     false  # single inverter — no vdc1/vdc2
+          enable_temp_power_correction: false  # guard uses pvt/pdc/irr (Costa names)
         selection:
           anchor_features: [delta_temp, dP_dt, dV_dt, dI_dt]
 

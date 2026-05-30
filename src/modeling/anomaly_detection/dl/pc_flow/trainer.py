@@ -542,9 +542,10 @@ def run_pc_flow(config: dict | None = None) -> None:
         context_feature_indices: list[int] = []
         logger.info("UNCONDITIONAL ablation: no physics conditioning — flow models p(x) over all {} features", n_features)
     else:
-        context_feature_names = pc_flow_cfg.get("context_features", ["irr", "pvt"])
+        by_dataset = pc_flow_cfg.get("context_features_by_dataset", {})
+        context_feature_names = by_dataset.get(args.dataset) if args.dataset in by_dataset else pc_flow_cfg.get("context_features", ["irr", "pvt"])
         context_feature_indices = [feature_idx[f] for f in context_feature_names if f in feature_idx]
-        if not context_feature_indices:
+        if not context_feature_indices and context_feature_names:
             raise RuntimeError(f"None of context_features {context_feature_names} found in features {features}")
         logger.info("Context features {} → indices {}", context_feature_names, context_feature_indices)
 
@@ -803,20 +804,16 @@ def run_pc_flow(config: dict | None = None) -> None:
         "test_episode_macro_f1": float(test_episode_macro_f1),
         "test_macro_per_class_pr_auc": test_macro.get("macro_per_class_pr_auc"),
         "test_worst_class_pr_auc": test_macro.get("worst_class_pr_auc"),
-        "test_class1_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("1"),
-        "test_class2_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("2"),
-        "test_class3_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("3"),
-        "test_class4_pr_auc_vs_normal": test_macro.get("per_class_pr_auc_vs_normal", {}).get("4"),
+        **{f"test_class{cls}_pr_auc_vs_normal": v
+           for cls, v in test_macro.get("per_class_pr_auc_vs_normal", {}).items()},
         "val_episode_binary_pr_auc": val_episode_metrics.get("episode_binary_pr_auc"),
         "val_episode_macro_per_class_pr_auc": val_episode_metrics.get("episode_macro_per_class_pr_auc"),
         "val_episode_worst_class_pr_auc": val_episode_metrics.get("episode_worst_class_pr_auc"),
         "test_episode_binary_pr_auc": test_episode_metrics.get("episode_binary_pr_auc"),
         "test_episode_macro_per_class_pr_auc": test_episode_metrics.get("episode_macro_per_class_pr_auc"),
         "test_episode_worst_class_pr_auc": test_episode_metrics.get("episode_worst_class_pr_auc"),
-        "test_episode_class1_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("1"),
-        "test_episode_class2_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("2"),
-        "test_episode_class3_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("3"),
-        "test_episode_class4_pr_auc": test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).get("4"),
+        **{f"test_episode_class{cls}_pr_auc": v
+           for cls, v in test_episode_metrics.get("episode_per_class_pr_auc_vs_normal", {}).items()},
         "n_train_samples": len(train_dl.dataset),
         "n_features": n_features, "n_non_context": n_non_context,
         "n_context_features": len(context_feature_indices),

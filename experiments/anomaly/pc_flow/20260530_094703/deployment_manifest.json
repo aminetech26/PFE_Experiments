@@ -1,0 +1,48 @@
+{
+  "task": "anomaly_semisup",
+  "model": "pc_flow",
+  "model_family": "anomaly_dl",
+  "model_artifact": "checkpoints/best.ckpt",
+  "feature_names": [
+    "Eg",
+    "Fg",
+    "GTI",
+    "Ia",
+    "Ig",
+    "Pg",
+    "TA",
+    "TPV",
+    "Vg",
+    "Vg_normalized",
+    "dI_dt",
+    "dP_dt",
+    "dV_dt",
+    "delta_temp"
+  ],
+  "label_column": "label",
+  "threshold": 16.591478823173638,
+  "scaler_artifact": "scaler.joblib",
+  "classes": [
+    "0.0",
+    "1.0",
+    "2.1",
+    "2.2",
+    "2.3",
+    "3.1",
+    "3.2",
+    "4.0"
+  ],
+  "window_size": 1,
+  "score_direction": "higher_is_more_anomalous",
+  "checkpoint_available": true,
+  "threshold_policy": "gpd_pot0.9_p0.05",
+  "selection_metric": "val_macro_per_class_pr_auc_monitor",
+  "score_name": "pc_flow_nll",
+  "context_features": [
+    "GTI",
+    "TPV"
+  ],
+  "n_params": 6960,
+  "n_coupling_layers": 4,
+  "onnx_exportable": true
+}

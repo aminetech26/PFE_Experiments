@@ -1,0 +1,73 @@
+{
+  "score_direction": "higher_is_more_anomalous",
+  "threshold_policy": "gpd_pot0.9_p0.05",
+  "threshold": 16.591478823173638,
+  "test_not_used_for_calibration": true,
+  "score_stats": {
+    "score_name": "pc_flow_nll",
+    "score_components": [
+      "negative_log_likelihood"
+    ]
+  },
+  "threshold_quantile": 0.95,
+  "candidate_per_true_class_thresholds": {
+    "threshold_policy": "validation_true_class_pr_curve_f1",
+    "deployment_ready": false,
+    "intended_use": "diagnostic_or_candidate_class_conditioned_gate",
+    "normal_label": 0,
+    "thresholds": {
+      "1": {
+        "threshold": 93389.3515625,
+        "val_f1": 0.9752756431673907,
+        "val_support_fault": 3018,
+        "val_support_normal": 484029,
+        "test_precision": 0.9828973843058351,
+        "test_recall": 0.2960606060606061,
+        "test_f1": 0.4550535631113181,
+        "test_pr_auc": 0.5234121217828859
+      },
+      "3.1": {
+        "threshold": 8.802769660949707,
+        "val_f1": 0.009038228940384996,
+        "val_support_fault": 886,
+        "val_support_normal": 484029,
+        "test_precision": 0.005300696247058538,
+        "test_recall": 0.47995606809445357,
+        "test_f1": 0.010485588314687622,
+        "test_pr_auc": 0.005249790790974014
+      },
+      "3.2": {
+        "threshold": 15.772603988647461,
+        "val_f1": 0.09425038463730127,
+        "val_support_fault": 3516,
+        "val_support_normal": 484029,
+        "test_precision": 0.05695937986852605,
+        "test_recall": 0.5399855907780979,
+        "test_f1": 0.10304884336438319,
+        "test_pr_auc": 0.043958071391703324
+      },
+      "4": {
+        "threshold": 9.705177307128906,
+        "val_f1": 0.2141344728160067,
+        "val_support_fault": 32301,
+        "val_support_normal": 484029,
+        "test_precision": 0.14864818298977953,
+        "test_recall": 0.7458934190960335,
+        "test_f1": 0.24789389603374365,
+        "test_pr_auc": 0.15412181418555318
+      }
+    }
+  },
+  "threshold_diagnostics": {
+    "strategy": "gpd",
+    "pot_quantile": 0.9,
+    "pot_threshold_u": 13.227653503417969,
+    "n_exceedances": 188284,
+    "n_normal_scores": 1882842,
+    "exceedance_rate": 0.09999989377759791,
+    "gpd_xi_shape": 0.48656080225409293,
+    "gpd_sigma_scale": 4.080541105123448,
+    "target_tail_prob": 0.05,
+    "threshold": 16.591478823173638
+  }
+}
