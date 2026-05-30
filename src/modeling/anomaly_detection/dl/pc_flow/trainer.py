@@ -230,6 +230,9 @@ class PCFlowLightningModule(pl.LightningModule):
         })
 
     def on_validation_epoch_end(self) -> None:
+        if self.trainer.sanity_checking:
+            self._val_outputs.clear()
+            return
         if not self._val_outputs:
             return
         all_scores = torch.cat([o["scores"] for o in self._val_outputs]).numpy()
