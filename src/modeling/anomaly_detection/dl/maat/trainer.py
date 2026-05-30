@@ -251,6 +251,9 @@ def _fault_threshold_metrics(
     return macro_fault_f1, worst_fault_precision, normal_fpr
 
 
+_MAX_THRESHOLD_CANDIDATES = 400   # subsample PR-curve thresholds to cap calibration cost
+
+
 def _calibrate_threshold_macro_fault_f1(
     scores: np.ndarray,
     labels: np.ndarray,
@@ -259,6 +262,16 @@ def _calibrate_threshold_macro_fault_f1(
     if original_labels is None or original_labels.size == 0:
         raise ValueError("original_labels are required for macro-fault threshold calibration")
     prec, rec, thresholds = precision_recall_curve(labels, scores)
+
+    # Subsample thresholds to cap the O(n_thresholds × n_classes × n_samples) cost.
+    # With stride=1 on large val sets the PR curve can have tens of thousands of
+    # unique score values; 400 evenly-spaced candidates lose <0.5% threshold quality.
+    if len(thresholds) > _MAX_THRESHOLD_CANDIDATES:
+        indices = np.linspace(0, len(thresholds) - 1, _MAX_THRESHOLD_CANDIDATES, dtype=int)
+        thresholds = thresholds[indices]
+        prec = prec[indices]
+        rec = rec[indices]
+
     best: tuple[float, float, float, float, dict[str, float]] | None = None
 
     for idx, thr in enumerate(thresholds):
@@ -837,6 +850,33 @@ def _save_gate_histogram(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-epoch loguru callback (HPO trials and final run)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _EpochLogger(pl.Callback):
+    """Logs a one-line summary to loguru at every real validation epoch end."""
+
+    def __init__(self, label: str = "", t_start: float | None = None) -> None:
+        self._label = label
+        self._t_start = t_start or time.time()
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.sanity_checking:
+            return
+        m = trainer.callback_metrics
+        sel   = float(m.get("val_selection_score", float("nan")))
+        f1    = float(m.get("val_pv_maat_f1",     float("nan")))
+        rec   = float(m.get("val_rec_loss",        float("nan")))
+        nans  = int(pl_module._nan_count) if hasattr(pl_module, "_nan_count") else 0
+        elapsed = time.time() - self._t_start
+        nan_str = f"  NaN×{nans}" if nans else ""
+        logger.info(
+            "  {} epoch {:3d} | sel={:.4f}  f1={:.4f}  rec={:.4f}  {:.0f}s{}",
+            self._label, trainer.current_epoch, sel, f1, rec, elapsed, nan_str,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Optuna pruning callback
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -933,6 +973,8 @@ def _train_and_eval(
     pruning_warmup_epochs: int = 3,
     ckpt_dir: Path | None = None,
     trial: optuna.Trial | None = None,
+    epoch_logger_label: str = "",
+    epoch_logger_t_start: float | None = None,
 ) -> tuple[MAATLightningModule, str | None]:
     pl.seed_everything(seed, workers=True)
 
@@ -953,6 +995,7 @@ def _train_and_eval(
     ckpt_callback: ModelCheckpoint | None = None
     callbacks: list = [
         EarlyStopping(monitor="val_selection_score", patience=patience, mode="max", verbose=False),
+        _EpochLogger(label=epoch_logger_label, t_start=epoch_logger_t_start),
     ]
     if ckpt_dir is not None:
         ckpt_callback = ModelCheckpoint(
@@ -1213,6 +1256,8 @@ def run_maat(config: dict | None = None) -> None:
                     seed=seed,
                     pruning_warmup_epochs=pruning_warmup_epochs,
                     trial=trial,
+                    epoch_logger_label=f"trial {_done + 1}/{n_trials}",
+                    epoch_logger_t_start=_hpo_start,
                 )
                 selection_score = float(lit.best_val_selection_score)
             except optuna.exceptions.TrialPruned:
@@ -1333,6 +1378,8 @@ def run_maat(config: dict | None = None) -> None:
         total_steps=max(1, len(train_dl) * max_epochs),
         seed=seed,
         ckpt_dir=ckpt_dir,
+        epoch_logger_label="final",
+        epoch_logger_t_start=t0,
     )
     fit_time = time.perf_counter() - t0
     logger.info(f"Training done in {fit_time:.1f}s | best_ckpt={best_ckpt_path}")
