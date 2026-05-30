@@ -73,8 +73,8 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 torch.set_float32_matmul_precision("high")  # TF32 matmul on Ampere; fp32 accumulators preserved
 torch.backends.cudnn.benchmark = True       # fixed input shapes → cuDNN autotunes once and caches
 
-SELECTION_METRIC_NAME = "macro_fault_f1"
-THRESHOLD_POLICY_NAME = "validation_macro_fault_f1"
+SELECTION_METRIC_NAME = "macro_per_class_pr_auc"
+THRESHOLD_POLICY_NAME = "gpd_quantile"
 OFFICIAL_SCORE_FUSION = "raw"
 
 
@@ -584,7 +584,6 @@ class MAATLightningModule(pl.LightningModule):
         val_preds = (pv_scores >= threshold).astype(int)
         val_episode_macro_f1 = _episode_macro_f1_binary(all_labels, val_preds, all_group_ids)
         val_f1 = float(f1_score(all_labels, val_preds, zero_division=0))
-        val_selection_score = macro_fault_f1
         val_acc = float(accuracy_score(all_labels, val_preds))
         val_pv_pr_auc = _safe_pr_auc(all_labels, pv_scores)
 
@@ -595,6 +594,8 @@ class MAATLightningModule(pl.LightningModule):
         )
         worst_fault_precision = float(threshold_meta["worst_fault_precision"])
         normal_fpr = float(threshold_meta["normal_fpr"])
+
+        val_selection_score = val_macro_fault_pr_auc
 
         self.best_val_pv_maat_f1 = max(self.best_val_pv_maat_f1, val_f1)
         self.best_val_episode_macro_f1 = max(self.best_val_episode_macro_f1, val_episode_macro_f1)
@@ -1460,7 +1461,7 @@ def run_maat(config: dict | None = None) -> None:
         val_scores,
         threshold,
     )
-    val_selection_score = val_macro_fault_f1
+    val_selection_score = _val_macro_fault_pr_auc_base
     val_prec = float(precision_score(val_labels, val_preds, zero_division=0))
     val_rec = float(recall_score(val_labels, val_preds, zero_division=0))
     val_acc = float(accuracy_score(val_labels, val_preds))
@@ -1507,7 +1508,7 @@ def run_maat(config: dict | None = None) -> None:
         "score_fusion": OFFICIAL_SCORE_FUSION,
         "score_components": ["product"],
         "score_tau": None,
-        "threshold_policy": THRESHOLD_POLICY_NAME,
+        "threshold_policy": _maat_threshold_policy,
         "selection_metric": SELECTION_METRIC_NAME,
         "official_score_reduction": "max",
         "score_reduction_scope": "product_temporal",
@@ -1582,7 +1583,7 @@ def run_maat(config: dict | None = None) -> None:
     calibration_payload = {
         **build_score_calibration_payload(
             threshold=threshold,
-            threshold_policy=THRESHOLD_POLICY_NAME,
+            threshold_policy=_maat_threshold_policy,
             threshold_quantile=None,
         ),
         "score_name": "pv_maat_score",
@@ -1630,7 +1631,7 @@ def run_maat(config: dict | None = None) -> None:
             "score_fusion": score_fusion_name,
             "score_components": score_components,
             "score_tau": score_tau,
-            "threshold_policy": THRESHOLD_POLICY_NAME,
+            "threshold_policy": _maat_threshold_policy,
             "selection_metric": SELECTION_METRIC_NAME,
             "official_score_reduction": "max",
             "score_reduction_scope": "product_temporal",
@@ -1734,7 +1735,7 @@ def run_maat(config: dict | None = None) -> None:
                 "score_components": metrics.get("score_components", []),
                 "score_tau": metrics.get("score_tau"),
                 "headline_fusion": metrics.get("headline_fusion", "pv_maat_score"),
-                "threshold_policy": THRESHOLD_POLICY_NAME,
+                "threshold_policy": _maat_threshold_policy,
                 "selection_metric": metrics.get("selection_metric", SELECTION_METRIC_NAME),
                 "score_reduction_scope": "product_temporal",
                 "threshold": threshold,
