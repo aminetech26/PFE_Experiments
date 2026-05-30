@@ -122,6 +122,46 @@ def _load_config() -> dict:
         return yaml.safe_load(fh)
 
 
+def _load_data_config() -> dict:
+    data_config_path = PROJECT_ROOT / "configs" / "data_config.yaml"
+    with data_config_path.open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def _filter_to_evaluable_classes(
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    dataset: str,
+    label_col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Drop train-only fault classes from val/test for datasets that declare evaluable_classes.
+
+    Classes listed under splits.train_only_classes have too few episodes to support
+    meaningful per-class evaluation. Keeping them pollutes the macro PR-AUC used for
+    model selection and early stopping. Normal rows (label==0) are always kept.
+    """
+    data_cfg = _load_data_config()
+    evaluable = data_cfg.get("paths", {}).get("datasets", {}).get(dataset, {}).get(
+        "splits", {}
+    ).get("evaluable_classes", [])
+    if not evaluable:
+        return val_df, test_df
+
+    keep = {0.0} | {float(c) for c in evaluable}
+    val_filtered  = val_df[val_df[label_col].isin(keep)].reset_index(drop=True)
+    test_filtered = test_df[test_df[label_col].isin(keep)].reset_index(drop=True)
+
+    dropped_val  = len(val_df)  - len(val_filtered)
+    dropped_test = len(test_df) - len(test_filtered)
+    logger.info(
+        "Evaluable-class filter | keep={} | "
+        "val: {:,} → {:,} ({} dropped)  test: {:,} → {:,} ({} dropped)",
+        sorted(keep), len(val_df), len(val_filtered), dropped_val,
+        len(test_df), len(test_filtered), dropped_test,
+    )
+    return val_filtered, test_filtered
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Lightning Module
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,6 +577,8 @@ def run_pc_flow(config: dict | None = None) -> None:
 
     features: list[str] = manifest.get("final_features", [])
     label_col: str = str(manifest.get("label_column", "label"))
+
+    val_df, test_df = _filter_to_evaluable_classes(val_df, test_df, args.dataset, label_col)
     n_features = len(features)
     feature_idx = {name: i for i, name in enumerate(features)}
 
