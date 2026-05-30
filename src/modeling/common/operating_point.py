@@ -171,6 +171,42 @@ def _decision_metrics(labels: np.ndarray, preds: np.ndarray) -> dict:
     }
 
 
+def _episode_decision_metrics(
+    preds: np.ndarray, labels: np.ndarray, group_ids: np.ndarray | None
+) -> dict:
+    """Event-level RECALL: fraction of fault episodes the detector fires on (>=1 sample).
+
+    The operator-meaningful "did the dashboard alarm at some point during this fault
+    event" — higher than per-sample recall for a sequential detector (it confirms the
+    event even if it misses onset samples).
+
+    Deliberately reports ONLY recall, not precision/F1. Point-adjusted *precision* is
+    pathological: a single stray FP sample condemns a whole normal episode, so even a
+    0.9998-sample-precision detector shows ~0.5 episode precision (Kim et al. 2022).
+    Use the per-sample precision from `_decision_metrics` for the precision story.
+    """
+    if group_ids is None:
+        return {}
+    preds = np.asarray(preds)
+    labels = np.asarray(labels)
+    groups: dict = {}
+    for i, g in enumerate(group_ids):
+        groups.setdefault(g, []).append(i)
+    n_fault = 0
+    n_fault_detected = 0
+    for idxs in groups.values():
+        idxs_a = np.asarray(idxs)
+        if labels[idxs_a].max() > 0:                    # fault episode
+            n_fault += 1
+            if preds[idxs_a].max() > 0:                 # alarmed at least once during it
+                n_fault_detected += 1
+    return {
+        "episode_recall": float(n_fault_detected / n_fault) if n_fault else 0.0,
+        "n_fault_episodes": int(n_fault),
+        "n_episodes": int(len(groups)),
+    }
+
+
 def compute_operating_points(
     *,
     calib_normal_scores: np.ndarray,
@@ -239,12 +275,14 @@ def compute_operating_points(
             "target_fpr": float(baseline_fpr),
             "policy": f"gpd_pot{pot_quantile:g}_fpr{baseline_fpr:g}",
             **_decision_metrics(test_labels, base_pred),
+            **_episode_decision_metrics(base_pred, test_labels, test_group_ids),
         },
         "sensitive": {
             "threshold": float(t_sens),
             "target_fpr": float(sensitive_fpr),
             "policy": f"gpd_pot{pot_quantile:g}_fpr{sensitive_fpr:g}",
             **_decision_metrics(test_labels, sens_pred),
+            **_episode_decision_metrics(sens_pred, test_labels, test_group_ids),
         },
         "sensitive_hysteresis": {
             "threshold": float(t_sens),
@@ -253,23 +291,27 @@ def compute_operating_points(
             "detection_latency_samples": int(max(0, hysteresis_n - 1)),
             "policy": f"gpd_pot{pot_quantile:g}_fpr{sensitive_fpr:g}_hyst{hysteresis_n}",
             **_decision_metrics(test_labels, deb_pred),
+            **_episode_decision_metrics(deb_pred, test_labels, test_group_ids),
         },
         "conformal": {
             "alpha": float(conformal_alpha),
             "n_calib": int(np.asarray(calib_normal_scores).size),
             "policy": f"conformal_p<={conformal_alpha:g}",  # distribution-free FPR<=alpha
             **_decision_metrics(test_labels, conf_pred),
+            **_episode_decision_metrics(conf_pred, test_labels, test_group_ids),
         },
         "fdr_bh": {
             "q": float(fdr_q),
             "policy": f"bh_fdr<={fdr_q:g}",  # FDR among alarms <= q (Bates et al. 2023)
             **_decision_metrics(test_labels, fdr_pred),
+            **_episode_decision_metrics(fdr_pred, test_labels, test_group_ids),
         },
         "cusum": {
             "k": float(cusum_k),
             "h": float(_h),
             "policy": f"cusum_k{cusum_k:g}_fpr{baseline_fpr:g}",  # Page/Lorden optimal sequential
             **_decision_metrics(test_labels, cusum_pred),
+            **_episode_decision_metrics(cusum_pred, test_labels, test_group_ids),
         },
     }
 
