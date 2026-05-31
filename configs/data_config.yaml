@@ -257,7 +257,7 @@ feature_engineering:
     irr_norm_floor:            1.0
     enable_hygiene_pruning:    true
     enable_mrmr_selection:     true
-    mrmr_k:                    64
+    mrmr_k:                    32
     enable_corr_pruning:       false
     enable_vif_pruning:        false
     enable_wavelet:            false
