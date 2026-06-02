@@ -104,13 +104,15 @@ def load_data(parquet_path: str | Path) -> pd.DataFrame:
 def split_healthy_faulty(
     df: pd.DataFrame,
     healthy_train_frac: float = 0.80,
+    healthy_val_frac: float = 0.50,
     seed: int = 42,
 ) -> dict[str, pd.DataFrame]:
-    """Split data into train (healthy), val (healthy), and test (faulty per class).
+    """Split data into train (healthy), val (healthy), test_healthy, and test (faulty per class).
 
-    TRAIN: first healthy_train_frac of healthy data (label == 0)
-    VAL:   remaining healthy data
-    TEST:  all faulty data, grouped by fault class
+    TRAIN:        first healthy_train_frac of healthy data (label == 0)
+    VAL:          fraction healthy_val_frac of the *remaining* healthy (early stopping)
+    TEST_HEALTHY: the rest of the healthy data (held-out evaluation baseline)
+    TEST:         all faulty data, grouped by fault class
 
     Temporal order is preserved within each split.
     """
@@ -118,10 +120,13 @@ def split_healthy_faulty(
     faulty = df[df["label"] > 0].copy()
 
     n_healthy = len(healthy)
-    split_idx = int(n_healthy * healthy_train_frac)
+    train_end = int(n_healthy * healthy_train_frac)
+    remaining = healthy.iloc[train_end:]
+    val_end = int(len(remaining) * healthy_val_frac)
 
-    train_df = healthy.iloc[:split_idx]
-    val_df = healthy.iloc[split_idx:]
+    train_df = healthy.iloc[:train_end]
+    val_df = remaining.iloc[:val_end]
+    test_healthy_df = remaining.iloc[val_end:]
 
     # Group faulty data by class for per-class evaluation
     test_by_class: dict[str, pd.DataFrame] = {}
@@ -130,14 +135,16 @@ def split_healthy_faulty(
         if len(cls_data) > 0:
             test_by_class[f"fault_class_{cls}"] = cls_data
 
-    logger.info(f"  Train (healthy): {len(train_df):,}")
-    logger.info(f"  Val   (healthy): {len(val_df):,}")
+    logger.info(f"  Train (healthy):        {len(train_df):,}")
+    logger.info(f"  Val   (healthy):        {len(val_df):,}")
+    logger.info(f"  Test  (healthy):        {len(test_healthy_df):,}")
     for name, cls_df in test_by_class.items():
-        logger.info(f"  Test  ({name}): {len(cls_df):,}")
+        logger.info(f"  Test  ({name}):   {len(cls_df):,}")
 
     return {
         "train": train_df,
         "val": val_df,
+        "test_healthy": test_healthy_df,
         **test_by_class,
     }
 
@@ -403,6 +410,7 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--train-frac", type=float, default=0.80)
+    parser.add_argument("--healthy-val-frac", type=float, default=0.50, help="Fraction of remaining healthy to use as val (rest goes to test_healthy)")
     parser.add_argument("--threshold-percentile", type=float, default=95.0)
     parser.add_argument("--window-length", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -419,8 +427,8 @@ def main():
     logger.info("=== Step 1: Load Costa Data (native 1 Hz) ===")
     df = load_data(args.parquet_path)
 
-    logger.info("=== Step 2: Split (healthy train/val, faulty test) ===")
-    splits = split_healthy_faulty(df, healthy_train_frac=args.train_frac, seed=args.seed)
+    logger.info("=== Step 2: Split (healthy train/val/test, faulty test) ===")
+    splits = split_healthy_faulty(df, healthy_train_frac=args.train_frac, healthy_val_frac=args.healthy_val_frac, seed=args.seed)
 
     logger.info("=== Step 3: Normalize & Create Tensors ===")
     tensors = prepare_tensors(splits, window_length=args.window_length)
@@ -429,8 +437,9 @@ def main():
 
     X_train = tensors["train"]["X"]
     X_val = tensors["val"]["X"]
+    X_test_healthy = tensors["test_healthy"]["X"]
     logger.info(f"  n_features: {n_features} ({feature_names})")
-    logger.info(f"  X_train: {tuple(X_train.shape)} | X_val: {tuple(X_val.shape)}")
+    logger.info(f"  X_train: {tuple(X_train.shape)} | X_val: {tuple(X_val.shape)} | X_test_healthy: {tuple(X_test_healthy.shape)}")
 
     # ── GVSAO Hyperparameter Optimisation ─────────────────────────────────
     final_lr = args.lr or 0.001
@@ -506,11 +515,11 @@ def main():
     threshold = compute_threshold(train_errors, args.threshold_percentile)
     logger.info(f"  Anomaly threshold ({args.threshold_percentile}th pctl): {threshold:.6f}")
 
-    # Evaluate on validation healthy data (should have low anomaly rate)
-    val_errors = evaluate_reconstruction(model, X_val, device, final_batch_size)
-    val_fp = int(np.sum(val_errors > threshold))
-    val_result = evaluate_anomaly_detection(val_errors, tensors["val"]["labels"], threshold)
-    logger.info(f"  Val (healthy): FP={val_fp}/{len(val_errors)} ({100*val_fp/len(val_errors):.2f}%)")
+    # Evaluate on test healthy data (held-out baseline for evaluation)
+    test_healthy_errors = evaluate_reconstruction(model, X_test_healthy, device, final_batch_size)
+    test_healthy_fp = int(np.sum(test_healthy_errors > threshold))
+    test_healthy_result = evaluate_anomaly_detection(test_healthy_errors, tensors["test_healthy"]["labels"], threshold)
+    logger.info(f"  Test (healthy): FP={test_healthy_fp}/{len(test_healthy_errors)} ({100*test_healthy_fp/len(test_healthy_errors):.2f}%)")
 
     # Evaluate on each fault class
     class_results: dict[str, dict] = {}
@@ -528,9 +537,9 @@ def main():
         # Threshold-based metrics on fault class alone
         result = evaluate_anomaly_detection(fault_errors, labels_fault, threshold)
 
-        # Per-class PR AUC: combine fault errors with val (healthy) errors
-        combined_errors_pc = np.concatenate([val_errors, fault_errors])
-        combined_labels_pc = np.concatenate([np.zeros(len(val_errors)), labels_fault])
+        # Per-class PR AUC: combine fault errors with test healthy errors
+        combined_errors_pc = np.concatenate([test_healthy_errors, fault_errors])
+        combined_labels_pc = np.concatenate([np.zeros(len(test_healthy_errors)), labels_fault])
         per_class_pr_auc = float(average_precision_score(
             (combined_labels_pc > 0).astype(int), combined_errors_pc
         )) if len(fault_errors) > 0 else 0.0
@@ -570,8 +579,8 @@ def main():
     if all_fault_errors:
         combined_errors = np.concatenate(all_fault_errors)
         combined_labels = np.concatenate(all_fault_labels)
-        combined_val = np.concatenate([val_errors, combined_errors])
-        combined_label = np.concatenate([np.zeros(len(val_errors)), combined_labels])
+        combined_val = np.concatenate([test_healthy_errors, combined_errors])
+        combined_label = np.concatenate([np.zeros(len(test_healthy_errors)), combined_labels])
         overall_result = evaluate_anomaly_detection(combined_val, combined_label, threshold)
         logger.info(
             f"  {'OVERALL':<14} "
@@ -640,7 +649,7 @@ def main():
         "anomaly_detection": {
             "threshold_percentile": args.threshold_percentile,
             "threshold_value": threshold,
-            "val_healthy_fp_rate": float(val_fp / len(val_errors)) if len(val_errors) > 0 else 0.0,
+            "test_healthy_fp_rate": float(test_healthy_fp / len(test_healthy_errors)) if len(test_healthy_errors) > 0 else 0.0,
             "per_class": class_details,
             "macro_metrics": macro_metrics,
             "overall": overall_result if all_fault_errors else {},
