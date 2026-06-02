@@ -35,27 +35,40 @@ def resolve_run_dir(
         return path
 
     latest_runs_path = features_root / "latest_runs.json"
-    if not latest_runs_path.exists():
-        raise FileNotFoundError(f"Missing latest runs file: {latest_runs_path}")
+    if latest_runs_path.exists():
+        latest_payload = json.loads(latest_runs_path.read_text(encoding="utf-8"))
 
-    latest_payload = json.loads(latest_runs_path.read_text(encoding="utf-8"))
+        if profile:
+            by_task_profile = latest_payload.get("latest_by_task_profile", {})
+            rel = by_task_profile.get(task, {}).get(profile)
+            if rel:
+                return features_root / _normalize_relative_path(rel)
 
-    if profile:
-        by_task_profile = latest_payload.get("latest_by_task_profile", {})
-        rel = by_task_profile.get(task, {}).get(profile)
+        by_task = latest_payload.get("latest_by_task", {})
+        rel = by_task.get(task)
         if rel:
             return features_root / _normalize_relative_path(rel)
 
-    by_task = latest_payload.get("latest_by_task", {})
-    rel = by_task.get(task)
-    if not rel:
-        raise KeyError(
-            f"Could not resolve latest run for task='{task}'"
-            + (f", profile='{profile}'" if profile else "")
-            + f" in {latest_runs_path}"
-        )
+    # latest_runs.json absent or incomplete — scan the standard directory tree.
+    # Priority 1: features_root/task/runs/<profile>  (exact profile match)
+    # Priority 2: most-recently-modified dir under features_root/task/runs/
+    runs_root = features_root / task / "runs"
+    if profile:
+        profile_dir = runs_root / profile
+        if profile_dir.is_dir():
+            return profile_dir
 
-    return features_root / _normalize_relative_path(rel)
+    if runs_root.is_dir():
+        candidates = [d for d in runs_root.iterdir() if d.is_dir()]
+        if candidates:
+            return max(candidates, key=lambda d: d.stat().st_mtime)
+
+    raise FileNotFoundError(
+        f"Cannot resolve feature run dir for task='{task}'"
+        + (f", profile='{profile}'" if profile else "")
+        + f" under {features_root}. "
+        "Run featurization first or pass --run-dir / --run-id explicitly."
+    )
 
 
 def resolve_run_dir_by_id(
