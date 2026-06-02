@@ -90,6 +90,13 @@ def _build_lgbm_params(base: dict, seed: int, n_classes: int) -> dict:
     return params
 
 
+def _build_extra_trees_params(base: dict, seed: int, n_classes: int) -> dict:
+    """Mirror extra_trees_model._build_extra_trees_params. n_classes unused (sklearn infers)."""
+    params = dict(base)
+    params.update({"random_state": int(seed), "class_weight": "balanced"})
+    return params
+
+
 def _build_catboost_params(base: dict, seed: int, n_classes: int) -> dict:
     """Mirror catboost_model._build_catboost_params so CV uses identical model setup.
 
@@ -114,24 +121,26 @@ def _build_params(model: str, base: dict, seed: int, n_classes: int) -> dict:
     """Dispatch to the per-model param builder (identical setup to the production trainer)."""
     if model == "catboost":
         return _build_catboost_params(base, seed, n_classes)
+    if model == "extra_trees":
+        return _build_extra_trees_params(base, seed, n_classes)
     return _build_lgbm_params(base, seed, n_classes)
 
 
 def _make_model(model: str, params: dict):
-    """Instantiate the classifier. Both libraries are imported lazily so running
-    one family does not require the other to be installed (edge images, partial envs)."""
+    """All libraries imported lazily — running one family does not require the others."""
     if model == "catboost":
         from catboost import CatBoostClassifier
-
         return CatBoostClassifier(**params)
+    if model == "extra_trees":
+        from sklearn.ensemble import ExtraTreesClassifier
+        return ExtraTreesClassifier(**params)
     import lightgbm as lgb
-
     return lgb.LGBMClassifier(**params)
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Task B classification: HPO + grouped K-fold CV")
-    p.add_argument("--model", default="lightgbm", choices=["lightgbm", "catboost"],
+    p.add_argument("--model", default="lightgbm", choices=["lightgbm", "catboost", "extra_trees"],
                    help="Classifier family to validate (default: lightgbm; use catboost to "
                         "validate the deployed classifier).")
     p.add_argument("--dataset", default="costa")
