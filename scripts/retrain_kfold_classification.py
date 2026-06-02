@@ -25,15 +25,20 @@ CAVEATS to state in the thesis:
 
 Usage:
     python -m scripts.retrain_kfold_classification --dataset costa --n-folds 5
+    python -m scripts.retrain_kfold_classification --model catboost --dataset costa --n-folds 5
     python -m scripts.retrain_kfold_classification --no-hpo          # midpoint params
     python -m scripts.retrain_kfold_classification --best-params params.json
+
+The ``--model`` flag selects the classifier family (default ``lightgbm``; use
+``catboost`` to validate the actually-deployed classifier). Both mirror their
+production trainer's param setup exactly, so the CV uses identical model config.
 
 Stages:
     [0] HPO        -- one Optuna run on the ORIGINAL train/val holdout (f1_macro),
                       mirroring the production trainer; or --no-hpo / --best-params.
     [1] Pool       -- concat train+val+test; X / y / groups(segment_id).
-    [2] K-fold     -- StratifiedGroupKFold(segment_id); per fold refit LightGBM
-                      (fixed params) + scoring via compute_classification_metrics.
+    [2] K-fold     -- StratifiedGroupKFold(segment_id); per fold refit the chosen
+                      model (fixed params) + scoring via compute_classification_metrics.
     [3] Aggregate  -- mean / std / median / IQR per metric; per-class + support.
 """
 from __future__ import annotations
@@ -43,12 +48,11 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from loguru import logger
 from sklearn.metrics import f1_score
-from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import LabelEncoder
 
 from src.modeling.classification.ml.common import compute_classification_metrics
@@ -86,8 +90,50 @@ def _build_lgbm_params(base: dict, seed: int, n_classes: int) -> dict:
     return params
 
 
+def _build_catboost_params(base: dict, seed: int, n_classes: int) -> dict:
+    """Mirror catboost_model._build_catboost_params so CV uses identical model setup.
+
+    ``n_classes`` is accepted for signature symmetry with the LightGBM builder;
+    CatBoost infers the class count from the labels.
+    """
+    params = dict(base)
+    params.update(
+        {
+            "loss_function": "MultiClass",
+            "eval_metric": "TotalF1:average=Macro",
+            "auto_class_weights": "Balanced",
+            "random_seed": int(seed),
+            "verbose": False,
+            "allow_writing_files": False,
+        }
+    )
+    return params
+
+
+def _build_params(model: str, base: dict, seed: int, n_classes: int) -> dict:
+    """Dispatch to the per-model param builder (identical setup to the production trainer)."""
+    if model == "catboost":
+        return _build_catboost_params(base, seed, n_classes)
+    return _build_lgbm_params(base, seed, n_classes)
+
+
+def _make_model(model: str, params: dict):
+    """Instantiate the classifier. Both libraries are imported lazily so running
+    one family does not require the other to be installed (edge images, partial envs)."""
+    if model == "catboost":
+        from catboost import CatBoostClassifier
+
+        return CatBoostClassifier(**params)
+    import lightgbm as lgb
+
+    return lgb.LGBMClassifier(**params)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Task B classification: HPO + grouped K-fold CV")
+    p.add_argument("--model", default="lightgbm", choices=["lightgbm", "catboost"],
+                   help="Classifier family to validate (default: lightgbm; use catboost to "
+                        "validate the deployed classifier).")
     p.add_argument("--dataset", default="costa")
     p.add_argument("--task", default="classification", choices=["classification"])
     p.add_argument("--split-path", default="path_a", choices=["path_a", "path_b"])
@@ -140,7 +186,7 @@ def _aggregate(per_fold_metrics: list[dict]) -> dict:
 
 
 def _resolve_best_params(
-    args, config: dict, lgb_space: dict, hpo_cfg: dict, seed: int,
+    args, config: dict, space: dict, hpo_cfg: dict, seed: int,
     x_train, y_train, x_val, y_val, n_classes: int,
 ) -> tuple[dict, bool]:
     """Stage 0: load / midpoint / HPO-once on the ORIGINAL holdout. Returns (base_params, hpo_ran)."""
@@ -150,24 +196,25 @@ def _resolve_best_params(
         return base, False
     if args.no_hpo:
         logger.info("STAGE 0: skipped (--no-hpo) — midpoint params")
-        return midpoint_params_from_space(lgb_space), False
+        return midpoint_params_from_space(space), False
 
     n_trials = args.n_trials or int(hpo_cfg.get("n_trials_phase1", 50))
     logger.info("STAGE 0: HPO once on original train/val holdout ({} trials, f1_macro)", n_trials)
 
     def objective(trial):
-        params = _build_lgbm_params(suggest_params_from_space(trial, lgb_space), seed, n_classes)
-        model = lgb.LGBMClassifier(**params)
+        params = _build_params(args.model, suggest_params_from_space(trial, space), seed, n_classes)
+        model = _make_model(args.model, params)
         model.fit(x_train, y_train)
-        return float(f1_score(y_val, model.predict(x_val), average="macro", zero_division=0))
+        pred = np.asarray(model.predict(x_val)).astype(int).reshape(-1)
+        return float(f1_score(y_val, pred, average="macro", zero_division=0))
 
     best_base, study = run_optuna(
-        objective, search_space=lgb_space, n_trials=n_trials,
+        objective, search_space=space, n_trials=n_trials,
         direction=str(hpo_cfg.get("direction", "maximize")), seed=seed,
         n_jobs=1, timeout_seconds=hpo_cfg.get("timeout_seconds"),
         sampler_name=str(hpo_cfg.get("sampler", "tpe")),
         pruner_name=str(hpo_cfg.get("pruner", "none")),
-        storage_url=None, study_name=f"clf_kfold_hpo_{args.dataset}_{args.profile}",
+        storage_url=None, study_name=f"clf_kfold_hpo_{args.model}_{args.dataset}_{args.profile}",
         load_if_exists=False,
     )
     logger.info("STAGE 0 done — best holdout f1_macro={:.4f}", float(study.best_value))
@@ -181,7 +228,12 @@ def main() -> None:
     n_folds = args.n_folds or int(config.get("experiment", {}).get("n_cv_folds", 5))
 
     ml_cfg = config["classification"]["ml"]
-    lgb_space = ml_cfg["models"]["lightgbm"]
+    if args.model not in ml_cfg["models"]:
+        raise KeyError(
+            f"No '{args.model}' search space under classification.ml.models in model_config.yaml "
+            f"(have: {sorted(ml_cfg['models'].keys())})"
+        )
+    space = ml_cfg["models"][args.model]
     hpo_cfg = ml_cfg["hpo"]
 
     # ── STAGE 1: load + pool ──────────────────────────────────────────────────
@@ -227,19 +279,19 @@ def main() -> None:
     x_tr, y_tr = train_df[features], encoder.transform(train_df[label_col])
     x_va, y_va = val_df[features], encoder.transform(val_df[label_col])
     base_params, hpo_ran = _resolve_best_params(
-        args, config, lgb_space, hpo_cfg, seed, x_tr, y_tr, x_va, y_va, n_classes,
+        args, config, space, hpo_cfg, seed, x_tr, y_tr, x_va, y_va, n_classes,
     )
-    params = _build_lgbm_params(base_params, seed, n_classes)
-    logger.info("Fixed params for CV: {}", {k: params[k] for k in list(params)[:8]})
+    params = _build_params(args.model, base_params, seed, n_classes)
+    logger.info("Fixed params for CV ({}): {}", args.model, {k: params[k] for k in list(params)[:8]})
 
     # ── STAGE 2: StratifiedGroupKFold retrain ─────────────────────────────────
     sgkf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     per_fold_metrics: list[dict] = []
     fold_records: list[dict] = []
     for fold_idx, (tr_idx, te_idx) in enumerate(sgkf.split(x_pool, y_pool, groups)):
-        model = lgb.LGBMClassifier(**params)
+        model = _make_model(args.model, params)
         model.fit(x_pool.iloc[tr_idx], y_pool[tr_idx])
-        proba = model.predict_proba(x_pool.iloc[te_idx])
+        proba = np.asarray(model.predict_proba(x_pool.iloc[te_idx]))
         pred = np.argmax(proba, axis=1)
         y_te = y_pool[te_idx]
 
@@ -276,13 +328,13 @@ def main() -> None:
     # ── STAGE 3: aggregate + write ────────────────────────────────────────────
     summary = _aggregate(per_fold_metrics)
     out_dir = Path(args.output_dir) if args.output_dir else (
-        get_experiments_root() / "classification" / "lightgbm"
+        get_experiments_root() / "classification" / args.model
         / f"kfold_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "kfold_summary_classification.json"
     summary_path.write_text(json.dumps({
-        "model": "lightgbm",
+        "model": args.model,
         "task": args.task,
         "dataset": args.dataset,
         "split_path": args.split_path,
@@ -303,7 +355,7 @@ def main() -> None:
 
     # headline
     print("\n" + "=" * 70)
-    print(f"Task B classification — {n_folds}-fold StratifiedGroupKFold({args.group_col})")
+    print(f"Task B classification [{args.model}] — {n_folds}-fold StratifiedGroupKFold({args.group_col})")
     print("-" * 70)
     print(f"{'metric':<28}{'mean':>10}{'std':>10}{'n':>5}")
     print("-" * 70)
@@ -322,11 +374,11 @@ def main() -> None:
 
         from src.mlflow_setup import init_tracking
         init_tracking("classification")
-        run_name = f"kfold_summary_lightgbm_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+        run_name = f"kfold_summary_{args.model}_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
         with mlflow.start_run(run_name=run_name):
             mlflow.set_tags({
                 "task": args.task, "dataset": args.dataset, "split_path": args.split_path,
-                "model": "lightgbm", "run_type": "kfold_summary",
+                "model": args.model, "run_type": "kfold_summary",
                 "cv_strategy": f"StratifiedGroupKFold({args.group_col})",
                 "methodology": "hpo_once_then_grouped_kfold",
             })
