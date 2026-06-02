@@ -52,6 +52,7 @@ from src.modeling.common.artifact_contract import (
     write_json as contract_write_json,
 )
 from src.modeling.common.episode_metrics import episode_macro_f1_binary, episode_macro_pr_auc
+from src.modeling.common.operating_point import compute_operating_points
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -517,6 +518,11 @@ def main():
         args.num_encoder_layers, args.lstm_hidden, args.dropout,
     ).to(device)
 
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    logger.info(f"  Parameters: {total_params:,} total | {trainable_params:,} trainable | {frozen_params:,} non-trainable")
+
     t0 = time.perf_counter()
     model, training_info = train_model(
         model, X_train, X_val, device,
@@ -545,6 +551,9 @@ def main():
 
     # Compute threshold from training reconstruction errors
     train_errors = evaluate_reconstruction(model, X_train, device, final_batch_size)
+
+    # Held-out val errors for threshold calibration (healthy, blindfolded)
+    val_errors = evaluate_reconstruction(model, X_val, device, final_batch_size)
     threshold = compute_threshold(train_errors, args.threshold_percentile)
     logger.info(f"  Anomaly threshold ({args.threshold_percentile}th pctl): {threshold:.6f}")
 
@@ -708,7 +717,190 @@ def main():
     logger.info(f"  Test Episode Macro F1: {test_episode_macro_f1:.4f}")
     logger.info(f"  Test Episode PR-AUC:  {test_episode_pr_auc:.4f}")
 
-    # ── Save standard contract artifacts ────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Operating points & per-method evaluation
+    # ═══════════════════════════════════════════════════════════════════════════
+    logger.info("=== Step 7: Operating Points & Per-Method Evaluation ===")
+
+    # Compute operating points from held-out val normal scores
+    ops = compute_operating_points(
+        calib_normal_scores=val_errors,
+        test_labels=test_bin if all_fault_errors else np.zeros(len(test_healthy_errors)),
+        test_scores=test_scores if all_fault_errors else test_healthy_errors,
+        test_group_ids=test_all_group_ids if all_fault_errors else tensors["test_healthy"].get("group_ids"),
+        return_predictions=True,
+    )
+
+    ops_predictions = ops.pop("_predictions")
+    op_thresholds = ops_predictions["thresholds"]
+
+    # Define the 4 threshold calibration methods
+    calibration_methods: dict[str, dict] = {
+        "percentile": {
+            "label": "Percentile",
+            "preds": test_preds_bin if all_fault_errors else np.zeros(len(test_healthy_errors), dtype=int),
+            "threshold": threshold,
+            "policy": f"q{args.threshold_percentile:.1f}_normal_train",
+        },
+        "P3_advisory": {
+            "label": "P3 Advisory",
+            "preds": ops_predictions["sensitive_hysteresis"],
+            "threshold": op_thresholds["sensitive"],
+            "policy": ops["sensitive_hysteresis"]["policy"],
+        },
+        "P2_high": {
+            "label": "P2 High",
+            "preds": ops_predictions["conformal"],
+            "threshold": op_thresholds.get("conformal_alpha", 0.05),
+            "policy": ops["conformal"]["policy"],
+        },
+        "P1_critical": {
+            "label": "P1 Critical",
+            "preds": ops_predictions["cusum"],
+            "threshold": op_thresholds.get("cusum_h", 0.0),
+            "policy": ops["cusum"]["policy"],
+        },
+    }
+
+    # Per-method metrics computation
+    per_method_metrics: dict[str, dict] = {}
+    for method_key, method in calibration_methods.items():
+        meth_preds = np.asarray(method["preds"]).astype(int)
+        meth_labels = test_bin.astype(int) if all_fault_errors else np.zeros(len(test_healthy_errors), dtype=int)
+        meth_scores = test_scores if all_fault_errors else test_healthy_errors
+        meth_group_ids = test_all_group_ids if all_fault_errors else tensors["test_healthy"].get("group_ids")
+
+        meth_tp = int(np.sum((meth_preds == 1) & (meth_labels == 1)))
+        meth_fp = int(np.sum((meth_preds == 1) & (meth_labels == 0)))
+        meth_fn = int(np.sum((meth_preds == 0) & (meth_labels == 1)))
+        meth_prec = meth_tp / (meth_tp + meth_fp) if (meth_tp + meth_fp) > 0 else 0.0
+        meth_rec = meth_tp / (meth_tp + meth_fn) if (meth_tp + meth_fn) > 0 else 0.0
+        meth_f1 = 2 * meth_prec * meth_rec / (meth_prec + meth_rec) if (meth_prec + meth_rec) > 0 else 0.0
+        meth_pr_auc = float(average_precision_score(meth_labels, meth_scores)) if len(np.unique(meth_labels)) > 1 else 0.0
+        meth_ep_f1 = episode_macro_f1_binary(meth_labels, meth_preds, meth_group_ids)
+        meth_ep_pr_auc = episode_macro_pr_auc(meth_scores, meth_labels, meth_group_ids)
+
+        # Per-class contract metrics using appropriate threshold
+        meth_threshold = method["threshold"] if isinstance(method["threshold"], (int, float)) else threshold
+        meth_per_class = compute_anomaly_per_class_metrics(
+            labels=np.concatenate([np.zeros(len(test_healthy_errors)), combined_labels]) if all_fault_errors else np.zeros(len(test_healthy_errors)),
+            scores=meth_scores,
+            threshold=meth_threshold,
+            normal_label=0,
+        )
+
+        meth_pr_aucs = [float(m["pr_auc_vs_normal"]) for m in meth_per_class.values() if m.get("pr_auc_vs_normal") is not None]
+        meth_f1s = [float(m["f1_at_threshold_vs_normal"]) for m in meth_per_class.values()]
+        meth_recs = [float(m["recall_at_threshold_vs_normal"]) for m in meth_per_class.values()]
+        meth_precs = [float(m["precision_at_threshold_vs_normal"]) for m in meth_per_class.values()]
+        meth_worst_pr = round(float(min(meth_pr_aucs)), 6) if meth_pr_aucs else None
+
+        per_method_metrics[method_key] = {
+            "label": method["label"],
+            "policy": method["policy"],
+            "threshold": method["threshold"],
+            "precision": round(meth_prec, 6),
+            "recall": round(meth_rec, 6),
+            "f1_score": round(meth_f1, 6),
+            "pr_auc": round(meth_pr_auc, 6),
+            "episode_macro_f1": round(meth_ep_f1, 6),
+            "episode_pr_auc": round(meth_ep_pr_auc, 6),
+            "worst_class_pr_auc": meth_worst_pr,
+            "macro_pr_auc": round(float(np.mean(meth_pr_aucs)), 6) if meth_pr_aucs else None,
+            "macro_f1": round(float(np.mean(meth_f1s)), 6) if meth_f1s else None,
+            "macro_recall": round(float(np.mean(meth_recs)), 6) if meth_recs else None,
+            "macro_precision": round(float(np.mean(meth_precs)), 6) if meth_precs else None,
+            "per_class": {str(k): {
+                "pr_auc_vs_normal": v.get("pr_auc_vs_normal"),
+                "f1_at_threshold_vs_normal": v.get("f1_at_threshold_vs_normal"),
+                "support_fault": v.get("support_fault"),
+            } for k, v in meth_per_class.items()},
+        }
+
+    # Log per-method results
+    logger.info("  ── Per Calibration Method ──")
+    logger.info(f"  {'Method':<16} {'F1':>8} {'PR-AUC':>8} {'Prec':>8} {'Rec':>8} {'Ep-F1':>8} {'Ep-PR':>8} {'Worst-PR':>8}")
+    for mk, mm in per_method_metrics.items():
+        logger.info(
+            f"  {mm['label']:<16} "
+            f"{mm['f1_score']:>8.4f} {mm['pr_auc']:>8.4f} "
+            f"{mm['precision']:>8.4f} {mm['recall']:>8.4f} "
+            f"{mm['episode_macro_f1']:>8.4f} {mm['episode_pr_auc']:>8.4f} "
+            f"{str(mm['worst_class_pr_auc']):>8}"
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 5-Fold evaluation (episode-stratified)
+    # ═══════════════════════════════════════════════════════════════════════════
+    logger.info("=== Step 8: 5-Fold Evaluation ===")
+    k_folds = 5
+    kfold_results: dict[str, dict[str, list[float]]] = {mk: {} for mk in calibration_methods}
+
+    if all_fault_errors and test_all_group_ids is not None:
+        unique_groups = np.unique(test_all_group_ids)
+        rng = np.random.default_rng(args.seed)
+        rng.shuffle(unique_groups)
+        fold_groups = np.array_split(unique_groups, k_folds)
+
+        for fold_idx, fold_group_set in enumerate(fold_groups):
+            fold_mask = np.isin(test_all_group_ids, fold_group_set)
+            fold_test_mask = ~fold_mask  # rest of groups for testing
+
+            fold_scores = test_scores[fold_test_mask]
+            fold_labels = test_bin.astype(int)[fold_test_mask]
+            fold_gids = test_all_group_ids[fold_test_mask]
+
+            for method_key, method in calibration_methods.items():
+                meth_preds_all = np.asarray(method["preds"]).astype(int)
+                fold_preds = meth_preds_all[fold_test_mask]
+
+                fold_tp = int(np.sum((fold_preds == 1) & (fold_labels == 1)))
+                fold_fp = int(np.sum((fold_preds == 1) & (fold_labels == 0)))
+                fold_fn = int(np.sum((fold_preds == 0) & (fold_labels == 1)))
+                fold_prec = fold_tp / (fold_tp + fold_fp) if (fold_tp + fold_fp) > 0 else 0.0
+                fold_rec = fold_tp / (fold_tp + fold_fn) if (fold_tp + fold_fn) > 0 else 0.0
+                fold_f1 = 2 * fold_prec * fold_rec / (fold_prec + fold_rec) if (fold_prec + fold_rec) > 0 else 0.0
+                fold_pr_auc = float(average_precision_score(fold_labels, fold_scores)) if len(np.unique(fold_labels)) > 1 else 0.0
+                fold_ep_f1 = episode_macro_f1_binary(fold_labels, fold_preds, fold_gids)
+                fold_ep_pr_auc = episode_macro_pr_auc(fold_scores, fold_labels, fold_gids)
+
+                fd = kfold_results[method_key]
+                fd.setdefault("precision", []).append(fold_prec)
+                fd.setdefault("recall", []).append(fold_rec)
+                fd.setdefault("f1_score", []).append(fold_f1)
+                fd.setdefault("pr_auc", []).append(fold_pr_auc)
+                fd.setdefault("episode_macro_f1", []).append(fold_ep_f1)
+                fd.setdefault("episode_pr_auc", []).append(fold_ep_pr_auc)
+
+        # Aggregate
+        kfold_agg: dict[str, dict] = {}
+        logger.info("  ── 5-Fold Summary (mean ± std) ──")
+        logger.info(f"  {'Method':<16} {'F1':>16} {'PR-AUC':>16} {'Ep-F1':>16} {'Ep-PR':>16}")
+        for mk, mm in per_method_metrics.items():
+            if mk not in kfold_results or "f1_score" not in kfold_results[mk]:
+                continue
+            kd = kfold_results[mk]
+            agg = {}
+            summary_items = []
+            for metric in ["f1_score", "pr_auc", "episode_macro_f1", "episode_pr_auc"]:
+                if metric in kd and len(kd[metric]) > 0:
+                    vals = np.array(kd[metric])
+                    agg[metric] = {
+                        "mean": round(float(np.mean(vals)), 6),
+                        "std": round(float(np.std(vals, ddof=1)), 6),
+                    }
+                    summary_items.append(f"{agg[metric]['mean']:.4f}±{agg[metric]['std']:.4f}")
+                else:
+                    summary_items.append("N/A")
+            kfold_agg[mk] = agg
+            logger.info(f"  {mm['label']:<16} {'  '.join(f'{s:>16}' for s in summary_items)}")
+    else:
+        kfold_agg = {}
+        logger.info("  Skipped — insufficient test data for k-fold")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Save standard contract artifacts (updated with per-method metrics)
+    # ═══════════════════════════════════════════════════════════════════════════
     metrics_dir = Path(DEFAULT_METRICS_DIR)
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
@@ -730,6 +922,8 @@ def main():
         "n_test_healthy": int(tensors["test_healthy"]["n_samples"]),
         "n_test_fault": int(sum(tensors[key]["n_samples"] for key in tensors if key.startswith("fault_class_"))),
         "train_time_s": round(train_time, 1),
+        "per_method_metrics": {mk: mm for mk, mm in per_method_metrics.items()},
+        "kfold_5_aggregates": kfold_agg,
     }
     contract_write_json(metrics_dir / "global_metrics.json", global_metrics)
     contract_write_json(metrics_dir / "per_class_metrics.json", per_class_metrics)
@@ -782,6 +976,8 @@ def main():
             "worst_class_pr_auc": worst_class_pr_auc,
             "test_episode_macro_f1": test_episode_macro_f1,
             "test_episode_pr_auc": test_episode_pr_auc,
+            "per_method_metrics": {mk: mm for mk, mm in per_method_metrics.items()},
+            "kfold_5": kfold_agg,
             "overall": overall_result if all_fault_errors else {},
             "label_distribution": {
                 FAULT_NAMES[int(lbl)]: int(cnt)
@@ -812,6 +1008,15 @@ def main():
         logger.success(f"  Macro F1: {macro_metrics['macro_f1']:.4f}")
         logger.success(f"  Macro Recall: {macro_metrics['macro_recall']:.4f}")
         logger.success(f"  Macro Precision: {macro_metrics['macro_precision']:.4f}")
+    logger.success("  ── Per-Method F1 / PR-AUC ──")
+    for mk in ["percentile", "P3_advisory", "P2_high", "P1_critical"]:
+        if mk in per_method_metrics:
+            mm = per_method_metrics[mk]
+            kf = kfold_agg.get(mk, {})
+            kf_f1 = kf.get("f1_score", {})
+            kf_pr = kf.get("pr_auc", {})
+            kf_str = f"  (kfold F1={kf_f1.get('mean', 0):.4f}±{kf_f1.get('std', 0):.4f} PR={kf_pr.get('mean', 0):.4f}±{kf_pr.get('std', 0):.4f})" if kf_f1 else ""
+            logger.success(f"    {mm['label']:<16} F1={mm['f1_score']:.4f} PR-AUC={mm['pr_auc']:.4f}{kf_str}")
     logger.success(f"  Checkpoint: {ckpt_path}")
     logger.success(f"  Metrics: {results_path}")
     logger.success("=" * 60)

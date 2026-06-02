@@ -26,6 +26,7 @@ from sklearn.metrics import average_precision_score
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
 from src.modeling.common.artifact_contract import compute_anomaly_per_class_metrics
 from src.modeling.common.episode_metrics import episode_macro_f1_binary, episode_macro_pr_auc
+from src.modeling.common.operating_point import compute_operating_points
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
@@ -329,6 +330,65 @@ def main():
 
     if worst_class_pr_auc is not None:
         logger.info(f"  Worst-class PR-AUC:    {worst_class_pr_auc:.4f}")
+
+    # ── Operating points & per-method evaluation ──────────────────────────
+    healthy_mask = (labels_arr == 0)
+    calib_normal_scores = errors_arr[healthy_mask] if healthy_mask.any() else errors_arr
+
+    ops = compute_operating_points(
+        calib_normal_scores=calib_normal_scores,
+        test_labels=true_bin,
+        test_scores=errors_arr,
+        test_group_ids=group_ids_arr,
+        return_predictions=True,
+    )
+    ops_predictions = ops.pop("_predictions")
+    op_thresholds = ops_predictions["thresholds"]
+
+    calibration_methods: dict[str, dict] = {
+        "percentile": {
+            "label": "Percentile",
+            "preds": preds_bin,
+            "threshold": threshold,
+            "policy": f"q95_normal_train",
+        },
+        "P3_advisory": {
+            "label": "P3 Advisory",
+            "preds": ops_predictions["sensitive_hysteresis"],
+            "threshold": op_thresholds["sensitive"],
+            "policy": ops["sensitive_hysteresis"]["policy"],
+        },
+        "P2_high": {
+            "label": "P2 High",
+            "preds": ops_predictions["conformal"],
+            "threshold": op_thresholds.get("conformal_alpha", 0.05),
+            "policy": ops["conformal"]["policy"],
+        },
+        "P1_critical": {
+            "label": "P1 Critical",
+            "preds": ops_predictions["cusum"],
+            "threshold": op_thresholds.get("cusum_h", 0.0),
+            "policy": ops["cusum"]["policy"],
+        },
+    }
+
+    logger.info("\n  ── Per Calibration Method ──")
+    logger.info(f"  {'Method':<16} {'F1':>8} {'PR-AUC':>8} {'Prec':>8} {'Rec':>8} {'Ep-F1':>8} {'Ep-PR':>8}")
+    for method_key, method in calibration_methods.items():
+        mpreds = np.asarray(method["preds"]).astype(int)
+        mtp = int(np.sum((mpreds == 1) & (true_bin == 1)))
+        mfp = int(np.sum((mpreds == 1) & (true_bin == 0)))
+        mfn = int(np.sum((mpreds == 0) & (true_bin == 1)))
+        mprec = mtp / (mtp + mfp) if (mtp + mfp) > 0 else 0.0
+        mrec = mtp / (mtp + mfn) if (mtp + mfn) > 0 else 0.0
+        mf1 = 2 * mprec * mrec / (mprec + mrec) if (mprec + mrec) > 0 else 0.0
+        mpr_auc = float(average_precision_score(true_bin, errors_arr)) if len(np.unique(true_bin)) > 1 else 0.0
+        mep_f1 = episode_macro_f1_binary(true_bin, mpreds, group_ids_arr)
+        mep_pr = episode_macro_pr_auc(errors_arr, true_bin, group_ids_arr)
+        logger.info(
+            f"  {method['label']:<16} {mf1:>8.4f} {mpr_auc:>8.4f} "
+            f"{mprec:>8.4f} {mrec:>8.4f} {mep_f1:>8.4f} {mep_pr:>8.4f}"
+        )
 
     # Label distribution (frequency)
     logger.info("\n  ── Label Distribution ──")
