@@ -37,7 +37,6 @@ from src.modeling.anomaly_detection.ml.one_class_svm_model import (
     _subsample_train_indices,
 )
 from src.modeling.common.artifact_contract import (
-    build_candidate_per_true_class_thresholds,
     build_deployment_manifest,
     build_run_manifest,
     build_score_calibration_payload,
@@ -339,18 +338,34 @@ def run_isolation_forest(config: dict | None = None) -> None:
 
     joblib.dump(final_model, model_path)
     joblib.dump(scaler, scaler_path)
+    _op_cfg = config.get("anomaly_detection", {}).get("operating_point", {})
+    _pot_q = config.get("anomaly_detection", {}).get("threshold", {}).get("pot_quantile", 0.90)
+    _normal_val_scores = val_scores[y_val_bin == 0]
+    operating_points = compute_operating_points(
+        calib_normal_scores=_normal_val_scores, test_labels=y_test_bin, test_scores=test_scores,
+        test_group_ids=test_group_ids, pot_quantile=float(_pot_q),
+        baseline_fpr=float(_op_cfg.get("baseline_fpr", 0.05)),
+        sensitive_fpr=float(_op_cfg.get("sensitive_fpr", 0.20)),
+        hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
+        conformal_alpha=float(_op_cfg.get("conformal_alpha", 0.05)),
+        fdr_q=float(_op_cfg.get("fdr_q", 0.10)), op_cfg=_op_cfg,
+    )
+    metrics.update(flatten_operating_points(operating_points, "test"))
+    _conformal_alpha = float(_op_cfg.get("conformal_alpha", 0.05))
+    _p2_threshold = float(np.quantile(_normal_val_scores, 1.0 - _conformal_alpha)) if len(_normal_val_scores) else None
+    _cusum_k = float(_op_cfg.get("cusum_k", 0.5))
+    _mu_normal = float(np.mean(_normal_val_scores)) if len(_normal_val_scores) else None
     per_class_metrics = compute_anomaly_per_class_metrics(
         labels=y_test,
         scores=test_scores,
         threshold=threshold,
+        p2_threshold=_p2_threshold,
+        cusum_k=_cusum_k,
+        mu_normal=_mu_normal,
         val_labels=y_val,
         val_scores=val_scores,
     )
-    candidate_per_true_class_thresholds = build_candidate_per_true_class_thresholds(
-        per_class_metrics,
-        normal_label=0,
-    )
-    # ── Episode-level PR-AUC (closes the ML null-gap) + uniform operating points ─
+    # ── Episode-level PR-AUC (closes the ML null-gap) ──────────────────────────
     if test_group_ids is not None:
         _test_ep = compute_episode_level_pr_auc(
             labels=y_test_bin, scores=test_scores,
@@ -365,18 +380,6 @@ def run_isolation_forest(config: dict | None = None) -> None:
             "test_episode_class3_pr_auc": _test_ep.get("episode_per_class_pr_auc_vs_normal", {}).get("3"),
             "test_episode_class4_pr_auc": _test_ep.get("episode_per_class_pr_auc_vs_normal", {}).get("4"),
         })
-    _op_cfg = config.get("anomaly_detection", {}).get("operating_point", {})
-    _pot_q = config.get("anomaly_detection", {}).get("threshold", {}).get("pot_quantile", 0.90)
-    operating_points = compute_operating_points(
-        calib_normal_scores=val_scores[y_val_bin == 0], test_labels=y_test_bin, test_scores=test_scores,
-        test_group_ids=test_group_ids, pot_quantile=float(_pot_q),
-        baseline_fpr=float(_op_cfg.get("baseline_fpr", 0.05)),
-        sensitive_fpr=float(_op_cfg.get("sensitive_fpr", 0.20)),
-        hysteresis_n=int(_op_cfg.get("hysteresis_n", 10)),
-        conformal_alpha=float(_op_cfg.get("conformal_alpha", 0.05)),
-        fdr_q=float(_op_cfg.get("fdr_q", 0.10)), op_cfg=_op_cfg,
-    )
-    metrics.update(flatten_operating_points(operating_points, "test"))
     leakage_report = run_anomaly_leakage_report(
         test_scores=test_scores, test_labels=y_test_bin, pr_auc=metrics.get("test_pr_auc"), seed=seed,
     )
@@ -421,7 +424,6 @@ def run_isolation_forest(config: dict | None = None) -> None:
             threshold=threshold,
             threshold_policy=_iforest_threshold_policy,
             threshold_quantile=None,
-            candidate_per_true_class_thresholds=candidate_per_true_class_thresholds,
         ),
     )
     write_json(global_metrics_path, metrics)
@@ -495,16 +497,10 @@ def run_isolation_forest(config: dict | None = None) -> None:
             )
             mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
             for cls_str, m in per_class_metrics.items():
-                if m.get("per_class_threshold") is not None:
-                    mlflow.log_metric(f"test_f1_class{cls_str}_per_class", m["f1_at_per_class_threshold"])
-                    mlflow.log_metric(f"test_f1_class{cls_str}_global", m["f1_at_threshold_vs_normal"])
-                    mlflow.log_metric(f"per_class_threshold_class{cls_str}", m["per_class_threshold"])
-                    mlflow.log_metric(
-                        f"candidate_per_true_class_threshold_class{cls_str}",
-                        m["candidate_per_true_class_threshold"],
-                    )
-                if m.get("pr_auc_vs_normal") is not None:
-                    mlflow.log_metric(f"test_pr_auc_class{cls_str}_vs_normal", m["pr_auc_vs_normal"])
+                for key in ("pr_auc_vs_normal", "p3_recall", "p3_f1", "p2_recall", "p2_f1", "p1_cusum_contrib_rate"):
+                    v = m.get(key)
+                    if v is not None:
+                        mlflow.log_metric(f"test_class{cls_str}_{key}", float(v))
             for p in (
                 global_metrics_path,
                 per_class_metrics_path,

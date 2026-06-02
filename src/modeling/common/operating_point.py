@@ -220,6 +220,7 @@ def compute_operating_points(
     conformal_alpha: float = 0.05,
     fdr_q: float = 0.10,
     op_cfg: dict | None = None,
+    return_predictions: bool = False,
 ) -> dict:
     """Compute the three uniform operating points from held-out normal scores.
 
@@ -269,7 +270,7 @@ def compute_operating_points(
     _h = _cusum_calibrate_h(calib_normal_scores, _mu, _sigma, cusum_k, baseline_fpr)
     cusum_pred = _cusum_predict(test_scores, test_group_ids, _mu, _sigma, cusum_k, _h)
 
-    return {
+    result = {
         "gpd_baseline": {
             "threshold": float(t_base),
             "target_fpr": float(baseline_fpr),
@@ -314,6 +315,31 @@ def compute_operating_points(
             **_episode_decision_metrics(cusum_pred, test_labels, test_group_ids),
         },
     }
+
+    if return_predictions:
+        # Per-tier alarm arrays + threshold scalars — single source of truth for the
+        # deployment-metrics module (avoids recomputing/duplicating threshold calibration).
+        # Kept under a private key; flatten_operating_points skips non-scalar payloads,
+        # but callers should pop it before logging the dict.
+        result["_predictions"] = {
+            "gpd_baseline": base_pred,
+            "sensitive": sens_pred,
+            "sensitive_hysteresis": deb_pred,
+            "conformal": conf_pred,
+            "fdr_bh": fdr_pred,
+            "cusum": cusum_pred,
+            "thresholds": {
+                "gpd_baseline": float(t_base),
+                "sensitive": float(t_sens),
+                "conformal_alpha": float(conformal_alpha),
+                "cusum_k": float(cusum_k),
+                "cusum_h": float(_h),
+                "cusum_mu": float(_mu),
+                "cusum_sigma": float(_sigma),
+            },
+        }
+
+    return result
 
 
 def flatten_operating_points(ops: dict, split: str = "test") -> dict:

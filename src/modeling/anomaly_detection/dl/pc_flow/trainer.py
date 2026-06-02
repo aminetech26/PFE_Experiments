@@ -46,7 +46,6 @@ from src.mlflow_setup import init_tracking
 from src.modeling.anomaly_detection.dl.dataset import TimeSeriesDataset
 from src.modeling.anomaly_detection.dl.pc_flow.model import PCFlowModel
 from src.modeling.common.artifact_contract import (
-    build_candidate_per_true_class_thresholds,
     build_deployment_manifest,
     build_run_manifest,
     build_score_calibration_payload,
@@ -55,6 +54,7 @@ from src.modeling.common.artifact_contract import (
     compute_macro_per_class_pr_auc,
     write_json,
 )
+from src.modeling.common.deployment_metrics import compute_deployment_metrics
 from src.modeling.common.dl_training_utils import (
     _build_warmup_cosine_scheduler,
     _resolve_loader_runtime,
@@ -816,6 +816,7 @@ def run_pc_flow(config: dict | None = None) -> None:
         hysteresis_n=int(op_cfg.get("hysteresis_n", 10)),
         conformal_alpha=float(op_cfg.get("conformal_alpha", 0.05)),
         fdr_q=float(op_cfg.get("fdr_q", 0.10)), op_cfg=op_cfg,
+        return_predictions=True,  # needed for deployment-metrics temporal characterization
     )
     _op_sh = operating_points["sensitive_hysteresis"]
     logger.info(
@@ -882,6 +883,7 @@ def run_pc_flow(config: dict | None = None) -> None:
     # Save artifacts
     global_metrics_path = artifacts_dir / "global_metrics.json"
     per_class_metrics_path = artifacts_dir / "per_class_metrics.json"
+    deployment_metrics_path = artifacts_dir / "deployment_alarm_metrics.json"
     episode_metrics_path = artifacts_dir / "episode_metrics.json"
     run_manifest_path = artifacts_dir / "run_manifest.json"
     deployment_manifest_path = artifacts_dir / "deployment_manifest.json"
@@ -901,21 +903,64 @@ def run_pc_flow(config: dict | None = None) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
     joblib.dump(scaler, scaler_path)
 
+    # Derive deployed alarm thresholds for per-class metric alignment
+    _normal_val_scores = val_scores[val_labels == 0]
+    _conformal_alpha = float(op_cfg.get("conformal_alpha", 0.05))
+    _p2_threshold = float(np.quantile(_normal_val_scores, 1.0 - _conformal_alpha)) if len(_normal_val_scores) else None
+    _cusum_k = float(op_cfg.get("cusum_k", 0.5))
+    _mu_normal = float(np.mean(_normal_val_scores)) if len(_normal_val_scores) else None
+
     per_class_metrics = compute_anomaly_per_class_metrics(
         labels=test_pc_source, scores=test_scores, threshold=threshold,
+        p2_threshold=_p2_threshold,
+        cusum_k=_cusum_k,
+        mu_normal=_mu_normal,
         val_labels=val_pc_source, val_scores=val_scores,
     )
-    candidate_thresholds = build_candidate_per_true_class_thresholds(per_class_metrics, normal_label=0)
     calibration_payload = build_score_calibration_payload(
         threshold=threshold, threshold_policy=threshold_policy_str_val,
         threshold_quantile=float(thr_cfg.get("percentile", 95.0)) / 100.0,
-        candidate_per_true_class_thresholds=candidate_thresholds,
         score_stats={"score_name": "pc_flow_nll", "score_components": ["negative_log_likelihood"]},
     )
     calibration_payload["threshold_diagnostics"] = threshold_diag
     write_json(calibration_path, calibration_payload)
     write_json(per_class_metrics_path, per_class_metrics)
     write_json(episode_metrics_path, {"val": val_episode_metrics, "test": test_episode_metrics, "agg": "p95"})
+
+    # ── Deployment-characterization metrics (winner only): per-tier ISA-18.2 table ──
+    # Headline = threshold-free macro/worst per-class PR-AUC (the selection metric);
+    # tiers describe the single escalating alarm system (never averaged).
+    _pc_pr_auc = {
+        k: v for k, v in (test_macro.get("per_class_pr_auc_vs_normal", {}) or {}).items()
+        if v is not None
+    }
+    _worst_cls = min(_pc_pr_auc, key=_pc_pr_auc.get) if _pc_pr_auc else None
+    _worst_support = (
+        per_class_metrics.get(_worst_cls, {}).get("support_fault") if _worst_cls else None
+    )
+    deployment_metrics = compute_deployment_metrics(
+        operating_points=operating_points,
+        test_labels_binary=test_labels,
+        test_group_ids=test_group_ids,
+        macro_per_class_pr_auc=test_macro.get("macro_per_class_pr_auc"),
+        worst_class_pr_auc=test_macro.get("worst_class_pr_auc"),
+        worst_class=_worst_cls,
+        worst_class_support=_worst_support,
+        selection_metric="val_macro_per_class_pr_auc",
+    )
+    write_json(deployment_metrics_path, deployment_metrics)
+    operating_points.pop("_predictions", None)  # drop arrays before any dict logging
+    _p3 = deployment_metrics["tiers"]["P3_advisory"]
+    _p1 = deployment_metrics["tiers"]["P1_critical"]
+    logger.info(
+        "Deployment — headline macro_pc_pr_auc={:.4f} worst={:.4f} (class {}) | "
+        "P3 episode_recall={:.3f} median_delay={} | P1 escalation={:.3f} ARL0={}",
+        deployment_metrics["headline"]["macro_per_class_pr_auc"] or 0.0,
+        deployment_metrics["headline"]["worst_class_pr_auc"] or 0.0,
+        _worst_cls,
+        _p3.get("episode_recall") or 0.0, _p3.get("median_detection_delay_samples"),
+        _p1.get("episode_escalation_rate") or 0.0, _p1.get("arl0_samples"),
+    )
 
     run_manifest = build_run_manifest(
         task=args.task, model="pc_flow", model_family="anomaly_dl",
@@ -968,9 +1013,18 @@ def run_pc_flow(config: dict | None = None) -> None:
                                 if isinstance(v, (int, float, np.integer, np.floating))
                                 and not isinstance(v, bool) and v is not None})
             for cls_str, m in per_class_metrics.items():
-                if m.get("pr_auc_vs_normal") is not None:
-                    mlflow.log_metric(f"test_pr_auc_class{cls_str}_vs_normal", m["pr_auc_vs_normal"])
-            for p in (global_metrics_path, per_class_metrics_path, episode_metrics_path,
+                for key in ("pr_auc_vs_normal", "p3_recall", "p3_f1", "p2_recall", "p2_f1", "p1_cusum_contrib_rate"):
+                    v = m.get(key)
+                    if v is not None:
+                        mlflow.log_metric(f"test_class{cls_str}_{key}", float(v))
+            # Deployment-tier scalars (per-tier characterization, never averaged)
+            for _tier_name, _tier in deployment_metrics["tiers"].items():
+                for _k, _v in _tier.items():
+                    if isinstance(_v, (int, float, np.integer, np.floating)) and not isinstance(_v, bool):
+                        if np.isfinite(_v):
+                            mlflow.log_metric(f"deploy_{_tier_name}_{_k}", float(_v))
+            for p in (global_metrics_path, per_class_metrics_path, deployment_metrics_path,
+                      episode_metrics_path,
                       run_manifest_path, deployment_manifest_path, params_path,
                       hpo_params_path, scaler_path, manifest_path, calibration_path,
                       pr_curve_path, histogram_path, timeline_path):

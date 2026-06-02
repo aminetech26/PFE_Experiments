@@ -726,16 +726,10 @@ def run_one_class_svm(config: dict | None = None) -> None:
             )
             mlflow.log_metric("sanity_pr_auc_suspicious", float(sanity_check["is_suspicious"]))
             for cls_str, m in per_class_metrics.items():
-                if m.get("per_class_threshold") is not None:
-                    mlflow.log_metric(f"test_f1_class{cls_str}_per_class", m["f1_at_per_class_threshold"])
-                    mlflow.log_metric(f"test_f1_class{cls_str}_global", m["f1_at_threshold_vs_normal"])
-                    mlflow.log_metric(f"per_class_threshold_class{cls_str}", m["per_class_threshold"])
-                    mlflow.log_metric(
-                        f"candidate_per_true_class_threshold_class{cls_str}",
-                        m["candidate_per_true_class_threshold"],
-                    )
-                if m.get("pr_auc_vs_normal") is not None:
-                    mlflow.log_metric(f"test_pr_auc_class{cls_str}_vs_normal", m["pr_auc_vs_normal"])
+                for key in ("pr_auc_vs_normal", "p3_recall", "p3_f1", "p2_recall", "p2_f1", "p1_cusum_contrib_rate"):
+                    v = m.get(key)
+                    if v is not None:
+                        mlflow.log_metric(f"test_class{cls_str}_{key}", float(v))
             for p in (
                 global_metrics_path,
                 per_class_metrics_path,

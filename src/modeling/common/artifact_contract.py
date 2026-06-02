@@ -211,25 +211,37 @@ def compute_anomaly_per_class_metrics(
     labels: np.ndarray,
     scores: np.ndarray,
     threshold: float,
+    p2_threshold: float | None = None,
+    cusum_k: float | None = None,
+    mu_normal: float | None = None,
     val_labels: np.ndarray | None = None,
     val_scores: np.ndarray | None = None,
     normal_label: float | int = 0,
 ) -> dict[str, dict[str, float | int | None]]:
-    """Compute class-vs-normal metrics for each non-normal class.
+    """Compute per-class metrics aligned with the three deployed alarm tiers.
 
-    For each fault class ``cls``, metrics are evaluated on the filtered subset
-    ``{normal_label, cls}`` only (test side). If ``val_labels`` and ``val_scores``
-    are provided, also computes a per-class optimal threshold ``T_k*`` calibrated
-    on the val subset ``{normal_label, cls}`` and reports metrics at ``T_k*`` on test.
-    Existing global-threshold fields are preserved for backward compatibility.
+    For each fault class, evaluates on the OvN subset {normal_label, cls}.
+
+    Tiers (all optional — only computed when the relevant threshold is provided):
+      P3 Advisory  → threshold          (sensitive_threshold / GPD)
+      P2 High      → p2_threshold       (conformal threshold)
+      P1 Critical  → CUSUM stateful; proxy = fraction of fault samples with
+                     score > mu_normal + cusum_k (samples that contribute to accumulation)
+
+    The legacy per-class-optimal threshold group is dropped — it does not
+    correspond to any deployed threshold.
     """
     labels_arr = np.asarray(labels)
     scores_arr = np.asarray(scores, dtype=float)
-    threshold_val = float(threshold)
+    p3_thr = float(threshold)
 
     has_val = val_labels is not None and val_scores is not None
     val_labels_arr = np.asarray(val_labels) if has_val else None
     val_scores_arr = np.asarray(val_scores, dtype=float) if has_val else None
+
+    cusum_contrib_thr: float | None = None
+    if cusum_k is not None and mu_normal is not None:
+        cusum_contrib_thr = float(mu_normal) + float(cusum_k)
 
     out: dict[str, dict[str, float | int | None]] = {}
     unique_labels = sorted(np.unique(labels_arr).tolist())
@@ -243,7 +255,7 @@ def compute_anomaly_per_class_metrics(
 
         y_true = (labels_arr[class_mask] == cls).astype(int)
         cls_scores = scores_arr[class_mask]
-        cls_preds = (cls_scores >= threshold_val).astype(int)
+        fault_scores = cls_scores[y_true == 1]
 
         support = int(y_true.sum())
         if support == 0:
@@ -255,54 +267,54 @@ def compute_anomaly_per_class_metrics(
         except Exception:
             pr_auc = None
 
-        precision = float(precision_score(y_true, cls_preds, zero_division=0))
-        recall = float(recall_score(y_true, cls_preds, zero_division=0))
-        f1 = float(f1_score(y_true, cls_preds, zero_division=0))
+        # P3: precision/recall/F1 at the deployed sensitive threshold
+        preds_p3 = (cls_scores >= p3_thr).astype(int)
+        p3_precision = float(precision_score(y_true, preds_p3, zero_division=0))
+        p3_recall = float(recall_score(y_true, preds_p3, zero_division=0))
+        p3_f1 = float(f1_score(y_true, preds_p3, zero_division=0))
 
-        # Per-class optimal threshold calibrated on val
-        per_class_thr: float | None = None
-        prec_at_pc: float | None = None
-        rec_at_pc: float | None = None
-        f1_at_pc: float | None = None
+        # P2: metrics at conformal threshold (if provided)
+        p2_precision: float | None = None
+        p2_recall: float | None = None
+        p2_f1: float | None = None
+        if p2_threshold is not None:
+            preds_p2 = (cls_scores >= float(p2_threshold)).astype(int)
+            p2_precision = float(precision_score(y_true, preds_p2, zero_division=0))
+            p2_recall = float(recall_score(y_true, preds_p2, zero_division=0))
+            p2_f1 = float(f1_score(y_true, preds_p2, zero_division=0))
+
+        # P1/CUSUM proxy: fraction of fault samples that contribute to accumulation
+        # (score > mu_normal + cusum_k). These samples push the CUSUM statistic up.
+        cusum_contrib_rate: float | None = None
+        if cusum_contrib_thr is not None and len(fault_scores) > 0:
+            cusum_contrib_rate = float((fault_scores > cusum_contrib_thr).mean())
+
+        # Validation support (for context only)
         val_support_fault: int | None = None
         val_support_normal: int | None = None
-        val_f1_at_pc: float | None = None
-
         if has_val:
             val_class_mask = (val_labels_arr == cls) | (val_labels_arr == normal_label)
             y_val_k = (val_labels_arr[val_class_mask] == cls).astype(int)
-            s_val_k = val_scores_arr[val_class_mask]
-            if y_val_k.sum() >= 2 and int((y_val_k == 0).sum()) >= 1:
-                try:
-                    per_class_thr, val_f1_at_pc = _optimal_f1_threshold(s_val_k, y_val_k)
-                    val_support_fault = int(y_val_k.sum())
-                    val_support_normal = int((val_labels_arr[val_class_mask] == normal_label).sum())
-                    cls_preds_pc = (cls_scores >= per_class_thr).astype(int)
-                    prec_at_pc = float(precision_score(y_true, cls_preds_pc, zero_division=0))
-                    rec_at_pc = float(recall_score(y_true, cls_preds_pc, zero_division=0))
-                    f1_at_pc = float(f1_score(y_true, cls_preds_pc, zero_division=0))
-                except Exception:
-                    pass
+            val_support_fault = int(y_val_k.sum())
+            val_support_normal = int((val_labels_arr[val_class_mask] == normal_label).sum())
 
         out[str(int(cls) if float(cls).is_integer() else cls)] = {
             "support_fault": support,
             "support_normal": support_normal,
-            "pr_auc_vs_normal": pr_auc,
-            "precision_at_threshold_vs_normal": precision,
-            "recall_at_threshold_vs_normal": recall,
-            "f1_at_threshold_vs_normal": f1,
-            "per_class_threshold": per_class_thr,
-            "precision_at_per_class_threshold": prec_at_pc,
-            "recall_at_per_class_threshold": rec_at_pc,
-            "f1_at_per_class_threshold": f1_at_pc,
-            "candidate_per_true_class_threshold": per_class_thr,
-            "precision_at_candidate_per_true_class_threshold": prec_at_pc,
-            "recall_at_candidate_per_true_class_threshold": rec_at_pc,
-            "f1_at_candidate_per_true_class_threshold": f1_at_pc,
             "val_support_fault": val_support_fault,
             "val_support_normal": val_support_normal,
-            "val_f1_at_per_class_threshold": val_f1_at_pc,
-            "val_f1_at_candidate_per_true_class_threshold": val_f1_at_pc,
+            # Threshold-free ranking quality
+            "pr_auc_vs_normal": pr_auc,
+            # P3 Advisory (sensitive_threshold / GPD) — deployed
+            "p3_precision": p3_precision,
+            "p3_recall": p3_recall,
+            "p3_f1": p3_f1,
+            # P2 High (conformal threshold) — deployed
+            "p2_precision": p2_precision,
+            "p2_recall": p2_recall,
+            "p2_f1": p2_f1,
+            # P1 Critical CUSUM proxy — fraction of fault samples that contribute to accumulation
+            "p1_cusum_contrib_rate": cusum_contrib_rate,
         }
     return out
 
