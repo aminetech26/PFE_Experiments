@@ -41,6 +41,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from loguru import logger
+from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
@@ -336,7 +337,7 @@ def evaluate_anomaly_detection(
     labels: np.ndarray,
     threshold: float,
 ) -> dict[str, float]:
-    """Compute precision, recall, F1 for anomaly detection."""
+    """Compute precision, recall, F1, PR AUC for anomaly detection."""
     preds = (errors > threshold).astype(int)
     true = (labels > 0).astype(int)
 
@@ -349,6 +350,13 @@ def evaluate_anomaly_detection(
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
+    n_pos = int(true.sum())
+    n_neg = int(len(true) - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        pr_auc = 0.0
+    else:
+        pr_auc = float(average_precision_score(true, errors))
+
     return {
         "TP": tp,
         "FP": fp,
@@ -357,6 +365,7 @@ def evaluate_anomaly_detection(
         "precision": round(precision, 6),
         "recall": round(recall, 6),
         "f1_score": round(f1, 6),
+        "pr_auc": round(pr_auc, 6),
         "threshold": threshold,
     }
 
@@ -505,6 +514,7 @@ def main():
 
     # Evaluate on each fault class
     class_results: dict[str, dict] = {}
+    class_details: dict[str, dict] = {}
     for cls in EVALUABLE_CLASSES:
         key = f"fault_class_{cls}"
         if key not in tensors:
@@ -514,14 +524,37 @@ def main():
         X_fault = tensors[key]["X"]
         labels_fault = tensors[key]["labels"]
         fault_errors = evaluate_reconstruction(model, X_fault, device, final_batch_size)
+
+        # Threshold-based metrics on fault class alone
         result = evaluate_anomaly_detection(fault_errors, labels_fault, threshold)
+
+        # Per-class PR AUC: combine fault errors with val (healthy) errors
+        combined_errors_pc = np.concatenate([val_errors, fault_errors])
+        combined_labels_pc = np.concatenate([np.zeros(len(val_errors)), labels_fault])
+        per_class_pr_auc = float(average_precision_score(
+            (combined_labels_pc > 0).astype(int), combined_errors_pc
+        )) if len(fault_errors) > 0 else 0.0
+
+        n_fault = int(labels_fault.shape[0])
         class_results[key] = result
+        class_details[FAULT_NAMES[cls]] = {
+            "pr_auc": round(per_class_pr_auc, 6),
+            "precision": result["precision"],
+            "recall": result["recall"],
+            "f1_score": result["f1_score"],
+            "n_fault": n_fault,
+            "TP": result["TP"],
+            "FP": result["FP"],
+            "FN": result["FN"],
+        }
         logger.info(
             f"  {FAULT_NAMES[cls]:<14} "
             f"Precision={result['precision']:.4f} "
             f"Recall={result['recall']:.4f} "
             f"F1={result['f1_score']:.4f} "
-            f"TP={result['TP']} FP={result['FP']} FN={result['FN']}"
+            f"PR-AUC={per_class_pr_auc:.4f} "
+            f"TP={result['TP']} FP={result['FP']} FN={result['FN']} "
+            f"N={n_fault}"
         )
 
     # ── Overall (all fault classes combined) ───────────────────────────────
@@ -545,8 +578,33 @@ def main():
             f"Precision={overall_result['precision']:.4f} "
             f"Recall={overall_result['recall']:.4f} "
             f"F1={overall_result['f1_score']:.4f} "
+            f"PR-AUC={overall_result['pr_auc']:.4f} "
             f"TP={overall_result['TP']} FP={overall_result['FP']} FN={overall_result['FN']}"
         )
+
+    # ── Macro averages ──────────────────────────────────────────────────────
+    pr_auc_list = []
+    f1_list = []
+    recall_list = []
+    precision_list = []
+    for detail in class_details.values():
+        pr_auc_list.append(detail["pr_auc"])
+        f1_list.append(detail["f1_score"])
+        recall_list.append(detail["recall"])
+        precision_list.append(detail["precision"])
+
+    n_classes = len(pr_auc_list)
+    macro_metrics = {}
+    if n_classes > 0:
+        macro_metrics = {
+            "macro_pr_auc": round(float(np.mean(pr_auc_list)), 6),
+            "macro_f1": round(float(np.mean(f1_list)), 6),
+            "macro_recall": round(float(np.mean(recall_list)), 6),
+            "macro_precision": round(float(np.mean(precision_list)), 6),
+        }
+        logger.info("  ── Macro Averages ──")
+        for k, v in macro_metrics.items():
+            logger.info(f"    {k}: {v:.4f}")
 
     # ── Save Results ───────────────────────────────────────────────────────
     metrics_dir = Path(DEFAULT_METRICS_DIR)
@@ -583,8 +641,14 @@ def main():
             "threshold_percentile": args.threshold_percentile,
             "threshold_value": threshold,
             "val_healthy_fp_rate": float(val_fp / len(val_errors)) if len(val_errors) > 0 else 0.0,
-            "per_class": {k: v for k, v in class_results.items()},
+            "per_class": class_details,
+            "macro_metrics": macro_metrics,
             "overall": overall_result if all_fault_errors else {},
+            "label_distribution": {
+                FAULT_NAMES[int(lbl)]: int(cnt)
+                for lbl, cnt in df["label"].value_counts().sort_index().items()
+                if int(lbl) in FAULT_NAMES
+            },
         },
     }
 
@@ -599,6 +663,12 @@ def main():
         logger.success(f"  Overall F1: {overall_result['f1_score']:.4f}")
         logger.success(f"  Overall Precision: {overall_result['precision']:.4f}")
         logger.success(f"  Overall Recall: {overall_result['recall']:.4f}")
+        logger.success(f"  Overall PR-AUC: {overall_result['pr_auc']:.4f}")
+    if macro_metrics:
+        logger.success(f"  Macro PR-AUC: {macro_metrics['macro_pr_auc']:.4f}")
+        logger.success(f"  Macro F1: {macro_metrics['macro_f1']:.4f}")
+        logger.success(f"  Macro Recall: {macro_metrics['macro_recall']:.4f}")
+        logger.success(f"  Macro Precision: {macro_metrics['macro_precision']:.4f}")
     logger.success(f"  Checkpoint: {ckpt_path}")
     logger.success(f"  Metrics: {results_path}")
     logger.success("=" * 60)

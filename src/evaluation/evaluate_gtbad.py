@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
+from sklearn.metrics import average_precision_score
 
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
 
@@ -170,6 +171,9 @@ def main():
     print(header)
     print(sep)
 
+    all_errors: list[float] = []
+    all_labels: list[int] = []
+
     for row_idx, (_, row) in enumerate(df.iterrows(), start=args.start_row + 1):
         label_val = int(row["label"])
         label_name = CLASS_NAMES.get(label_val, f"Unknown({label_val})")
@@ -179,9 +183,93 @@ def main():
         error = result["error"]
         decision = "ANOMALY" if error > threshold else "normal"
 
+        all_errors.append(error)
+        all_labels.append(label_val)
+
         print(f"{row_idx:<8} {label_name:<18} {error:>14.6f}  {decision}")
 
     logger.success(f"Done — {len(df):,} rows processed.")
+
+    # ── 5. Aggregate metrics ──────────────────────────────────────────────
+    errors_arr = np.array(all_errors)
+    labels_arr = np.array(all_labels)
+    true_bin = (labels_arr > 0).astype(int)
+    preds_bin = (errors_arr > threshold).astype(int)
+
+    EVALUABLE_CLASSES = [1, 2, 3, 4]
+
+    # Overall metrics
+    tp = int(np.sum((preds_bin == 1) & (true_bin == 1)))
+    fp = int(np.sum((preds_bin == 1) & (true_bin == 0)))
+    fn = int(np.sum((preds_bin == 0) & (true_bin == 1)))
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    pr_auc = float(average_precision_score(true_bin, errors_arr)) if len(np.unique(true_bin)) > 1 else 0.0
+
+    logger.info("\n" + "=" * 60)
+    logger.info("AGGREGATE METRICS")
+    logger.info("=" * 60)
+    logger.info(f"  Overall Precision: {precision:.4f}")
+    logger.info(f"  Overall Recall:    {recall:.4f}")
+    logger.info(f"  Overall F1:        {f1:.4f}")
+    logger.info(f"  Overall PR-AUC:    {pr_auc:.4f}")
+
+    # Per-class metrics
+    per_class_pr_auc: list[float] = []
+    per_class_f1: list[float] = []
+    per_class_recall: list[float] = []
+    per_class_precision: list[float] = []
+
+    logger.info("\n  ── Per Class ──")
+    logger.info(f"  {'Class':<14} {'N':>8} {'Precision':>10} {'Recall':>10} {'F1':>10} {'PR-AUC':>10}")
+
+    for cls in EVALUABLE_CLASSES:
+        mask = (labels_arr == cls)
+        n_fault = int(mask.sum())
+        if n_fault == 0:
+            continue
+
+        # Per-class: combine healthy (label==0) with this fault class
+        healthy_mask = (labels_arr == 0)
+        pc_errors = np.concatenate([errors_arr[healthy_mask], errors_arr[mask]])
+        pc_labels = np.concatenate([np.zeros(healthy_mask.sum()), labels_arr[mask]])
+        pc_bin = (pc_labels > 0).astype(int)
+        pc_preds = (pc_errors > threshold).astype(int)
+
+        pc_tp = int(np.sum((pc_preds == 1) & (pc_bin == 1)))
+        pc_fp = int(np.sum((pc_preds == 1) & (pc_bin == 0)))
+        pc_fn = int(np.sum((pc_preds == 0) & (pc_bin == 1)))
+        pc_prec = pc_tp / (pc_tp + pc_fp) if (pc_tp + pc_fp) > 0 else 0.0
+        pc_rec = pc_tp / (pc_tp + pc_fn) if (pc_tp + pc_fn) > 0 else 0.0
+        pc_f1 = 2 * pc_prec * pc_rec / (pc_prec + pc_rec) if (pc_prec + pc_rec) > 0 else 0.0
+        pc_pr = float(average_precision_score(pc_bin, pc_errors)) if len(np.unique(pc_bin)) > 1 else 0.0
+
+        per_class_pr_auc.append(pc_pr)
+        per_class_f1.append(pc_f1)
+        per_class_recall.append(pc_rec)
+        per_class_precision.append(pc_prec)
+
+        logger.info(
+            f"  {CLASS_NAMES[cls]:<14} {n_fault:>8} {pc_prec:>10.4f} {pc_rec:>10.4f} "
+            f"{pc_f1:>10.4f} {pc_pr:>10.4f}"
+        )
+
+    # Macro averages
+    n_cls = len(per_class_pr_auc)
+    if n_cls > 0:
+        logger.info("\n  ── Macro Averages ──")
+        logger.info(f"  Macro PR-AUC:    {np.mean(per_class_pr_auc):.4f}")
+        logger.info(f"  Macro F1:        {np.mean(per_class_f1):.4f}")
+        logger.info(f"  Macro Recall:    {np.mean(per_class_recall):.4f}")
+        logger.info(f"  Macro Precision: {np.mean(per_class_precision):.4f}")
+
+    # Label distribution (frequency)
+    logger.info("\n  ── Label Distribution ──")
+    for lbl in sorted(CLASS_NAMES.keys()):
+        cnt = int((labels_arr == lbl).sum())
+        if cnt > 0:
+            logger.info(f"  {CLASS_NAMES[lbl]:<14} {cnt:>8}")
 
 
 if __name__ == "__main__":
