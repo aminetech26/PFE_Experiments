@@ -51,7 +51,7 @@ from src.modeling.common.artifact_contract import (
     compute_anomaly_per_class_metrics,
     write_json as contract_write_json,
 )
-from src.modeling.common.episode_metrics import episode_macro_f1_binary
+from src.modeling.common.episode_metrics import episode_macro_f1_binary, episode_macro_pr_auc
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -701,9 +701,12 @@ def main():
             test_all_group_ids = None
 
         test_episode_macro_f1 = episode_macro_f1_binary(test_bin, test_preds_bin, test_all_group_ids)
+        test_episode_pr_auc = episode_macro_pr_auc(test_scores, test_bin, test_all_group_ids)
     else:
         test_episode_macro_f1 = 0.0
+        test_episode_pr_auc = 0.0
     logger.info(f"  Test Episode Macro F1: {test_episode_macro_f1:.4f}")
+    logger.info(f"  Test Episode PR-AUC:  {test_episode_pr_auc:.4f}")
 
     # ── Save standard contract artifacts ────────────────────────────────────
     metrics_dir = Path(DEFAULT_METRICS_DIR)
@@ -778,6 +781,7 @@ def main():
             "macro_metrics": macro_metrics,
             "worst_class_pr_auc": worst_class_pr_auc,
             "test_episode_macro_f1": test_episode_macro_f1,
+            "test_episode_pr_auc": test_episode_pr_auc,
             "overall": overall_result if all_fault_errors else {},
             "label_distribution": {
                 FAULT_NAMES[int(lbl)]: int(cnt)
@@ -802,6 +806,7 @@ def main():
     if worst_class_pr_auc is not None:
         logger.success(f"  Worst-class PR-AUC: {worst_class_pr_auc:.4f}")
     logger.success(f"  Test Episode Macro F1: {test_episode_macro_f1:.4f}")
+    logger.success(f"  Test Episode PR-AUC:  {test_episode_pr_auc:.4f}")
     if macro_metrics:
         logger.success(f"  Macro PR-AUC: {macro_metrics['macro_pr_auc']:.4f}")
         logger.success(f"  Macro F1: {macro_metrics['macro_f1']:.4f}")

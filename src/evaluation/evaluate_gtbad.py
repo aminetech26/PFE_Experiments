@@ -25,7 +25,7 @@ from sklearn.metrics import average_precision_score
 
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
 from src.modeling.common.artifact_contract import compute_anomaly_per_class_metrics
-from src.modeling.common.episode_metrics import episode_macro_f1_binary
+from src.modeling.common.episode_metrics import episode_macro_f1_binary, episode_macro_pr_auc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
@@ -323,7 +323,9 @@ def main():
     # ── Episode-level macro F1 ────────────────────────────────────────────
     group_ids_arr = np.array(all_group_ids) if all_group_ids else None
     test_episode_macro_f1 = episode_macro_f1_binary(true_bin, preds_bin, group_ids_arr)
+    test_episode_pr_auc = episode_macro_pr_auc(errors_arr, true_bin, group_ids_arr)
     logger.info(f"\n  Test Episode Macro F1: {test_episode_macro_f1:.4f}")
+    logger.info(f"  Test Episode PR-AUC:  {test_episode_pr_auc:.4f}")
 
     if worst_class_pr_auc is not None:
         logger.info(f"  Worst-class PR-AUC:    {worst_class_pr_auc:.4f}")
