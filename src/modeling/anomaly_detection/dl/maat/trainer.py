@@ -43,6 +43,7 @@ from src.modeling.common.artifact_contract import (
     build_run_manifest,
     build_score_calibration_payload,
     compute_anomaly_per_class_metrics,
+    compute_macro_per_class_pr_auc,
     write_json,
 )
 from src.modeling.common.dl_training_utils import (
@@ -1485,6 +1486,14 @@ def run_maat(config: dict | None = None) -> None:
     _val_n_pos = int(val_labels.sum()) if val_labels is not None else 0
     _threshold_method = "max_macro_fault_f1"
 
+    # ── Threshold-free per-class PR-AUC (vs normal) — mirror pc_flow so the k-fold
+    #    aggregator (which reads ONLY global_metrics.json) gets the same key set ──
+    _val_pc_source = val_original_labels if val_original_labels is not None else val_labels
+    _test_pc_source = test_original_labels if test_original_labels is not None else test_labels
+    _val_macro = compute_macro_per_class_pr_auc(labels=_val_pc_source, scores=val_scores)
+    _test_macro = compute_macro_per_class_pr_auc(labels=_test_pc_source, scores=test_scores)
+    _n_params = int(sum(p.numel() for p in final_lit.model.parameters()))
+
     # ── Uniform operating-point system (GPD baseline + sensitive + hysteresis) ──
     _op_cfg = config["anomaly_detection"].get("operating_point", {})
     operating_points = compute_operating_points(
@@ -1536,6 +1545,13 @@ def run_maat(config: dict | None = None) -> None:
         "test_pv_maat_precision": test_prec,
         "test_pv_maat_recall": test_rec,
         "test_episode_macro_f1": test_episode_macro_f1,
+        "val_macro_per_class_pr_auc": _val_macro.get("macro_per_class_pr_auc"),
+        "val_worst_class_pr_auc": _val_macro.get("worst_class_pr_auc"),
+        "test_macro_per_class_pr_auc": _test_macro.get("macro_per_class_pr_auc"),
+        "test_worst_class_pr_auc": _test_macro.get("worst_class_pr_auc"),
+        **{f"test_class{cls}_pr_auc_vs_normal": v
+           for cls, v in _test_macro.get("per_class_pr_auc_vs_normal", {}).items()},
+        "n_params": _n_params,
         "n_train_windows": len(train_dl.dataset),
         "n_features": n_features,
         "fit_time_s": round(fit_time, 2),

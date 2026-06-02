@@ -315,11 +315,28 @@ def main() -> None:
 
     # STAGE 0 — HPO
     resolved_best_params_path: Path | None = None
+    inline_best_params_json: str | None = None
     if args.best_params:
-        resolved_best_params_path = Path(args.best_params)
-        if not resolved_best_params_path.exists():
-            raise FileNotFoundError(f"--best-params not found: {resolved_best_params_path}")
-        logger.info("STAGE 0: SKIPPED (using --best-params from {})", resolved_best_params_path)
+        raw = args.best_params.strip()
+        if raw.startswith("{"):
+            # Inline JSON injection — validate, then persist for provenance.
+            try:
+                json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"--best-params looks like inline JSON but failed to parse: {exc}"
+                ) from exc
+            inline_best_params_json = raw
+            resolved_best_params_path = output_dir / "hpo_stage" / "injected_best_params.json"
+            resolved_best_params_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_best_params_path.write_text(raw, encoding="utf-8")
+            logger.info("STAGE 0: SKIPPED (using inline --best-params JSON → {})",
+                        resolved_best_params_path)
+        else:
+            resolved_best_params_path = Path(args.best_params)
+            if not resolved_best_params_path.exists():
+                raise FileNotFoundError(f"--best-params not found: {resolved_best_params_path}")
+            logger.info("STAGE 0: SKIPPED (using --best-params from {})", resolved_best_params_path)
     elif args.no_hpo:
         logger.info("STAGE 0: SKIPPED (--no-hpo)")
     else:
@@ -344,7 +361,7 @@ def main() -> None:
 
     # STAGE 2
     logger.info("STAGE 2: Per-fold retrain")
-    best_params_json = _load_best_params(resolved_best_params_path)
+    best_params_json = inline_best_params_json or _load_best_params(resolved_best_params_path)
     per_fold_metrics: list[dict] = []
     fold_records: list[dict] = []
     for fold_idx, (val_fold_df, test_fold_df, fa) in enumerate(folds):
