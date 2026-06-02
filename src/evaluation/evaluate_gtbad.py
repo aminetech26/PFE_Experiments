@@ -24,6 +24,8 @@ from loguru import logger
 from sklearn.metrics import average_precision_score
 
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
+from src.modeling.common.artifact_contract import compute_anomaly_per_class_metrics
+from src.modeling.common.episode_metrics import episode_macro_f1_binary
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "interim" / "ingestion" / "costa" / "costa_merged.parquet"
@@ -37,6 +39,26 @@ CLASS_NAMES: dict[int, str] = {
     3: "OpenCircuit",
     4: "Shadowing",
 }
+
+
+def _add_group_columns(df: pd.DataFrame, gap_seconds: int = 300) -> pd.DataFrame:
+    """Add episode_id and operating_day_id columns for episode-level metrics."""
+    if "episode_id" not in df.columns:
+        if df.index.name == "timestamp":
+            dt_s = df.index.to_series().diff().dt.total_seconds().fillna(0)
+        else:
+            dt_s = pd.to_datetime(df["timestamp"]).diff().dt.total_seconds().fillna(0)
+        label_change = df["label"].diff().fillna(0) != 0
+        df["episode_id"] = ((dt_s > gap_seconds) | label_change).cumsum().astype(int)
+
+    if "operating_day_id" not in df.columns:
+        if df.index.name == "timestamp":
+            operating_day = df.index.to_series().dt.date.astype(str)
+        else:
+            operating_day = pd.to_datetime(df["timestamp"]).dt.date.astype(str)
+        df["operating_day_id"] = pd.factorize(operating_day, sort=True)[0].astype(int)
+
+    return df
 
 
 def _resolve_device(device_str: str | None) -> torch.device:
@@ -115,6 +137,9 @@ def main():
             "Run: uv run python -m src.data.ingestion --dataset costa"
         )
     df = pd.read_parquet(parquet_path)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.set_index("timestamp").sort_index()
+    df = _add_group_columns(df)
     logger.info(f"Loaded: {len(df):,} rows from {parquet_path}")
 
     if args.start_row > 0:
@@ -173,6 +198,8 @@ def main():
 
     all_errors: list[float] = []
     all_labels: list[int] = []
+    all_group_ids: list[str] = []
+    group_col = "episode_id" if "episode_id" in df.columns else None
 
     for row_idx, (_, row) in enumerate(df.iterrows(), start=args.start_row + 1):
         label_val = int(row["label"])
@@ -185,6 +212,8 @@ def main():
 
         all_errors.append(error)
         all_labels.append(label_val)
+        if group_col:
+            all_group_ids.append(str(row[group_col]))
 
         print(f"{row_idx:<8} {label_name:<18} {error:>14.6f}  {decision}")
 
@@ -263,6 +292,41 @@ def main():
         logger.info(f"  Macro F1:        {np.mean(per_class_f1):.4f}")
         logger.info(f"  Macro Recall:    {np.mean(per_class_recall):.4f}")
         logger.info(f"  Macro Precision: {np.mean(per_class_precision):.4f}")
+
+    # ── Standard contract: per-class metrics ──────────────────────────────
+    per_class_metrics = compute_anomaly_per_class_metrics(
+        labels=labels_arr,
+        scores=errors_arr,
+        threshold=threshold,
+        normal_label=0,
+    )
+    worst_class_pr_auc = None
+    pr_aucs = [
+        float(m["pr_auc_vs_normal"])
+        for m in per_class_metrics.values()
+        if m.get("pr_auc_vs_normal") is not None
+    ]
+    if pr_aucs:
+        worst_class_pr_auc = round(float(min(pr_aucs)), 6)
+
+    logger.info("\n  ── Per-Class (contract) ──")
+    for cls_key, m in per_class_metrics.items():
+        logger.info(
+            f"    {CLASS_NAMES.get(int(cls_key), cls_key):<14} "
+            f"PR-AUC={m.get('pr_auc_vs_normal', 'N/A')} "
+            f"F1@thr={m.get('f1_at_threshold_vs_normal', 'N/A')} "
+            f"Prec@thr={m.get('precision_at_threshold_vs_normal', 'N/A')} "
+            f"Rec@thr={m.get('recall_at_threshold_vs_normal', 'N/A')} "
+            f"support={m.get('support_fault', 0)}"
+        )
+
+    # ── Episode-level macro F1 ────────────────────────────────────────────
+    group_ids_arr = np.array(all_group_ids) if all_group_ids else None
+    test_episode_macro_f1 = episode_macro_f1_binary(true_bin, preds_bin, group_ids_arr)
+    logger.info(f"\n  Test Episode Macro F1: {test_episode_macro_f1:.4f}")
+
+    if worst_class_pr_auc is not None:
+        logger.info(f"  Worst-class PR-AUC:    {worst_class_pr_auc:.4f}")
 
     # Label distribution (frequency)
     logger.info("\n  ── Label Distribution ──")

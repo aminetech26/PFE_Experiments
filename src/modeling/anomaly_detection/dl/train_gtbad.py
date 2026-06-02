@@ -46,6 +46,12 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.modeling.anomaly_detection.dl.gtbad_model import GTBADModel, reconstruction_error
 from src.modeling.anomaly_detection.dl.gvsao import GVSaoConfig, GVSaoResult, run_gvsao
+from src.modeling.common.artifact_contract import (
+    build_score_calibration_payload,
+    compute_anomaly_per_class_metrics,
+    write_json as contract_write_json,
+)
+from src.modeling.common.episode_metrics import episode_macro_f1_binary
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
@@ -80,10 +86,29 @@ def _resolve_device(device_str: str | None) -> torch.device:
     return torch.device(device_str)
 
 
+def _add_group_columns(df: pd.DataFrame, gap_seconds: int = 300) -> pd.DataFrame:
+    """Add episode_id and operating_day_id columns for episode-level metrics.
+
+    episode_id: contiguous block of same label, resets on label change or time gap.
+    operating_day_id: unique integer per calendar day.
+    """
+    if "episode_id" not in df.columns:
+        dt_s = df.index.to_series().diff().dt.total_seconds().fillna(0)
+        label_change = df["label"].diff().fillna(0) != 0
+        df["episode_id"] = ((dt_s > gap_seconds) | label_change).cumsum().astype(int)
+
+    if "operating_day_id" not in df.columns:
+        operating_day = df.index.to_series().dt.date.astype(str)
+        df["operating_day_id"] = pd.factorize(operating_day, sort=True)[0].astype(int)
+
+    return df
+
+
 def load_data(parquet_path: str | Path) -> pd.DataFrame:
     """Load ingested Costa data at native 1 Hz sampling.
 
     Returns DataFrame with timestamp index, sorted chronologically.
+    Adds episode_id (contiguous same-label blocks) and operating_day_id.
     """
     parquet_path = Path(parquet_path)
     if not parquet_path.exists():
@@ -92,6 +117,9 @@ def load_data(parquet_path: str | Path) -> pd.DataFrame:
     df = pd.read_parquet(parquet_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.set_index("timestamp").sort_index()
+
+    # Compute group columns for episode-level metrics
+    df = _add_group_columns(df)
 
     logger.info(f"  Loaded: {len(df):,} rows, {df.shape[1]} columns")
     logger.info("  Label distribution:")
@@ -170,11 +198,13 @@ def prepare_tensors(
     splits: dict[str, pd.DataFrame],
     scaler: MinMaxScaler | None = None,
     window_length: int = 1,
+    group_col: str = "episode_id",
 ) -> dict[str, Any]:
     """MinMax-normalize features and create windowed tensors.
 
     Scaler is fitted on TRAIN data only (leakage prevention).
     Window length = 1 for point-wise reconstruction.
+    group_col: column used for episode-level metrics.
     """
     sensor_cols_present = [c for c in SENSOR_COLS if c in splits["train"].columns]
     n_features = len(sensor_cols_present)
@@ -201,9 +231,12 @@ def prepare_tensors(
             l_windows = labels[window_length - 1:]
             l_windows = np.max([labels[i:i + window_length] for i in range(n - window_length + 1)], axis=1)
 
+        group_ids = df[group_col].values.astype(str) if group_col in df.columns else None
+
         result[split_name] = {
             "X": torch.from_numpy(X_windows),
             "labels": l_windows,
+            "group_ids": group_ids,
             "n_samples": len(X_windows),
         }
 
@@ -569,6 +602,7 @@ def main():
     # ── Overall (all fault classes combined) ───────────────────────────────
     all_fault_errors = []
     all_fault_labels = []
+    all_fault_group_ids = []
     for cls in EVALUABLE_CLASSES:
         key = f"fault_class_{cls}"
         if key in tensors:
@@ -576,6 +610,8 @@ def main():
             errs_f = evaluate_reconstruction(model, X_f, device, final_batch_size)
             all_fault_errors.append(errs_f)
             all_fault_labels.append(tensors[key]["labels"])
+            if tensors[key].get("group_ids") is not None:
+                all_fault_group_ids.append(tensors[key]["group_ids"])
     if all_fault_errors:
         combined_errors = np.concatenate(all_fault_errors)
         combined_labels = np.concatenate(all_fault_labels)
@@ -615,10 +651,97 @@ def main():
         for k, v in macro_metrics.items():
             logger.info(f"    {k}: {v:.4f}")
 
-    # ── Save Results ───────────────────────────────────────────────────────
+    # ── Standard contract: per-class metrics ────────────────────────────────
+    if all_fault_errors:
+        test_scores = np.concatenate([test_healthy_errors, combined_errors])
+        test_labels = np.concatenate([np.zeros(len(test_healthy_errors)), combined_labels])
+    else:
+        test_scores = test_healthy_errors
+        test_labels = np.zeros(len(test_healthy_errors))
+
+    per_class_metrics = compute_anomaly_per_class_metrics(
+        labels=test_labels,
+        scores=test_scores,
+        threshold=threshold,
+        normal_label=0,
+    )
+
+    worst_class_pr_auc = None
+    pr_aucs = [
+        float(m["pr_auc_vs_normal"])
+        for m in per_class_metrics.values()
+        if m.get("pr_auc_vs_normal") is not None
+    ]
+    if pr_aucs:
+        worst_class_pr_auc = round(float(min(pr_aucs)), 6)
+        logger.info(f"  Worst-class PR-AUC: {worst_class_pr_auc:.4f}")
+    logger.info("  ── Per-Class (contract) ──")
+    for cls_key, m in per_class_metrics.items():
+        logger.info(
+            f"    {FAULT_NAMES.get(int(cls_key), cls_key):<14} "
+            f"PR-AUC={m.get('pr_auc_vs_normal', 'N/A')} "
+            f"F1@thr={m.get('f1_at_threshold_vs_normal', 'N/A')} "
+            f"Prec@thr={m.get('precision_at_threshold_vs_normal', 'N/A')} "
+            f"Rec@thr={m.get('recall_at_threshold_vs_normal', 'N/A')} "
+            f"support={m.get('support_fault', 0)}"
+        )
+
+    # ── Episode-level macro F1 ──────────────────────────────────────────────
+    if all_fault_errors:
+        test_preds_bin = (test_scores >= threshold).astype(int)
+        test_bin = (test_labels > 0).astype(int)
+
+        test_healthy_group_ids = tensors["test_healthy"].get("group_ids")
+        combined_group_ids = np.concatenate(all_fault_group_ids) if all_fault_group_ids else None
+        if test_healthy_group_ids is not None and combined_group_ids is not None:
+            test_all_group_ids = np.concatenate([test_healthy_group_ids, combined_group_ids])
+        elif test_healthy_group_ids is not None:
+            test_all_group_ids = test_healthy_group_ids
+        else:
+            test_all_group_ids = None
+
+        test_episode_macro_f1 = episode_macro_f1_binary(test_bin, test_preds_bin, test_all_group_ids)
+    else:
+        test_episode_macro_f1 = 0.0
+    logger.info(f"  Test Episode Macro F1: {test_episode_macro_f1:.4f}")
+
+    # ── Save standard contract artifacts ────────────────────────────────────
     metrics_dir = Path(DEFAULT_METRICS_DIR)
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
+    global_metrics = {
+        "test_pr_auc": overall_result["pr_auc"] if all_fault_errors else None,
+        "test_f1_at_threshold": overall_result["f1_score"] if all_fault_errors else None,
+        "test_precision_at_threshold": overall_result["precision"] if all_fault_errors else None,
+        "test_recall_at_threshold": overall_result["recall"] if all_fault_errors else None,
+        "test_episode_macro_f1": test_episode_macro_f1,
+        "worst_class_pr_auc": worst_class_pr_auc,
+        "macro_pr_auc": macro_metrics.get("macro_pr_auc"),
+        "macro_f1": macro_metrics.get("macro_f1"),
+        "macro_recall": macro_metrics.get("macro_recall"),
+        "macro_precision": macro_metrics.get("macro_precision"),
+        "threshold": threshold,
+        "threshold_percentile": args.threshold_percentile,
+        "n_train": int(tensors["train"]["n_samples"]),
+        "n_val": int(tensors["val"]["n_samples"]),
+        "n_test_healthy": int(tensors["test_healthy"]["n_samples"]),
+        "n_test_fault": int(sum(tensors[key]["n_samples"] for key in tensors if key.startswith("fault_class_"))),
+        "train_time_s": round(train_time, 1),
+    }
+    contract_write_json(metrics_dir / "global_metrics.json", global_metrics)
+    contract_write_json(metrics_dir / "per_class_metrics.json", per_class_metrics)
+    contract_write_json(
+        metrics_dir / "score_calibration.json",
+        build_score_calibration_payload(
+            threshold=threshold,
+            threshold_policy="normal_train_quantile",
+            threshold_quantile=args.threshold_percentile,
+            score_direction="higher_is_more_anomalous",
+        ),
+    )
+    logger.success(f"  Contract artifacts saved → {metrics_dir}")
+
+    # ── Save full results (backward compat) ─────────────────────────────────
     results_payload = {
         "model": "GTBAD (GVSAO-Transformer-BiLSTM)",
         "dataset": "Costa PV Fault Dataset",
@@ -651,7 +774,10 @@ def main():
             "threshold_value": threshold,
             "test_healthy_fp_rate": float(test_healthy_fp / len(test_healthy_errors)) if len(test_healthy_errors) > 0 else 0.0,
             "per_class": class_details,
+            "per_class_contract": {k: {kk: vv for kk, vv in v.items()} for k, v in per_class_metrics.items()},
             "macro_metrics": macro_metrics,
+            "worst_class_pr_auc": worst_class_pr_auc,
+            "test_episode_macro_f1": test_episode_macro_f1,
             "overall": overall_result if all_fault_errors else {},
             "label_distribution": {
                 FAULT_NAMES[int(lbl)]: int(cnt)
@@ -673,6 +799,9 @@ def main():
         logger.success(f"  Overall Precision: {overall_result['precision']:.4f}")
         logger.success(f"  Overall Recall: {overall_result['recall']:.4f}")
         logger.success(f"  Overall PR-AUC: {overall_result['pr_auc']:.4f}")
+    if worst_class_pr_auc is not None:
+        logger.success(f"  Worst-class PR-AUC: {worst_class_pr_auc:.4f}")
+    logger.success(f"  Test Episode Macro F1: {test_episode_macro_f1:.4f}")
     if macro_metrics:
         logger.success(f"  Macro PR-AUC: {macro_metrics['macro_pr_auc']:.4f}")
         logger.success(f"  Macro F1: {macro_metrics['macro_f1']:.4f}")
