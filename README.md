@@ -51,7 +51,7 @@ uv run python -m src.modeling.anomaly_detection.ml.run \
 
 Swap `--model` for any of `bocd`, `isolation_forest`, `ocsvm`, `maat`, `gtbad` to run a baseline instead. Fault classification baselines are trained via `src.modeling.classification.ml.run` (see `dvc.yaml` for the exact invocation).
 
-Colab is supported for GPU-bound training runs; see `notebooks/colab_baseline_runner.ipynb` (mounts Google Drive for persistent artifacts, reads secrets from Colab's built-in Secrets manager rather than hardcoding them).
+A Colab notebook is also available for running baselines with Google Drive-backed artifact persistence and DagsHub/MLflow tracking: `notebooks/colab_baseline_runner.ipynb`.
 
 ## Data
 
@@ -71,4 +71,4 @@ This codebase supports the preprint *"PC-Flow: An Efficient, Lightweight Physics
 
 ## License
 
-Not yet specified.
+MIT — see [LICENSE](LICENSE).
