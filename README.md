@@ -4,6 +4,10 @@ End-to-end pipeline for photovoltaic (PV) fault detection and diagnosis (FDD), b
 
 Developed as a final-year engineering project (PFE) at École nationale Supérieure d'Informatique (ESI), Algiers, hosted at the Centre de Développement des Énergies Renouvelables (CDER).
 
+<p align="center">
+  <img src="assets/fdd_architecture.png" alt="FDD system architecture: data acquisition and preprocessing feeding anomaly detection, fault diagnosis, and drift detection, reporting to a monitoring interface" width="700">
+</p>
+
 ## What's here
 
 - **Data pipeline** (`src/data/`): ingestion, temporal splitting, preprocessing, and physics-informed feature engineering for the [Costa PV fault dataset](https://github.com/clayton-h-costa/pv_fault_dataset), with leakage-prevention enforced at every stage (partition-first splitting, train-only statistics).
